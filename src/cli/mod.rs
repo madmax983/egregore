@@ -5,6 +5,7 @@
 mod as_of;
 mod at;
 mod audit;
+mod backup;
 mod bundle;
 mod candidates;
 mod capture_tests;
@@ -88,6 +89,7 @@ mod sessions;
 pub(crate) use as_of::*;
 pub(crate) use at::*;
 pub(crate) use audit::*;
+pub(crate) use backup::*;
 pub(crate) use bundle::*;
 pub(crate) use candidates::*;
 pub(crate) use change_impact::*;
@@ -632,6 +634,46 @@ pub(crate) enum Commands {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long)]
         force: bool,
+    },
+    /// Write a byte-level `.albk` backup artifact of an embedded store.
+    ///
+    /// The byte-level counterpart to `eg export` (issue #493): captures every
+    /// current node/edge, the full version history, the string interner,
+    /// declared schema constraints, and the unique-constraint registry in one
+    /// opaque artifact, through a consistent point-in-time snapshot.
+    ///
+    /// Read-only: the store is copied to a throwaway directory and the backup
+    /// is taken from the copy, so the live store is never opened or modified
+    /// and no write lease is taken — this works while a daemon or another
+    /// writer holds the lease.
+    ///
+    /// PRIVACY WARNING: the artifact is byte-level and carries `eg forget` /
+    /// `eg forget-repo` suppressed record bodies verbatim. It is a
+    /// disaster-recovery artifact, never a sharing format — never hand an
+    /// `.albk` to a party that was only cleared for an `eg export`. See
+    /// `docs/cli/store-backup.md` for the export-vs-backup distinction.
+    Backup {
+        /// Embedded `AletheiaDB` data directory to back up.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Output `.albk` artifact path, created or overwritten atomically.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a `.albk` backup artifact into a fresh embedded store.
+    ///
+    /// The target `--data-dir` must be missing or empty (issue #493): restore
+    /// never merges into or overwrites a live store. Replacing a live store is
+    /// a deliberate operator swap — move or delete it first, then restore.
+    /// The restored store is reopened and its record inventory verified before
+    /// the command reports success. See `docs/cli/store-backup.md`.
+    Restore {
+        /// `.albk` backup artifact to restore.
+        #[arg(long)]
+        from: PathBuf,
+        /// Missing or empty data directory to restore into.
+        #[arg(long)]
+        data_dir: PathBuf,
     },
     /// Export every persisted record from an embedded store as canonical JSONL.
     ///
@@ -4360,6 +4402,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             force,
         ),
+        Commands::Backup { data_dir, out } => backup_cmd(&data_dir, &out),
+        Commands::Restore { from, data_dir } => restore_cmd(&from, &data_dir),
         Commands::Export {
             format,
             data_dir,

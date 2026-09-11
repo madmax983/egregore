@@ -117,6 +117,7 @@ mod semantic_index_identity;
 mod semantic_index_unreadable;
 mod semantic_relevance;
 mod semantic_relevance_gate;
+mod store_backup;
 mod store_contention;
 mod store_export;
 mod symbol_metadata;
