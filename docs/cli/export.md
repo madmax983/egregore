@@ -19,11 +19,6 @@ the issue #68 evidence bundle** — a bundle is a record-closure-scoped,
 manifest-wrapped artifact for sharing scoped evidence, while export is the whole
 store as plain records with no header, manifest, or timestamp.
 
-Export is a **logical** backup: human-readable, diffable, privacy-safe (it
-drops `forget`-suppressed bodies). It is not byte-level — for the byte-level
-`.albk` artifact, its privacy implications, and why the two must never be
-confused, see [`docs/cli/store-backup.md`](store-backup.md).
-
 ```
 eg export --data-dir <dir> --out <file.jsonl>
 ```
