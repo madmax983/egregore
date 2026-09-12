@@ -3244,7 +3244,10 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Unify a leading `crate::` with this crate name (query + imports).
+        /// Override the owning-crate auto-resolution (issue #450): unify a leading
+        /// `crate::` with this crate name for the query and every import.
+        /// Without it, each import's `crate::` resolves from the owning-crate
+        /// facts (target name, package attribution, workspace directory name).
         #[arg(long = "crate")]
         crate_name: Option<String>,
         /// Restrict the importer set to one repository in a multi-repo store.

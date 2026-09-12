@@ -28,7 +28,7 @@ is exercised at runtime.
 | `<MODULE-PATH>` | yes | A `::`-separated module path (`serde`, `foo::bar`, `crate::query::liveness`). Empty, leading/trailing `::`, an empty interior segment (`a::::b`), or a whitespace-bearing segment is rejected (exit `1`). |
 | `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Read from a throwaway copy — the store is never mutated. |
-| `--crate <NAME>` | no | Unify a leading `crate::` with this crate name (see [crate-unification boundary](#crate-unification-boundary)). |
+| `--crate <NAME>` | no | Override the owning-crate resolution: unify a leading `crate::` with this crate name for the query and every import (see [crate-unification](#crate-unification)). |
 | `--repo <SELECTOR>` | no | Restrict the importer set to one repository in a multi-repo store (see [query.md](query.md#repository-scope---repo-issue-67)). |
 | `--format` | no | `json` (default) or `text`. |
 
@@ -71,26 +71,41 @@ is exercised at runtime.
   span.start_line, record_id)` and output is byte-identical across repeated
   runs and across `--graph` vs `--data-dir` on an unchanged store.
 
-### crate-unification boundary
+### crate-unification
 
-Since issue #117 the graph **does** carry an owning-Cargo-package attribution
-on every code fact (`crate_attribution`, resolved from the nearest enclosing
-`Cargo.toml`). This lane does **not** consume it: attribution names the package
-that *owns the file by directory containment*, which is not the same as the
-crate-path prefix a `use` statement resolves against — a `[lib] path` override,
-a `#[path]` module, or a re-export chain can put the two apart. This lane
-therefore still does **not** guess a `crate::` ↔ `<crate_name>::` unification;
-deriving `--crate` from the owning-package attribution is a follow-up, gated on
-establishing that the two agree.
+A leading `crate::` in an import denotes the importing file's **own** crate, so
+this lane resolves it to that crate's absolute `<crate_name>::…` form from
+facts the graph already carries — no flag needed (issue #450, building on the
+issue #440 crate-root partitioning):
 
-- **By default**, segments are matched literally. A `crate`-relative import
-  (`crate::foo::Bar`) and an absolute external import (`mycrate::foo::Bar`) are
-  **distinct**, and a leading `self` / `super` is matched literally (the graph
-  has no module anchor to resolve a relative prefix soundly).
-- **With `--crate <name>`**, a leading `crate` segment in **both** the query
-  and each import is rewritten to `<name>` before matching, so the two forms
-  unify: `--crate mycrate` makes `mycrate::foo` match both `crate::foo::Bar`
-  and `mycrate::foo::Bar`. This is caller-supplied ground truth, never guessed.
+1. **Auxiliary-target files** (`src/bin/<t>.rs`, `examples/<t>.rs`,
+   `tests/<t>.rs`, `benches/<t>.rs`) compile as their own crate named for the
+   **target** — `crate::` inside `examples/demo.rs` denotes the `demo` crate,
+   not the owning package.
+2. Otherwise the record's manifest-stamped **package attribution** (issue
+   #117), validated per the #104 doctrine: only a resolver-producible value
+   whose cited manifest encloses the record's path counts, so a crafted record
+   cannot forge another crate's identity.
+3. Otherwise the #440 **workspace-prefix-derived name**: the last component of
+   the workspace-crate directory prefix, cargo-normalized (`-` → `_`). This
+   covers graphs whose records predate attribution.
+
+A leading `crate` in the **query** resolves per import to that import's owning
+crate ("the importer's own crate"), so `crate::foo` finds every crate's own
+`foo`. Concretely: `mycrate::foo` matches both `crate::foo::Bar` and
+`mycrate::foo::Baz` written in `mycrate`. When no fact covers a record (e.g. a
+hand-built graph with no attribution), segments match literally, as before.
+
+**`--crate <name>`** remains as an explicit **override**: caller-supplied
+ground truth that wins over the facts for both the query and every import —
+for graphs the facts cannot cover, or when the caller wants to force a name.
+
+Residual bounds (documented, not hidden): a `[lib] name` override makes the
+true crate name differ from the package name; a helper module under an
+auxiliary target's directory (e.g. `tests/common/mod.rs`) inherits the target
+name although its `crate::` resolves to whichever target includes it; and a
+leading `self` / `super` is still matched literally (the graph has no module
+anchor to resolve a relative prefix soundly).
 
 ## Output format
 
@@ -155,10 +170,12 @@ eg query who-imports serde::Serialize --graph graph.jsonl
 - **No new schema.** This is a read-only query lane over existing `Import`
   nodes; it adds no inbound `IMPORTS` edge, no node kind, and bumps no schema
   or cache version.
-- **No crate-name inference.** `crate::` ↔ `<crate>::` unification is available
-  only via the explicit `--crate` flag (see the
-  [crate-unification boundary](#crate-unification-boundary)); relative `self` /
-  `super` prefixes are matched literally.
+- **No crate-name guessing.** `crate::` ↔ `<crate_name>::` unification resolves
+  only from owning-crate facts (auxiliary-target name, manifest-stamped
+  attribution, workspace directory name — see
+  [crate-unification](#crate-unification)); when no fact covers a record, the
+  forms stay distinct, and `--crate` overrides. Relative `self` / `super`
+  prefixes are matched literally.
 - **No `--at` / `--as-of` temporal pin.** A single-commit view is not offered.
   Corpus scope is instead controlled by `--at-head` / `--all-history`: over a
   `scan-history` graph the lane now defaults to the **HEAD-anchored** corpus and
