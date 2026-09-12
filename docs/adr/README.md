@@ -5,4 +5,3 @@ Store ADRs here for decisions that change the project shape, graph schema, persi
 Use filenames like `0001-standalone-repo.md`.
 
 - [0004: Stable Symbol Identity](0004-symbol-identity.md)
-- [0006: Tamper-Evidence via the AletheiaDB Provenance Hash Chain](0006-tamper-evidence-provenance-chain.md)

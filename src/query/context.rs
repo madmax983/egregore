@@ -174,11 +174,18 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         })
         .collect();
 
+    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
+    // from this current-state lane, including their temporal snapshots. Ordinary
+    // `forget` tombstones keep the temporal exemption below — only eviction
+    // tombstones suppress history.
+    let evicted_ids = crate::repo_evict::active_eviction_tombstoned_ids(records);
+
     // Step 1: collect symbol record IDs, excluding tombstoned CURRENT-STATE records.
     //
     // Temporal records (from scan-history, carrying `temporal` metadata) are
     // historical snapshots — they must NOT be suppressed by a tombstone that
-    // reflects deletion only in the current state.
+    // reflects deletion only in the current state (issue #231). However, they
+    // ARE suppressed by an ACTIVE repository-eviction tombstone (issue #472).
     let symbol_ids: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -192,6 +199,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             else {
                 return None;
             };
+            // Issue #472: evicted snapshots are suppressed even though temporal.
+            if temporal.is_some() && evicted_ids.contains(id.as_str()) {
+                return None;
+            }
             let is_historical = temporal.is_some();
             if name.as_deref() == Some(symbol_name)
                 && (is_historical || !tombstoned_ids.contains(id.as_str()))
