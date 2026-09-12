@@ -208,6 +208,11 @@ pub fn subsystem_context<'a>(
         })
         .collect();
 
+    // Latest-write-wins liveness for the shared BFS relay gate (issue #469).
+    // Over an append-only `--graph` a relay node re-ingested AFTER its own
+    // tombstone is live again, matching the coalesced `--data-dir` read.
+    let liveness = super::liveness::Liveness::new(records);
+
     // Step 1: collect File and Symbol node IDs under the prefix.
     let seed_ids: BTreeSet<&str> = records
         .iter()
@@ -375,14 +380,7 @@ pub fn subsystem_context<'a>(
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        if was_classified
-                            || is_bfs_relay_node(
-                                id,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                             next_frontier.push(id);
                         }
                     }
@@ -424,13 +422,7 @@ pub fn subsystem_context<'a>(
                             &mut verification_evidence,
                         );
                         visited.insert(node_id.as_str());
-                        if was_classified
-                            || is_bfs_relay_node(
-                                node_id.as_str(),
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
+                        if was_classified || is_bfs_relay_node(node_id.as_str(), &by_id, &liveness)
                         {
                             next_frontier.push(node_id.as_str());
                         }
@@ -620,9 +612,7 @@ pub fn subsystem_context<'a>(
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                    if was_classified
-                        || is_bfs_relay_node(id, &by_id, &tombstoned_ids, &has_any_temporal_version)
-                    {
+                    if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                         next_extra.push(id);
                     }
                 }
@@ -975,4 +965,110 @@ fn collect_log_signatures<'a>(
 
     log_signatures.sort_by(|a, b| a.record_id.cmp(b.record_id));
     (log_signatures, extra_unresolved)
+}
+
+#[cfg(test)]
+mod relay_liveness_tests {
+    //! Divergence repros for the shared `is_bfs_relay_node` tombstone gate
+    //! (issue #469): a ToolCall re-ingested AFTER its own tombstone must relay
+    //! the subsystem BFS again (latest-write-wins, matching the coalesced
+    //! `--data-dir` read), while a tombstone with no re-ingest still deletes
+    //! the relay.
+
+    use super::*;
+
+    fn file_node() -> GraphRecord {
+        GraphRecord::node(
+            "codegraph:v5:file:src/lib.rs".to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            "file src/lib.rs".to_owned(),
+        )
+    }
+
+    fn memory_node(id: &str, kind: NodeKind) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("{} {id}", kind.as_str()),
+        )
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb:{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    /// Fixture: a File seed under the queried prefix, a ToolCall relay with a
+    /// `TOUCHED_FILE` edge to the file and a `PRODUCED_EVIDENCE` edge to a
+    /// CommandRun. `revive` controls whether the ToolCall is re-ingested after
+    /// its tombstone.
+    fn fixture(revive: bool) -> Vec<GraphRecord> {
+        let tool_id = "codegraph:v5:tool:relay";
+        let run_id = "codegraph:v5:run:relay";
+        let mut records = vec![
+            file_node(),
+            memory_node(tool_id, NodeKind::ToolCall),
+            GraphRecord::edge(
+                EdgeLabel::TouchedFile,
+                tool_id.to_owned(),
+                "codegraph:v5:file:src/lib.rs".to_owned(),
+                None,
+                "tool touched file".to_owned(),
+            ),
+            tombstone(tool_id),
+        ];
+        if revive {
+            records.push(memory_node(tool_id, NodeKind::ToolCall));
+        }
+        records.push(memory_node(run_id, NodeKind::CommandRun));
+        records.push(GraphRecord::edge(
+            EdgeLabel::ProducedEvidence,
+            tool_id.to_owned(),
+            run_id.to_owned(),
+            None,
+            "tool call produced run".to_owned(),
+        ));
+        records
+    }
+
+    #[test]
+    fn revived_toolcall_relays_subsystem_bfs_to_command_run() {
+        // Divergence repro (issue #469): over `--graph` the revived ToolCall is
+        // tombstone-gated out of the BFS relay, so the CommandRun it produced
+        // is never reached — while `--data-dir` (embedded latest-write-wins)
+        // treats the relay as live and surfaces the run.
+        let records = fixture(true);
+        let ctx = subsystem_context(&records, "src").expect("subsystem_context");
+        assert!(
+            ctx.verification_evidence
+                .iter()
+                .any(|r| r.id() == "codegraph:v5:run:relay"),
+            "a ToolCall revived after its tombstone must relay the subsystem BFS to its CommandRun"
+        );
+    }
+
+    #[test]
+    fn tombstoned_toolcall_without_reingest_does_not_relay() {
+        // Negative control: a tombstone with no later re-ingest still deletes
+        // the relay — the conversion must not turn every tombstoned relay live.
+        let records = fixture(false);
+        let ctx = subsystem_context(&records, "src").expect("subsystem_context");
+        assert!(
+            !ctx.verification_evidence
+                .iter()
+                .any(|r| r.id() == "codegraph:v5:run:relay"),
+            "a tombstoned ToolCall with no re-ingest must not relay the subsystem BFS"
+        );
+    }
 }

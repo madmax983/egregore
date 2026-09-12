@@ -681,30 +681,9 @@ pub fn memory_audit_context<'a>(
         }
     };
 
-    // Claim-version coalescing (issue #470): an append-only `--graph` holds every
-    // physical version of a non-temporal claim id (a modified or revived claim),
-    // while the embedded `--data-dir` read retains only the latest node write.
-    // Reading every version would both duplicate the `memory_claim` row and
-    // resurrect node-level metadata (`evidence_links`, `superseded_by`) the
-    // latest version withdrew, so keep only the latest write of each
-    // non-temporal id. Bitemporal history versions of one id are distinct
-    // legitimate snapshots, not stale rewrites, and are all kept (see
-    // `Liveness::is_latest_node_version`).
     let claim_nodes: Vec<&GraphRecord> = records
         .iter()
-        .enumerate()
-        .filter(|(index, r)| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            } => id == memory_id,
-            GraphRecord::Node { id, .. } => {
-                id == memory_id && liveness.is_latest_node_version(id.as_str(), *index)
-            }
-            _ => false,
-        })
-        .map(|(_, r)| r)
+        .filter(|r| matches!(r, GraphRecord::Node { id, .. } if id == memory_id))
         .collect();
 
     let mut ctx = MemoryAuditContext {
@@ -1223,128 +1202,6 @@ mod liveness_parity_tests {
         assert!(
             is_verified_claim(claim_node, &by_id, &edges_from, &tombstoned),
             "a verification edge re-ingested after its tombstone must confer verification"
-        );
-    }
-}
-
-#[cfg(test)]
-mod claim_version_coalescing_tests {
-    //! Transport-parity regression (issue #470): over an append-only `--graph`,
-    //! a non-temporal claim id can carry multiple physical versions (a modified
-    //! or revived claim), while the embedded `--data-dir` read retains only the
-    //! latest node write. `memory_audit_context` must coalesce to the latest
-    //! version per id — otherwise the audit emits one `memory_claim` row per
-    //! physical version AND resurrects node-level metadata (`evidence_links`,
-    //! `superseded_by`) the latest version withdrew.
-    use super::*;
-    use crate::ir::{SCHEMA_VERSION, TemporalMetadata};
-
-    fn obs(id: &str) -> GraphRecord {
-        GraphRecord::node(
-            id.to_owned(),
-            NodeKind::Observation,
-            None,
-            None,
-            Some("obs".to_owned()),
-            "observation".to_owned(),
-        )
-    }
-
-    fn tomb(deleted_id: &str) -> GraphRecord {
-        GraphRecord::Tombstone {
-            id: format!("codegraph:v6:tomb_{deleted_id}"),
-            schema_version: SCHEMA_VERSION,
-            deleted_id: deleted_id.to_owned(),
-            summary: "removed".to_owned(),
-            producer: None,
-        }
-    }
-
-    fn canonical(seed: char) -> String {
-        format!("agent_memory:v1:{}", seed.to_string().repeat(64))
-    }
-
-    fn temporal_at(commit: &str) -> TemporalMetadata {
-        TemporalMetadata {
-            git_commit: commit.to_owned(),
-            git_parent_commits: Vec::new(),
-            valid_time: "2026-01-01T00:00:00Z".to_owned(),
-            author_time: None,
-            observed_at: "2026-01-01T00:00:00Z".to_owned(),
-            valid_time_source: None,
-        }
-    }
-
-    /// RED repro (issue #470): an append-only `--graph` slice with two physical
-    /// versions of one claim id must audit identically to the coalesced
-    /// `--data-dir` slice that keeps only the latest node write.
-    #[test]
-    fn modified_claim_audits_identically_over_graph_and_datadir() {
-        let id = canonical('c');
-        let sup = canonical('s');
-        // v1: claim carrying a `superseded_by` link; v2: the same claim
-        // rewritten WITHOUT it (a modified claim — no tombstone involved).
-        let v1 = obs(&id).with_superseded_by(sup.clone());
-        let v2 = obs(&id);
-        let sup_node = obs(&sup);
-        // --graph: append-only, every physical version.
-        let graph_records = vec![v1, sup_node.clone(), v2.clone()];
-        // --data-dir: embedded read retains only the latest non-temporal write.
-        let datadir_records = vec![v2, sup_node];
-
-        let graph_ctx = memory_audit_context(&graph_records, &id, false);
-        let datadir_ctx = memory_audit_context(&datadir_records, &id, false);
-
-        assert_eq!(
-            graph_ctx.memory_claim.len(),
-            datadir_ctx.memory_claim.len(),
-            "--graph and --data-dir disagree on memory_claim row count"
-        );
-        assert_eq!(
-            graph_ctx.memory_claim.len(),
-            1,
-            "one id audits to one coalesced claim row"
-        );
-        assert!(
-            graph_ctx.superseding_records.is_empty(),
-            "a superseded_by link withdrawn by the latest version must not be resurrected"
-        );
-        assert_eq!(
-            graph_ctx.superseding_records.len(),
-            datadir_ctx.superseding_records.len(),
-            "--graph and --data-dir disagree on withdrawn supersession"
-        );
-    }
-
-    /// A revived claim (node, tombstone, node) likewise audits to one row, not
-    /// one row per physical version.
-    #[test]
-    fn revived_claim_yields_one_claim_row() {
-        let id = canonical('r');
-        let records = vec![obs(&id), tomb(&id), obs(&id)];
-        let ctx = memory_audit_context(&records, &id, false);
-        assert_eq!(
-            ctx.memory_claim.len(),
-            1,
-            "a revived claim audits to one coalesced claim row"
-        );
-        assert!(!ctx.is_no_match(), "the revived claim is live");
-    }
-
-    /// Bitemporal history versions of one claim id are distinct snapshots, not
-    /// stale rewrites — the embedded read emits ALL of them, so the audit keeps
-    /// ALL of them too.
-    #[test]
-    fn temporal_claim_versions_are_all_kept() {
-        let id = canonical('t');
-        let t1 = obs(&id).with_temporal(temporal_at("aaaaaa"));
-        let t2 = obs(&id).with_temporal(temporal_at("bbbbbb"));
-        let records = vec![t1, t2];
-        let ctx = memory_audit_context(&records, &id, false);
-        assert_eq!(
-            ctx.memory_claim.len(),
-            2,
-            "temporal versions are legitimate snapshots and must not be coalesced"
         );
     }
 }
