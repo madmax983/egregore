@@ -78,11 +78,6 @@ pub(crate) fn query_symbol_all(
     corpus_mode_source: query::CorpusModeSource,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
-    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
-    // from this current-state lane, including their temporal snapshots. Ordinary
-    // `forget` tombstones keep the issue #231 temporal exemption — only eviction
-    // tombstones suppress history.
-    let evicted = crate::repo_evict::active_eviction_tombstoned_ids(records);
     // HEAD-anchor keep-last coalescing (issue #456): the ID-level HEAD-anchor
     // pre-filter (`non_head_current_record_ids`, applied by the CLI dispatch)
     // drops symbol IDs whose EVERY version is off-HEAD (`gone`), but retains a
@@ -137,16 +132,6 @@ pub(crate) fn query_symbol_all(
         .iter()
         .enumerate()
         .filter(|(_, r)| {
-            // Issue #472: suppress temporal snapshots with active eviction tombstones.
-            if let GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            } = r
-                && evicted.contains(id.as_str())
-            {
-                return false;
-            }
             if let GraphRecord::Node {
                 id, temporal: None, ..
             } = r
@@ -314,23 +299,9 @@ pub(crate) fn query_symbols_matching(
     package: Option<&str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
-    // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
-    // from this current-state lane, including their temporal snapshots. Ordinary
-    // `forget` tombstones keep the issue #231 temporal exemption (the
-    // `temporal: None` gate below) — only eviction tombstones suppress history.
-    let evicted = crate::repo_evict::active_eviction_tombstoned_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
         .filter(|r| {
-            if let GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            } = r
-                && evicted.contains(id.as_str())
-            {
-                return false;
-            }
             if let GraphRecord::Node {
                 id, temporal: None, ..
             } = r

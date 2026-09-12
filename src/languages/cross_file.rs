@@ -37,7 +37,6 @@
 //! duplicate (caller, target) pairs collapse to one edge preferring the
 //! strongest status.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -887,11 +886,10 @@ fn reassign_aux_helper_crate_roots(
 }
 
 /// Applies a [`reassign_aux_helper_crate_roots`] remap to a CLONE of the facts,
-/// rewriting the `crate_root` on every `ImplTargetFact`, `PendingImplFact`, and
-/// `ImplTraitRelationFact` of each remapped helper file. Only the `crate_root`
-/// partition key changes; qualified names, module paths, and imports are
-/// untouched, so this is a pure re-partition, deterministic and byte-identical
-/// across runs.
+/// rewriting the `crate_root` on every `ImplTargetFact` and `PendingImplFact` of
+/// each remapped helper file. Only the `crate_root` partition key changes;
+/// qualified names, module paths, and imports are untouched, so this is a pure
+/// re-partition, deterministic and byte-identical across runs.
 fn apply_crate_root_remap(
     facts_by_file: &BTreeMap<String, FileFacts>,
     remap: &BTreeMap<String, String>,
@@ -904,13 +902,6 @@ fn apply_crate_root_remap(
             }
             for pending in &mut facts.pending_impls {
                 pending.crate_root.clone_from(new_root);
-            }
-            // The IMPLEMENTS-gated self-dispatch join (issue #414) keys
-            // `impl_trait_relations` by `crate_root`, so a helper's relations
-            // move with the rest of its facts: otherwise the CALLS pass would
-            // look them up under the entry root and miss (issue #475).
-            for relation in &mut facts.impl_trait_relations {
-                relation.crate_root.clone_from(new_root);
             }
         }
     }
@@ -972,36 +963,12 @@ fn join_segments(dir: &[String], suffix: &str) -> Option<String> {
 /// `CALLS` edges, in deterministic order. It also appends the `CONSTRUCTS`
 /// struct-literal edges (issue #443) via [`cross_file_construct_records`], so
 /// every driver that emits cross-file CALLS gets CONSTRUCTS with no extra wiring.
-///
-/// Auxiliary-target helper modules (`tests/common/mod.rs`) are reassigned to
-/// the entry crate that `mod`-includes them (issue #475) before resolution, on
-/// both the index side and the caller side, exactly as the IMPLEMENTS and
-/// CONSTRUCTS passes do.
 #[must_use]
 pub fn cross_file_call_records(
     repository_id: &str,
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> Vec<GraphRecord> {
-    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
-    // entry crate that `mod`-includes them, exactly as
-    // [`cross_file_construct_records`] does (issue #475): a `crate::…` call in
-    // such a helper resolves against the including ENTRY crate in Rust, but
-    // path-based [`crate_root_id`] stamps the helper its OWN synthetic root
-    // (`test:common`), which confines the call to the wrong partition and drops
-    // its CALLS edge. The remap rewrites both the index side (helper
-    // definitions partition under the entry root via the remap-aware
-    // [`DefinitionIndex`]) and the caller side (each call site's
-    // `caller_crate_root`, looked up below). When nothing needs remapping the
-    // borrowed facts are used directly, keeping output byte-identical.
-    let remap = reassign_aux_helper_crate_roots(facts_by_file);
-    let remapped;
-    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
-        facts_by_file
-    } else {
-        remapped = apply_crate_root_remap(facts_by_file, &remap);
-        &remapped
-    };
-    let index = DefinitionIndex::build(facts_by_file, remap.clone());
+    let index = DefinitionIndex::build(facts_by_file);
 
     // (source, target) -> strongest resolution + summary, deduplicating
     // repeated call sites between the same pair.
@@ -1012,10 +979,7 @@ pub fn cross_file_call_records(
     let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
 
     for (path, facts) in facts_by_file {
-        let caller_crate_root = remap
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| crate_root_id(path));
+        let caller_crate_root = crate_root_id(path);
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
@@ -1118,9 +1082,7 @@ pub fn cross_file_route_records(
     // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
     // entry crate that `mod`-includes them, exactly as
     // [`cross_file_construct_records`] does, so a `crate::…`-scoped registration
-    // in such a helper resolves against the including entry crate. The remap
-    // also partitions a helper's own handler definitions under the entry root
-    // on the index side (issue #475), via the remap-aware [`DefinitionIndex`].
+    // in such a helper resolves against the including entry crate.
     let remap = reassign_aux_helper_crate_roots(facts_by_file);
     let remapped;
     let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
@@ -1129,7 +1091,7 @@ pub fn cross_file_route_records(
         remapped = apply_crate_root_remap(facts_by_file, &remap);
         &remapped
     };
-    let index = DefinitionIndex::build(facts_by_file, remap.clone());
+    let index = DefinitionIndex::build(facts_by_file);
 
     // (owner_id, handler_symbol_id) -> summary, collapsing repeated
     // registrations between the same pair.
@@ -1913,25 +1875,10 @@ pub fn label_same_file_call_resolutions(
 fn same_file_call_resolutions(
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> BTreeMap<(String, String), CallResolution> {
-    // Same aux-helper crate-root remap as the cross-file CALLS pass
-    // (issue #475): a helper's call sites and definitions partition under the
-    // including entry crate, so the repo-wide candidate count behind each
-    // same-file label is computed under the true crate root.
-    let remap = reassign_aux_helper_crate_roots(facts_by_file);
-    let remapped;
-    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
-        facts_by_file
-    } else {
-        remapped = apply_crate_root_remap(facts_by_file, &remap);
-        &remapped
-    };
-    let index = DefinitionIndex::build(facts_by_file, remap.clone());
+    let index = DefinitionIndex::build(facts_by_file);
     let mut resolutions = BTreeMap::new();
     for (path, facts) in facts_by_file {
-        let caller_crate_root = remap
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| crate_root_id(path));
+        let caller_crate_root = crate_root_id(path);
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
@@ -2074,21 +2021,10 @@ struct DefinitionIndex<'facts> {
     /// that type's method. The `implemented` map above is derived from this
     /// same index; retaining it lets the `Method` arm reuse it directly.
     impl_index: ImplTargetIndex<'facts>,
-    /// Aux-helper crate-root remap (issue #475): helper repo-relative path ->
-    /// the including entry crate's root, from
-    /// [`reassign_aux_helper_crate_roots`]. [`Self::definition_crate_root`]
-    /// consults it so a helper's definitions partition under the entry crate
-    /// they truly belong to instead of their synthetic path-derived root.
-    /// Empty when no helper needed reassignment, in which case partitioning is
-    /// exactly the path-derived [`crate_root_id`] behavior.
-    aux_helper_roots: BTreeMap<String, String>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
-    fn build(
-        facts_by_file: &'facts BTreeMap<String, FileFacts>,
-        aux_helper_roots: BTreeMap<String, String>,
-    ) -> Self {
+    fn build(facts_by_file: &'facts BTreeMap<String, FileFacts>) -> Self {
         let mut by_simple_name: BTreeMap<&str, Vec<&DefinitionFact>> = BTreeMap::new();
         for facts in facts_by_file.values() {
             for definition in &facts.definitions {
@@ -2119,14 +2055,11 @@ impl<'facts> DefinitionIndex<'facts> {
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
         // crate-root-relative qualified name via the repo-wide impl-target
-        // index (issue #414). The facts carry the aux-helper crate-root remap
-        // when the caller applied [`reassign_aux_helper_crate_roots`]
-        // (issue #475): a helper's impl relations then join under the including
-        // entry crate they truly belong to, and the remap is conservative
-        // (single-includer helpers only), so the join still never crosses a
-        // true crate boundary. An unresolvable trait path (external/std,
-        // ambiguous) contributes nothing, so the gate degrades to unresolved
-        // (a MISS, never a WRONG edge).
+        // index (issue #414). A plain `build` (no aux-helper crate-root remap)
+        // is used deliberately — this join is conservative and stays within one
+        // crate root, so it never needs the #399 out-of-line remap. An
+        // unresolvable trait path (external/std, ambiguous) contributes nothing,
+        // so the gate degrades to unresolved (a MISS, never a WRONG edge).
         let impl_index = ImplTargetIndex::build(facts_by_file);
         let mut implemented: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for facts in facts_by_file.values() {
@@ -2195,21 +2128,7 @@ impl<'facts> DefinitionIndex<'facts> {
             implemented,
             crate_name_roots,
             impl_index,
-            aux_helper_roots,
         }
-    }
-
-    /// The crate root a definition partitions under for call-target
-    /// confinement (issue #475): the aux-helper remap when the definition's
-    /// file was reassigned to its including entry crate, else the
-    /// path-derived [`crate_root_id`].
-    fn definition_crate_root(&self, definition: &DefinitionFact) -> Cow<'_, str> {
-        self.aux_helper_roots
-            .get(&definition.repo_relative_path)
-            .map_or_else(
-                || Cow::Owned(crate_root_id(&definition.repo_relative_path)),
-                |root| Cow::Borrowed(root.as_str()),
-            )
     }
 
     /// The set of trait qualified names the type `impl_type` provably implements
@@ -2314,7 +2233,7 @@ impl<'facts> DefinitionIndex<'facts> {
             .into_iter()
             .filter(|definition| {
                 definition.is_trait_method
-                    && self.definition_crate_root(definition) == *caller_crate_root
+                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
                     && definition.match_segments.len() >= 2
                     && implemented.contains(
                         &definition.match_segments[..definition.match_segments.len() - 1]
@@ -2476,9 +2395,9 @@ impl<'facts> DefinitionIndex<'facts> {
                 pool.iter()
                     .copied()
                     .filter(|definition| {
-                        target_root
-                            .is_none_or(|root| self.definition_crate_root(definition) == *root)
-                            && segments_end_with(&definition.match_segments, segments)
+                        target_root.is_none_or(|root| {
+                            crate_root_id(&definition.repo_relative_path) == root
+                        }) && segments_end_with(&definition.match_segments, segments)
                     })
                     .collect()
             }
@@ -2899,7 +2818,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call(
             "caller",
             "Device::read",
@@ -2932,7 +2851,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Method, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -2960,7 +2879,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Direct, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -2981,7 +2900,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Path, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3001,7 +2920,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "A::read", &["A", "read"], CallKind::Path, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3025,7 +2944,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call(
             "caller",
             "Device::read",
@@ -3093,7 +3012,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3125,7 +3044,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3147,7 +3066,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "g", &["g"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "g", "lib")
@@ -3205,7 +3124,7 @@ mod tests {
         // `read`), binds ONLY `T::read`. The unrelated `U::read` (S does not
         // implement `U`) is excluded even though it shares the simple name.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3225,7 +3144,7 @@ mod tests {
         // relation leaves `S`'s implemented-trait set empty, so `self.read()`
         // binds nothing — a MISS, never a WRONG edge to `T::read` or `U::read`.
         let facts = self_dispatch_facts(false);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3240,7 +3159,7 @@ mod tests {
         // finds no proof for `S`, so the trait default is not bound — a
         // cross-crate-root trait degrades to unresolved, never a wrong edge.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts, BTreeMap::new());
+        let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "bin:tool").is_empty(),
@@ -3767,13 +3686,6 @@ mod tests {
                         &[],
                         "test:common",
                     )],
-                    impl_trait_relations: vec![ImplTraitRelationFact {
-                        impl_type: "Foo".to_owned(),
-                        impl_type_path: "Foo".to_owned(),
-                        trait_path: "crate::T".to_owned(),
-                        crate_root: "test:common".to_owned(),
-                        module_names: Vec::new(),
-                    }],
                     ..FileFacts::default()
                 },
             ),
@@ -3786,53 +3698,11 @@ mod tests {
             Some("test:it"),
             "a single-includer helper is reassigned to the including entry crate"
         );
-        // The remap rewrites crate_root on all three fact kinds.
+        // The remap rewrites crate_root on both fact kinds.
         let remapped = apply_crate_root_remap(&facts, &remap);
         let helper = &remapped["tests/common/mod.rs"];
         assert_eq!(helper.impl_targets[0].crate_root, "test:it");
         assert_eq!(helper.pending_impls[0].crate_root, "test:it");
-        assert_eq!(helper.impl_trait_relations[0].crate_root, "test:it");
-    }
-
-    #[test]
-    fn definition_crate_root_prefers_aux_helper_remap() {
-        // Issue #475: a definition in a remapped helper file partitions under
-        // the including entry crate's root, not its synthetic path-derived
-        // root; every other definition keeps the path-derived root.
-        let facts: BTreeMap<String, FileFacts> = [
-            (
-                "tests/common/mod.rs".to_owned(),
-                FileFacts {
-                    definitions: vec![definition(
-                        "helper-deep",
-                        "function",
-                        "tests/common/mod.rs",
-                        &["inner", "deep"],
-                    )],
-                    ..FileFacts::default()
-                },
-            ),
-            (
-                "src/lib.rs".to_owned(),
-                FileFacts {
-                    definitions: vec![definition(
-                        "lib-root",
-                        "function",
-                        "src/lib.rs",
-                        &["root_fn"],
-                    )],
-                    ..FileFacts::default()
-                },
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let remap = BTreeMap::from([("tests/common/mod.rs".to_owned(), "test:it".to_owned())]);
-        let index = DefinitionIndex::build(&facts, remap);
-        let helper_def = &facts["tests/common/mod.rs"].definitions[0];
-        assert_eq!(index.definition_crate_root(helper_def), "test:it");
-        let lib_def = &facts["src/lib.rs"].definitions[0];
-        assert_eq!(index.definition_crate_root(lib_def), "lib");
     }
 
     #[test]

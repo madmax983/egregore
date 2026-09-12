@@ -69,6 +69,7 @@ mod preference_approval;
 mod producer_drift;
 mod producer_version;
 mod protected_artifacts;
+mod provenance_chain_eval;
 mod public_api_deltas;
 mod python_scan;
 mod query;
