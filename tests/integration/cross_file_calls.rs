@@ -162,67 +162,6 @@ fn ambiguous_simple_names_emit_labeled_edges_to_all_candidates() {
 }
 
 #[test]
-fn resolved_calls_edges_retain_call_site_spans_ambiguous_edges_do_not() {
-    // Issue #462: per-call-site spans survive edge deduplication on resolved
-    // CALLS edges (enabling SCIP reference occurrences); ambiguous edges
-    // carry none, per the #233 fabrication-guard discipline.
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[
-            (
-                "src/alpha.rs",
-                "pub fn shared_helper() -> usize {\n    7\n}\n",
-            ),
-            (
-                "src/beta.rs",
-                "use crate::alpha::shared_helper;\n\npub fn beta_caller() -> usize {\n    shared_helper()\n}\n",
-            ),
-            ("src/delta.rs", "pub fn dupe() -> usize {\n    2\n}\n"),
-            (
-                "src/gamma.rs",
-                "pub fn dupe() -> usize {\n    3\n}\n\npub fn calls_dupe() -> usize {\n    dupe()\n}\n",
-            ),
-        ],
-    );
-
-    let records = scan_fixture(repo);
-    let helper = symbol_id(&records, "function", "alpha::shared_helper", "src/alpha.rs");
-    let beta_caller = symbol_id(&records, "function", "beta::beta_caller", "src/beta.rs");
-
-    let edge = calls_edge(&records, &beta_caller, &helper)
-        .expect("resolved cross-file CALLS edge should exist");
-    assert_eq!(edge["resolution"], "resolved");
-    let spans = edge["call_site_spans"]
-        .as_array()
-        .expect("a resolved CALLS edge must retain its call-site spans");
-    assert_eq!(spans.len(), 1, "one call site should yield one span");
-    assert_eq!(
-        spans[0]["start_line"].as_u64(),
-        Some(4),
-        "the `shared_helper()` call sits on line 4"
-    );
-    assert_eq!(spans[0]["end_line"].as_u64(), Some(4));
-
-    // The bare `dupe()` call in gamma.rs matches two in-repo definitions, so
-    // both edges (the cross-file fan-out to delta::dupe and the same-file
-    // edge to gamma::dupe) are ambiguous and must carry no spans.
-    let delta_dupe = symbol_id(&records, "function", "delta::dupe", "src/delta.rs");
-    let gamma_dupe = symbol_id(&records, "function", "gamma::dupe", "src/gamma.rs");
-    let calls_dupe = symbol_id(&records, "function", "gamma::calls_dupe", "src/gamma.rs");
-    for target in [&delta_dupe, &gamma_dupe] {
-        let ambiguous =
-            calls_edge(&records, &calls_dupe, target).expect("ambiguous CALLS edge should exist");
-        assert_eq!(ambiguous["resolution"], "ambiguous");
-        assert!(
-            ambiguous.get("call_site_spans").is_none(),
-            "an ambiguous CALLS edge must not retain call-site spans, got: {ambiguous}"
-        );
-    }
-}
-
-#[test]
 fn unresolved_external_calls_are_labeled_not_dropped_or_invented() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();

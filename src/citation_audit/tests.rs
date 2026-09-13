@@ -747,7 +747,6 @@ fn frame_resolves_to(signature_id: &str, target: &str) -> GraphRecord {
         frame_resolution: Some(crate::ir::FrameResolution::Resolved),
         frame_index: Some(0),
         basis: None,
-        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("frame 0 resolves to {target}"),
