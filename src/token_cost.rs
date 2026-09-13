@@ -38,10 +38,12 @@ pub const TOKEN_COUNT_METHOD_DESCRIPTION: &str = "Each maximal run of [A-Za-z0-9
     tokenization applied identically to the Egregore answer and the grep baseline.";
 
 /// Default minimum baseline-to-Egregore token-savings ratio a question class
-/// must meet to pass the gate (AC6). Recalibrated from 3.0 to 2.7 when
-/// column-precision SCIP ranges (issue #463) added ~8-13% answer tokens by
-/// serializing `start_column`/`end_column` on spans; the measured floor moved
-/// to 2.75 (file-defines class) and the gate sits just under it.
+/// must meet to pass the gate (AC6).
+///
+/// Recalibrated from 3.0 to 2.7 when column-precision SCIP ranges (issue
+/// #463) added ~8-13% answer tokens by serializing `start_column`/`end_column`
+/// on spans; the measured floor moved to 2.75 (file-defines class) and the
+/// gate sits just under it.
 pub const DEFAULT_MIN_RATIO: f64 = 2.7;
 
 // ---------------------------------------------------------------------------

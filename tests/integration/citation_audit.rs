@@ -825,6 +825,7 @@ fn seed() -> Fixture {
         frame_resolution: Some(FrameResolution::Resolved),
         frame_index: Some(0),
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("frame 0 of {sig_new_id} resolves to {symbol_id}"),
