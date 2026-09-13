@@ -1780,11 +1780,6 @@ impl EmbeddedAletheiaSink {
     /// read.
     pub fn inspect_current_records(&self) -> AdapterResult<InspectStoreReport> {
         let active_tombstoned = self.active_deleted_ids()?;
-        // Issue #472: record IDs whose ACTIVE tombstone is a repository-eviction
-        // tombstone (self-verifying). Their temporal candidates are suppressed
-        // from this current-state view; ordinary `forget` tombstones keep
-        // serving temporal candidates (issue #231).
-        let eviction_suppressed = self.active_eviction_tombstoned_ids()?;
         // Physical IDs of the current per-commit temporal candidates:
         // `read_all_records` serves every per-commit candidate (even for
         // tombstoned records, so `--at <commit>` views can resolve past
@@ -1850,11 +1845,7 @@ impl EmbeddedAletheiaSink {
                 record_type.as_deref() == Some("node")
                     && !active_tombstoned.contains(record_id.as_str())
             } else if current_temporal.contains(&node_id) {
-                // Issue #472: a temporal candidate targeted by an ACTIVE
-                // repository-eviction tombstone is suppressed from the current
-                // view. Ordinary `forget` tombstones keep serving temporal
-                // candidates (issue #231 bi-temporal honesty).
-                !eviction_suppressed.contains(record_id.as_str())
+                true
             } else {
                 !active_tombstoned.contains(record_id.as_str())
                     && self.node_lookup.non_temporal.get(record_id.as_str()) == Some(&node_id)
@@ -2237,48 +2228,6 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(deleted)
-    }
-
-    /// Returns the set of record IDs whose ACTIVE tombstone is a
-    /// repository-eviction tombstone (issue #472).
-    ///
-    /// Mirrors [`Self::active_deleted_ids`] but keeps only self-verifying
-    /// eviction tombstones: the stored tombstone record's own ID must equal
-    /// `repo_evict::eviction_tombstone_id(deleted_id)` recomputed from its
-    /// target — no schema field, no summary marker. Ordinary `forget`
-    /// tombstones are excluded so they keep the issue #231 temporal exemption.
-    /// A tombstone superseded by a later write of its target (stale) suppresses
-    /// nothing, so re-ingest revives the ID under latest-write-wins.
-    fn active_eviction_tombstoned_ids(&self) -> AdapterResult<std::collections::BTreeSet<String>> {
-        let mut suppressed = std::collections::BTreeSet::new();
-        for &tombstone_node_id in self.tombstone_ids.values() {
-            let node = self
-                .db
-                .get_node(tombstone_node_id)
-                .map_err(|e| read_back_error("active_eviction_tombstoned_ids", e.to_string()))?;
-            let Some(tombstone_id) = optional_str_property(
-                "active_eviction_tombstoned_ids",
-                "codegraph_id",
-                node.get_property("codegraph_id"),
-            )?
-            else {
-                continue;
-            };
-            let Some(deleted_id) = optional_str_property(
-                "active_eviction_tombstoned_ids",
-                "deleted_id",
-                node.get_property("deleted_id"),
-            )?
-            else {
-                continue;
-            };
-            if tombstone_id == crate::repo_evict::eviction_tombstone_id(&deleted_id).0
-                && !self.tombstone_node_is_stale(tombstone_node_id, &deleted_id)
-            {
-                suppressed.insert(deleted_id);
-            }
-        }
-        Ok(suppressed)
     }
 
     /// Returns true when the physical tombstone at `tombstone_node_id` no
@@ -4496,11 +4445,19 @@ fn source_span_from_properties<'a>(
     match (start_byte, end_byte, start_line, end_line) {
         (None, None, None, None) => Ok(None),
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => {
+            // Columns are optional extras: present when the producer recorded
+            // them, absent (UNKNOWN) on legacy records; they never participate
+            // in the all-or-nothing span check (issue #463).
+            let start_column =
+                optional_usize_property(record_id, "start_column", get("start_column"))?;
+            let end_column = optional_usize_property(record_id, "end_column", get("end_column"))?;
             Ok(Some(SourceSpan {
                 start_byte,
                 end_byte,
                 start_line,
                 end_line,
+                start_column,
+                end_column,
             }))
         }
         _ => Err(read_back_error(
@@ -4968,11 +4925,20 @@ where
     let end_byte = usize::try_from(get("end_byte")?.as_int()?).ok()?;
     let start_line = usize::try_from(get("start_line")?.as_int()?).ok()?;
     let end_line = usize::try_from(get("end_line")?.as_int()?).ok()?;
+    // Columns are optional: legacy records carry none (issue #463).
+    let start_column = get("start_column")
+        .and_then(::aletheiadb::PropertyValue::as_int)
+        .and_then(|raw| usize::try_from(raw).ok());
+    let end_column = get("end_column")
+        .and_then(::aletheiadb::PropertyValue::as_int)
+        .and_then(|raw| usize::try_from(raw).ok());
     Some(SourceSpan {
         start_byte,
         end_byte,
         start_line,
         end_line,
+        start_column,
+        end_column,
     })
 }
 
@@ -4980,7 +4946,7 @@ fn insert_span(
     builder: ::aletheiadb::PropertyMapBuilder,
     span: SourceSpan,
 ) -> ::aletheiadb::PropertyMapBuilder {
-    builder
+    let builder = builder
         .insert(
             "start_byte",
             i64::try_from(span.start_byte).unwrap_or(i64::MAX),
@@ -4990,7 +4956,17 @@ fn insert_span(
             "start_line",
             i64::try_from(span.start_line).unwrap_or(i64::MAX),
         )
-        .insert("end_line", i64::try_from(span.end_line).unwrap_or(i64::MAX))
+        .insert("end_line", i64::try_from(span.end_line).unwrap_or(i64::MAX));
+    // Column properties are only written when the producer recorded them;
+    // their absence on read-back means UNKNOWN (issue #463).
+    let builder = match span.start_column {
+        Some(column) => builder.insert("start_column", i64::try_from(column).unwrap_or(i64::MAX)),
+        None => builder,
+    };
+    match span.end_column {
+        Some(column) => builder.insert("end_column", i64::try_from(column).unwrap_or(i64::MAX)),
+        None => builder,
+    }
 }
 
 fn insert_temporal(
@@ -6375,6 +6351,79 @@ mod tests {
     }
 
     #[test]
+    fn span_columns_round_trip_through_the_embedded_store() {
+        // Issue #463: Tree-sitter-recorded span columns must persist through
+        // the embedded adapter and read back unchanged; a legacy column-less
+        // span must read back as UNKNOWN (None), never column 0.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("span-columns-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let column_id = stable_id(&["node", "symbol", "src/lib.rs", "columnar"]);
+        let legacy_id = stable_id(&["node", "symbol", "src/lib.rs", "legacy"]);
+        let columnar = GraphRecord::symbol(
+            column_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 4,
+                end_byte: 20,
+                start_line: 2,
+                end_line: 2,
+                start_column: Some(4),
+                end_column: Some(20),
+            },
+            "columnar".to_owned(),
+            "fn columnar".to_owned(),
+        );
+        let legacy = GraphRecord::symbol(
+            legacy_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "legacy".to_owned(),
+            "fn legacy".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&columnar).expect("columnar should write");
+        sink.write_record(&legacy).expect("legacy should write");
+
+        let read_columnar = sink
+            .read_back(column_id.as_str())
+            .expect("columnar read should succeed")
+            .expect("columnar record should be found");
+        let GraphRecord::Node {
+            span: Some(span), ..
+        } = read_columnar
+        else {
+            panic!("columnar symbol should read back with a span");
+        };
+        assert_eq!(span.start_column, Some(4), "start column must survive");
+        assert_eq!(span.end_column, Some(20), "end column must survive");
+
+        let read_legacy = sink
+            .read_back(legacy_id.as_str())
+            .expect("legacy read should succeed")
+            .expect("legacy record should be found");
+        let GraphRecord::Node {
+            span: Some(span), ..
+        } = read_legacy
+        else {
+            panic!("legacy symbol should read back with a span");
+        };
+        assert_eq!(span.start_column, None, "legacy span stays UNKNOWN");
+        assert_eq!(span.end_column, None, "legacy span stays UNKNOWN");
+    }
+
+    #[test]
     fn identical_non_temporal_node_write_is_noop() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("duplicate-exact-node-store");
@@ -7005,6 +7054,8 @@ mod tests {
                 end_byte,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "stable".to_owned(),
             summary.to_owned(),
@@ -7021,6 +7072,8 @@ mod tests {
                 end_byte: 20,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "stable".to_owned(),
             summary.to_owned(),

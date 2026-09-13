@@ -24,44 +24,23 @@
 //! makes `foo::bar` match `foo::bar::Baz` and `foo::bar`, but NEVER
 //! `foo::barbell` (segment boundaries are respected, so no sibling-path bleed).
 //!
-//! ## `crate::` auto-unification (issue #450)
+//! ## `crate::` unification boundary (honest, documented)
 //!
-//! A leading `crate::` in an import denotes the importing file's OWN crate, so
-//! it can be resolved to that crate's absolute `<crate_name>::…` form without
-//! guessing — from facts the graph already carries (issue #440's crate-root
-//! partitioning and issue #117's manifest-stamped package attribution):
+//! The graph carries no per-source-file owning-crate name — a `File` node
+//! records a repo-relative path, and a `Repository` node records a repo
+//! identity, but neither maps a source file to the Cargo crate that compiles
+//! it. Crate names therefore cannot be reliably derived at query time, so this
+//! lane does NOT fabricate `crate::` ↔ `<crate_name>::` unification. Two honest
+//! behaviours ship instead:
 //!
-//! 1. Auxiliary-target files (`src/bin/<t>.rs`, `examples/<t>.rs`,
-//!    `tests/<t>.rs`, `benches/<t>.rs`) compile as their own crate named for
-//!    the TARGET — the #440 crate-root id's `bin:`/`example:`/`test:`/`bench:`
-//!    base carries it, and the owning package's name would be the wrong crate.
-//! 2. Otherwise the record's manifest-stamped `crate_attribution` package
-//!    name, validated per the #104 doctrine
-//!    (`CrateAttribution::owning_package_for`): only a resolver-producible
-//!    value whose cited manifest encloses the record's path counts, so a
-//!    crafted record cannot forge another crate's identity.
-//! 3. Otherwise the #440 workspace-prefix-derived name
-//!    (`crate_name_of`): the last component of the workspace-crate directory
-//!    prefix, cargo-normalized (`-` → `_`). This covers graphs whose records
-//!    predate attribution.
-//!
-//! A query's leading `crate` resolves per import to that import's owning crate
-//! ("the importer's own crate"), so `crate::foo` finds every crate's own
-//! `foo`, and `mycrate::foo` matches both `crate::foo::Bar` (in `mycrate`) and
-//! `mycrate::foo::Baz` — with no flag. When nothing resolves a name (e.g. a
-//! hand-built graph with no attribution), segments match literally, preserving
-//! the old distinct-forms behavior.
-//!
-//! An explicit `--crate <name>` remains as an override: caller-supplied ground
-//! truth that wins over the facts for both the query and every import — for
-//! graphs the facts cannot cover, or when the caller wants to force a name.
-//!
-//! Residual bounds (documented, not hidden): a `[lib] name` override makes the
-//! true crate name differ from the package name; a helper module under an
-//! auxiliary target's directory (`tests/common/mod.rs`) inherits the target
-//! name although its `crate::` resolves to whichever target includes it; and a
-//! leading `self`/`super` is still matched literally (the graph has no module
-//! anchor to resolve a relative prefix soundly).
+//! * By default, segments are matched literally: a `crate`-relative import
+//!   (`crate::foo::Bar`) and an absolute external import (`mycrate::foo::Bar`)
+//!   are DISTINCT, and a leading `self`/`super` is matched literally (the graph
+//!   has no module anchor to resolve a relative prefix soundly).
+//! * With an explicit `--crate <name>`, a leading `crate` segment in EITHER the
+//!   query OR an import is rewritten to `<name>` before matching, so the two
+//!   forms unify: `mycrate::foo` then matches both `crate::foo::Bar` and
+//!   `mycrate::foo::Bar`. This is caller-supplied ground truth, never guessed.
 //!
 //! Liveness follows the shared latest-write-wins [`Liveness`] gate so `--graph`
 //! and `--data-dir` agree on tombstoned / revived Import records.
@@ -226,7 +205,7 @@ pub fn parse_import_segments(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Applies the `crate::` unification: rewrites a leading `crate` segment to the
+/// Applies the `--crate` unification: rewrites a leading `crate` segment to the
 /// supplied crate name so `crate`-relative and absolute forms unify. A no-op
 /// when `crate_name` is `None` or the first segment is not `crate`.
 fn normalize<'seg>(segments: &'seg [String], crate_name: Option<&'seg str>) -> Vec<&'seg str> {
@@ -239,53 +218,6 @@ fn normalize<'seg>(segments: &'seg [String], crate_name: Option<&'seg str>) -> V
     out
 }
 
-/// The crate TARGET name for an auxiliary-target file (`src/bin/<t>.rs`,
-/// `examples/<t>.rs`, `tests/<t>.rs`, `benches/<t>.rs`, and their module
-/// files), `None` for the primary crate root (`lib`) and `build.rs`.
-///
-/// These files compile as their OWN crate named for the target — `crate::`
-/// inside `examples/demo.rs` denotes the `demo` crate, not the owning package —
-/// so the #440 crate-root id's `bin:`/`example:`/`test:`/`bench:` base is the
-/// honest resolution and the package name would be the wrong crate. `build.rs`
-/// falls through to the package name as the best available answer.
-fn aux_target_name(repo_relative_path: &str) -> Option<String> {
-    use crate::languages::cross_file::crate_root_id;
-    // `crate_root_id` is `{workspace_prefix}::{base}` or just `{base}`; the
-    // prefix is `/`-joined so the last `::`-separated component is the base.
-    let root_id = crate_root_id(repo_relative_path);
-    let base = root_id.rsplit("::").next().unwrap_or(&root_id);
-    let target = base
-        .strip_prefix("bin:")
-        .or_else(|| base.strip_prefix("example:"))
-        .or_else(|| base.strip_prefix("test:"))
-        .or_else(|| base.strip_prefix("bench:"))?;
-    // Cargo normalizes `-` to `_` in target-derived crate names, matching the
-    // #440 `crate_name_of` convention.
-    Some(target.replace('-', "_"))
-}
-
-/// Resolves the owning crate name for one Import record's leading `crate::`
-/// (issue #450), or `None` when no fact covers it.
-///
-/// Resolution order: auxiliary-target name (the file's own crate, which the
-/// package name would misname) → manifest-stamped package attribution
-/// (validated per the #104 doctrine, so only a resolver-producible value whose
-/// cited manifest encloses the record's path counts) → the #440
-/// workspace-prefix-derived name (for graphs whose records predate
-/// attribution). Never guessed beyond these facts.
-fn owning_crate_name(record: &GraphRecord, repo_relative_path: &str) -> Option<String> {
-    if let Some(target) = aux_target_name(repo_relative_path) {
-        return Some(target);
-    }
-    if let Some((name, _manifest)) = record
-        .crate_attribution()
-        .and_then(|attribution| attribution.owning_package_for(repo_relative_path))
-    {
-        return Some(name.to_owned());
-    }
-    crate::languages::cross_file::crate_name_of(repo_relative_path)
-}
-
 /// Returns `true` when `query` is a segment-aware prefix of `import`.
 fn is_segment_prefix(query: &[&str], import: &[&str]) -> bool {
     query.len() <= import.len() && import[..query.len()] == *query
@@ -293,11 +225,10 @@ fn is_segment_prefix(query: &[&str], import: &[&str]) -> bool {
 
 /// Returns every file that imports a module path (issue #444).
 ///
-/// `query_path` is a `::`-separated module path; `crate_name` is the explicit
-/// `--crate` override that wins over the auto-resolved owning-crate facts for
-/// both the query and every import (see the module docs). `repo_scope`, when
-/// set, restricts results to Import nodes owned by that repository (resolved
-/// via [`RepositoryIndex::owner_of`]).
+/// `query_path` is a `::`-separated module path; `crate_name` optionally
+/// unifies `crate::` with an absolute crate name (see the module docs).
+/// `repo_scope`, when set, restricts results to Import nodes owned by that
+/// repository (resolved via [`RepositoryIndex::owner_of`]).
 ///
 /// # Errors
 ///
@@ -311,6 +242,7 @@ pub fn who_imports<'a>(
     repo_scope: Option<&str>,
 ) -> Result<WhoImportsResult<'a>, WhoImportsError> {
     let query_segments = parse_query_path(query_path)?;
+    let query_norm = normalize(&query_segments, crate_name);
 
     let liveness = Liveness::new(records);
     let is_owned =
@@ -354,22 +286,7 @@ pub fn who_imports<'a>(
             continue;
         }
         let import_segments = parse_import_segments(import_path);
-        // Auto-unification (issue #450): a leading `crate` in EITHER the query
-        // or the import resolves to this import's owning crate name — the
-        // explicit `--crate` override first, then the owning-crate facts. A
-        // `crate::`-leading query therefore means "the importer's own crate"
-        // per import, and `mycrate::foo` matches `crate::foo::Bar` written in
-        // `mycrate` with no flag. When nothing resolves a name, both stay
-        // literal and segments match as before. The facts are consulted only
-        // when no override is in effect.
-        let auto_name = if crate_name.is_none() {
-            owning_crate_name(record, path)
-        } else {
-            None
-        };
-        let effective: Option<&str> = crate_name.or(auto_name.as_deref());
-        let query_norm = normalize(&query_segments, effective);
-        let import_norm = normalize(&import_segments, effective);
+        let import_norm = normalize(&import_segments, crate_name);
         if !is_segment_prefix(&query_norm, &import_norm) {
             continue;
         }
@@ -403,7 +320,7 @@ pub fn who_imports<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{CrateAttribution, CrateAttributionStatus, Graph, stable_id};
+    use crate::ir::{Graph, stable_id};
 
     fn span(start_line: usize) -> SourceSpan {
         SourceSpan {
@@ -411,6 +328,8 @@ mod tests {
             end_byte: 10,
             start_line,
             end_line: start_line,
+            start_column: None,
+            end_column: None,
         }
     }
 
@@ -431,38 +350,6 @@ mod tests {
             "rust",
             format!("Rust import {name}"),
         ));
-        id
-    }
-
-    /// Pushes an Import node stamped with owning-package attribution (issue
-    /// #117), as `eg scan` produces via `apply_crate_attribution`, so the
-    /// auto-unification tests exercise the real facts rather than a mock.
-    fn import_attributed(
-        graph: &mut Graph,
-        path: &str,
-        name: &str,
-        line: usize,
-        package_name: &str,
-        manifest: &str,
-    ) -> String {
-        let id = import_id(path, name);
-        graph.push(
-            GraphRecord::syntax_node(
-                id.clone(),
-                NodeKind::Import,
-                path.to_owned(),
-                span(line),
-                name.to_owned(),
-                "rust",
-                format!("Rust import {name}"),
-            )
-            .with_crate_attribution(CrateAttribution {
-                status: CrateAttributionStatus::Attributed,
-                package_name: Some(package_name.to_owned()),
-                manifest_repo_relative_path: Some(manifest.to_owned()),
-                unattributed_reason: None,
-            }),
-        );
         id
     }
 
@@ -741,201 +628,6 @@ mod tests {
         // A `crate::` query also unifies when --crate is given.
         let crate_query = who_imports(&recs, "crate::foo", Some("mycrate"), &index, None).unwrap();
         assert_eq!(crate_query.rows.len(), 2);
-    }
-
-    // ── `crate::` auto-unification (issue #450) ──────────────────────────
-    //
-    // A leading `crate::` resolves to the importing file's owning crate from
-    // the facts the graph already carries — no `--crate` flag needed.
-
-    #[test]
-    fn auto_unify_attribution_resolves_crate_without_flag() {
-        // Workspace member `crates/foo`: attribution (from `eg scan`'s nearest
-        // enclosing `Cargo.toml` walk) names the true crate.
-        let mut g = Graph::new();
-        let id = import_attributed(
-            &mut g,
-            "crates/foo/src/x.rs",
-            "crate::bar::Baz",
-            1,
-            "foo",
-            "crates/foo/Cargo.toml",
-        );
-        import_attributed(
-            &mut g,
-            "crates/foo/src/y.rs",
-            "foo::bar::Qux",
-            2,
-            "foo",
-            "crates/foo/Cargo.toml",
-        );
-        let recs = g.into_records();
-
-        // An absolute query unifies with the `crate::` import — no flag.
-        let result = run(&recs, "foo::bar");
-        assert_eq!(result.rows.len(), 2);
-        assert!(result.rows.iter().any(|r| r.record_id == id));
-
-        // A `crate::`-leading query means "the importer's own crate", resolved
-        // per import.
-        let result = run(&recs, "crate::bar");
-        assert_eq!(result.rows.len(), 2);
-    }
-
-    #[test]
-    fn auto_unify_prefers_attribution_over_directory_name() {
-        // The package was renamed relative to its directory: the manifest's
-        // `[package] name` is the true crate name, the directory is not.
-        let mut g = Graph::new();
-        import_attributed(
-            &mut g,
-            "crates/foo-bar/src/x.rs",
-            "crate::q::W",
-            1,
-            "renamed",
-            "crates/foo-bar/Cargo.toml",
-        );
-        let recs = g.into_records();
-
-        assert_eq!(run(&recs, "renamed::q").rows.len(), 1);
-        // The directory-derived `foo_bar` is NOT the crate — no false match.
-        assert!(run(&recs, "foo_bar::q").is_empty());
-    }
-
-    #[test]
-    fn auto_unify_path_derived_name_without_attribution() {
-        // Graphs whose records predate attribution still unify via the #440
-        // workspace-prefix-derived name.
-        let mut g = Graph::new();
-        import(&mut g, "crates/other/src/y.rs", "crate::q::W", 1);
-        // The reverse direction unifies too: an absolute import of the member
-        // matches a `crate::` query resolved to that member.
-        import(&mut g, "crates/other/src/z.rs", "other::q::V", 2);
-        let recs = g.into_records();
-
-        // Both directions unify: the absolute query finds the `crate::`-written
-        // import (resolved to `other::q::W`), and the `crate::` query finds
-        // both rows.
-        assert_eq!(run(&recs, "other::q").rows.len(), 2);
-        assert_eq!(run(&recs, "crate::q").rows.len(), 2);
-    }
-
-    #[test]
-    fn auto_unify_aux_target_uses_target_name_not_package() {
-        // `examples/demo.rs` compiles as its OWN crate named `demo` — `crate::`
-        // there denotes the `demo` crate, so the owning package name `mypkg`
-        // would be the wrong resolution.
-        let mut g = Graph::new();
-        import_attributed(
-            &mut g,
-            "examples/demo.rs",
-            "crate::util::H",
-            1,
-            "mypkg",
-            "Cargo.toml",
-        );
-        import_attributed(
-            &mut g,
-            "src/bin/tool.rs",
-            "crate::cli::X",
-            2,
-            "mypkg",
-            "Cargo.toml",
-        );
-        let recs = g.into_records();
-
-        assert_eq!(run(&recs, "demo::util").rows.len(), 1);
-        assert_eq!(run(&recs, "tool::cli").rows.len(), 1);
-        // The package name must NOT unify with these aux-target `crate::`s.
-        assert!(run(&recs, "mypkg::util").is_empty());
-        assert!(run(&recs, "mypkg::cli").is_empty());
-    }
-
-    #[test]
-    fn auto_unify_single_crate_from_package_attribution() {
-        // A single-crate `src/…` layout has no workspace prefix for the #440
-        // name inference, but the root manifest's package name still resolves
-        // `crate::`.
-        let mut g = Graph::new();
-        import_attributed(&mut g, "src/lib.rs", "crate::m::N", 1, "solo", "Cargo.toml");
-        let recs = g.into_records();
-
-        assert_eq!(run(&recs, "solo::m").rows.len(), 1);
-        assert_eq!(run(&recs, "crate::m").rows.len(), 1);
-    }
-
-    #[test]
-    fn auto_unify_keeps_crates_apart() {
-        // Per-import resolution must not pool same-named modules across crates.
-        let mut g = Graph::new();
-        let a_id = import_attributed(
-            &mut g,
-            "crates/a/src/x.rs",
-            "crate::shared::A",
-            1,
-            "a",
-            "crates/a/Cargo.toml",
-        );
-        import_attributed(
-            &mut g,
-            "crates/b/src/y.rs",
-            "crate::shared::B",
-            2,
-            "b",
-            "crates/b/Cargo.toml",
-        );
-        let recs = g.into_records();
-
-        let result = run(&recs, "a::shared");
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].record_id, a_id);
-
-        // `crate::shared` means each importer's own crate: both match.
-        assert_eq!(run(&recs, "crate::shared").rows.len(), 2);
-    }
-
-    #[test]
-    fn auto_unify_rejects_forged_attribution_fail_closed() {
-        // A record citing a manifest that does not enclose its path is a shape
-        // the resolver never produces (#104 doctrine): the attribution is
-        // ignored and resolution falls back to the #440 path-derived name.
-        let mut g = Graph::new();
-        import_attributed(
-            &mut g,
-            "crates/a/src/x.rs",
-            "crate::q::W",
-            1,
-            "evil",
-            "crates/b/Cargo.toml",
-        );
-        let recs = g.into_records();
-
-        assert!(run(&recs, "evil::q").is_empty());
-        assert_eq!(run(&recs, "a::q").rows.len(), 1);
-    }
-
-    #[test]
-    fn crate_override_wins_over_auto_facts() {
-        // `--crate` stays caller-supplied ground truth: it overrides the facts
-        // for both the query and every import.
-        let mut g = Graph::new();
-        import_attributed(
-            &mut g,
-            "crates/foo/src/x.rs",
-            "crate::bar::Baz",
-            1,
-            "foo",
-            "crates/foo/Cargo.toml",
-        );
-        let recs = g.into_records();
-        let index = RepositoryIndex::build(&recs);
-
-        let forced = who_imports(&recs, "forced::bar", Some("forced"), &index, None).unwrap();
-        assert_eq!(forced.rows.len(), 1);
-        assert_eq!(forced.crate_name.as_deref(), Some("forced"));
-
-        let crate_query = who_imports(&recs, "crate::bar", Some("forced"), &index, None).unwrap();
-        assert_eq!(crate_query.rows.len(), 1);
     }
 
     // ── determinism ──────────────────────────────────────────────────────

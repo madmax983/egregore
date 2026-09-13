@@ -1204,6 +1204,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 end_byte: comment_start_byte + marker.note_end,
                 start_line: line,
                 end_line: line,
+                // Debt-marker offsets are computed from comment byte offsets;
+                // the column within the line is not tracked (issue #463).
+                start_column: None,
+                end_column: None,
             };
             self.graph.push(
                 GraphRecord::syntax_node(
@@ -5078,6 +5082,63 @@ mod tests {
             "only the comment marker may match; the string literal never does"
         );
         assert_eq!(markers[0].note(), Some("real marker"));
+    }
+
+    #[test]
+    fn symbol_spans_carry_tree_sitter_columns() {
+        // Issue #463: every syntax-derived symbol span records zero-based
+        // byte-offset columns, so the SCIP exporter can emit precise ranges
+        // without re-reading source. Columns must agree with the byte offsets
+        // against the source's newline positions.
+        let source = "fn top() {}\n    fn indented() {}\n";
+        let graph = extract_records(source);
+        let mut spans: Vec<SourceSpan> = graph
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    span: Some(span),
+                    ..
+                } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 2, "two function symbols expected");
+        spans.sort_by_key(|span| span.start_byte);
+        for span in &spans {
+            assert!(
+                span.start_column.is_some() && span.end_column.is_some(),
+                "extractor must record columns: {span:?}"
+            );
+        }
+        // The indented declaration starts four bytes into its line.
+        let indented = spans
+            .iter()
+            .find(|span| span.start_line == 2)
+            .expect("line-2 symbol");
+        assert_eq!(indented.start_column, Some(4));
+
+        let mut line_starts = vec![0usize];
+        for (index, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(index + 1);
+            }
+        }
+        for span in &spans {
+            let start_line_start = line_starts[span.start_line - 1];
+            let end_line_start = line_starts[span.end_line - 1];
+            assert_eq!(
+                span.start_column,
+                Some(span.start_byte - start_line_start),
+                "start column is the byte offset from line start"
+            );
+            assert_eq!(
+                span.end_column,
+                Some(span.end_byte - end_line_start),
+                "end column is the byte offset from line start"
+            );
+        }
     }
 
     /// Extracts `source` and returns the graph records (issue #206 helpers).

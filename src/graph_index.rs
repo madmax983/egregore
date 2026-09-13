@@ -697,6 +697,8 @@ mod tests {
             end_byte: 100,
             start_line: a,
             end_line: b,
+            start_column: None,
+            end_column: None,
         }
     }
 

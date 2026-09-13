@@ -24,10 +24,11 @@ follow-ups track lifting these limits:
   occurrences._ The extractor computes per-call-site spans but drops them when
   deduplicating edges; retaining them unlocks reference occurrences (implies a
   codegraph schema decision).
-* **#463** — _Column-precision SCIP ranges._ Ranges are currently line-granular
-  at column 0 because `SourceSpan` stores byte offsets + 1-based lines but no
-  columns; precise columns need extractor-stored columns or an opt-in
-  export-time source re-read.
+* **#463** — _Column-precision SCIP ranges._ **Implemented**: the Tree-sitter
+  extractors record zero-based byte-offset columns on `SourceSpan`
+  (`start_column` / `end_column`, additive and never identity inputs), so
+  definition ranges are column-precise with no source re-read; column-less
+  legacy spans degrade to the whole-line fallback.
 
 ---
 
@@ -64,10 +65,16 @@ format.
 | `visibility` / `signature` / `doc` on a symbol | `documentation[]` (visibility + doc text) and `signature_documentation` (the declaration header) |
 | `Repository` node name | the moniker package name + the `project_root` URI |
 
-Each definition `Occurrence.range` is a **whole-line span**
-`[start_line - 1, 0, end_line, 0]` — SCIP's 0-based lines derived from Egregore's
-1-based `SourceSpan`, column 0, with **no source re-read** (see #463 for column
-precision). The index `Metadata` carries `tool_info` (`name: "egregore"`, the
+Each definition `Occurrence.range` is **column-precise** whenever the extractor
+recorded columns: `[start_line - 1, start_column, end_line - 1, end_column]` —
+SCIP's 0-based, half-open lines/characters derived from Egregore's 1-based
+`SourceSpan` plus its zero-based byte-offset columns, with **no source re-read**
+(issue #463). Spans from legacy graphs or non-tree-sitter sources carry no
+columns and degrade honestly to the whole-line fallback
+`[start_line - 1, 0, end_line, 0]`. Every `Document` declares
+`position_encoding: UTF8CodeUnitOffsetFromLineStart` so consumers interpret the
+`character` values as the UTF-8 byte offsets the Tree-sitter extractors record.
+The index `Metadata` carries `tool_info` (`name: "egregore"`, the
 crate version), `project_root` as a `file://` URI, and `text_document_encoding:
 UTF8`.
 
@@ -147,7 +154,6 @@ SCIP interchange format instead; it does not alter the JSONL dump.
 
 * **Reference / implementation occurrences** (callers, implementors) — blocked on
   positional edge data (#462), plus the edge-resolution work #134/#148/#152.
-* **Column-precise ranges** — #463.
 * **LSIF emission**, **temporal / historical export** (SCIP is single-snapshot),
   **importing SCIP** produced by other indexers, and any **hosted indexing,
   remote crawl, or automatic upload**.

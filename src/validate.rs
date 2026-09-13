@@ -1232,6 +1232,8 @@ mod tests {
                 end_byte: 1,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             }),
             Some("n".to_owned()),
             "test node".to_owned(),

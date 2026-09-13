@@ -301,9 +301,13 @@ pub fn normalize_c_like_code(code: &str, raw_delims: &[char]) -> String {
     result.trim().to_owned()
 }
 
-/// Builds a [`SourceSpan`] from a Tree-sitter node's byte and line positions.
+/// Builds a [`SourceSpan`] from a Tree-sitter node's byte, line, and column
+/// positions (issue #463).
 ///
-/// Line numbers are 1-based to match editor conventions.
+/// Line numbers are 1-based to match editor conventions; columns are 0-based
+/// byte offsets from the start of the line (Tree-sitter `Point.column`
+/// semantics), which the SCIP exporter declares as
+/// `UTF8CodeUnitOffsetFromLineStart`.
 #[must_use]
 pub fn span(node: Node<'_>) -> SourceSpan {
     SourceSpan {
@@ -311,6 +315,8 @@ pub fn span(node: Node<'_>) -> SourceSpan {
         end_byte: node.end_byte(),
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
+        start_column: Some(node.start_position().column),
+        end_column: Some(node.end_position().column),
     }
 }
 
@@ -397,5 +403,37 @@ mod tests {
         assert!(looks_like_call("let x = prerun; run()", "run"));
         assert!(looks_like_call("(run())", "run"));
         assert!(!looks_like_call("anything", ""));
+    }
+
+    #[test]
+    fn span_records_zero_based_byte_offset_columns() {
+        // Issue #463: columns are zero-based byte offsets from the start of
+        // the line (Tree-sitter `Point.column` semantics), matching the SCIP
+        // `UTF8CodeUnitOffsetFromLineStart` position encoding.
+        let source = "fn top() {}\n    fn indented() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar loads");
+        let tree = parser.parse(source, None).expect("source parses");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let items: Vec<tree_sitter::Node<'_>> = root
+            .children(&mut cursor)
+            .filter(|node| node.kind() == "function_item")
+            .collect();
+        assert_eq!(items.len(), 2);
+
+        let top = span(items[0]);
+        assert_eq!(top.start_line, 1);
+        assert_eq!(top.start_column, Some(0));
+        assert_eq!(top.end_line, 1);
+        assert_eq!(top.end_column, Some("fn top() {}".len()));
+
+        let indented = span(items[1]);
+        assert_eq!(indented.start_line, 2);
+        assert_eq!(indented.start_column, Some(4));
+        assert_eq!(indented.end_line, 2);
+        assert_eq!(indented.end_column, Some(4 + "fn indented() {}".len()));
     }
 }

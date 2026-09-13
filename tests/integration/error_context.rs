@@ -51,6 +51,8 @@ const fn span(start: usize, end: usize) -> SourceSpan {
         end_byte: 0,
         start_line: start,
         end_line: end,
+        start_column: None,
+        end_column: None,
     }
 }
 

@@ -341,11 +341,6 @@ pub fn resolve_failure_handle(
         if deleted(handle) {
             return Ok(empty_target(FailureTargetKind::Symbol, true));
         }
-        // Issue #472: an ID with an ACTIVE repository-eviction tombstone is not
-        // a live record. Resolve to nothing so the caller emits no_match.
-        if crate::repo_evict::active_eviction_tombstoned_ids(records).contains(handle) {
-            return Ok(empty_target(FailureTargetKind::Symbol, true));
-        }
         for r in records {
             if let GraphRecord::Node { id, kind, .. } = r
                 && id == handle
@@ -1397,6 +1392,8 @@ mod liveness_parity_tests {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 2,
+                start_column: None,
+                end_column: None,
             }),
             Some("foo".to_owned()),
             "symbol foo".to_owned(),

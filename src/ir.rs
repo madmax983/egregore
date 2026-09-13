@@ -4136,7 +4136,15 @@ impl CrateAttributionReason {
     }
 }
 
-/// Source byte and line span for syntax-backed records.
+/// Source byte, line, and column span for syntax-backed records.
+///
+/// Columns are zero-based byte offsets from the start of the line (Tree-sitter
+/// `Point.column` semantics), matching the SCIP
+/// `UTF8CodeUnitOffsetFromLineStart` position encoding the exporter declares.
+/// `None` means the producer did not record columns (legacy records and
+/// non-tree-sitter sources such as GitHub line anchors); an absent field is
+/// UNKNOWN, never "column 0". Columns are coordinates, not identity inputs
+/// (ADR-0004).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct SourceSpan {
     /// Start byte, inclusive.
@@ -4147,6 +4155,12 @@ pub struct SourceSpan {
     pub start_line: usize,
     /// One-based end line.
     pub end_line: usize,
+    /// Zero-based start column (UTF-8 byte offset from line start), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<usize>,
+    /// Zero-based end column, exclusive, same units as `start_column`, if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
 }
 
 /// Builds a stable code-graph ID from semantic, repo-relative inputs.
@@ -4474,5 +4488,64 @@ mod label_inventory_tests {
                 label.as_str()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod source_span_tests {
+    use super::SourceSpan;
+
+    fn columnar() -> SourceSpan {
+        SourceSpan {
+            start_byte: 4,
+            end_byte: 20,
+            start_line: 2,
+            end_line: 2,
+            start_column: Some(4),
+            end_column: Some(20),
+        }
+    }
+
+    #[test]
+    fn columns_round_trip_through_json() {
+        let span = columnar();
+        let json = serde_json::to_string(&span).expect("serialize");
+        assert!(
+            json.contains("\"start_column\":4"),
+            "columns serialize: {json}"
+        );
+        assert!(
+            json.contains("\"end_column\":20"),
+            "columns serialize: {json}"
+        );
+        let back: SourceSpan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, span);
+    }
+
+    #[test]
+    fn absent_columns_serialize_without_the_keys() {
+        // Absent must mean UNKNOWN — never a null a reader could mistake for
+        // a computed "column 0" (issue #463, same contract as #117).
+        let span = SourceSpan {
+            start_column: None,
+            end_column: None,
+            ..columnar()
+        };
+        let json = serde_json::to_string(&span).expect("serialize");
+        assert!(
+            !json.contains("start_column") && !json.contains("end_column"),
+            "column-less spans must omit the keys entirely: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_span_json_without_columns_deserializes_to_unknown() {
+        // A pre-#463 v9 span line carries no column keys; it must still parse
+        // and read back as UNKNOWN, not column 0 (issue #463).
+        let legacy = r#"{"start_byte":4,"end_byte":20,"start_line":2,"end_line":2}"#;
+        let span: SourceSpan = serde_json::from_str(legacy).expect("legacy parses");
+        assert_eq!(span.start_column, None);
+        assert_eq!(span.end_column, None);
+        assert_eq!(span.start_line, 2);
     }
 }

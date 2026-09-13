@@ -216,6 +216,8 @@ mod tests {
             end_byte: 10,
             start_line,
             end_line: start_line,
+            start_column: None,
+            end_column: None,
         }
     }
 

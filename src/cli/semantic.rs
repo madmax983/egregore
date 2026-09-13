@@ -1269,6 +1269,8 @@ mod semantic_contract {
             end_byte: 5200,
             start_line: 142,
             end_line: 168,
+            start_column: None,
+            end_column: None,
         }
     }
 

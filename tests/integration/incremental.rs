@@ -79,6 +79,8 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
             end_byte: 28,
             start_line: 1,
             end_line: 1,
+            start_column: None,
+            end_column: None,
         },
         "bar".to_owned(),
         "Rust function bar".to_owned(),

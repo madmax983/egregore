@@ -66,6 +66,8 @@ fn seed_records() -> Vec<GraphRecord> {
                 end_byte: 20,
                 start_line: 1,
                 end_line: 1,
+                start_column: None,
+                end_column: None,
             },
             "contended".to_owned(),
             "contended target symbol".to_owned(),

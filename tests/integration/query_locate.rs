@@ -192,6 +192,8 @@ fn observation_bundle_graph() -> (tempfile::TempDir, PathBuf, String) {
             end_byte: 120,
             start_line: 5,
             end_line: 9,
+            start_column: None,
+            end_column: None,
         },
         "target_fn".to_owned(),
         format!("Rust fn target_fn at {path}:5"),
@@ -374,6 +376,8 @@ const fn line_span(start_line: usize, end_line: usize) -> SourceSpan {
         end_byte: end_line * 10 + 5,
         start_line,
         end_line,
+        start_column: None,
+        end_column: None,
     }
 }
 

@@ -136,7 +136,6 @@ use crate::{
 /// cached: it is recomputed on every refresh, so a source file byte-identical
 /// to its cached version whose owning `Cargo.toml` was added, renamed, or
 /// deleted is still re-attributed.
-///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
