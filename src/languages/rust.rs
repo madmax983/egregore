@@ -218,6 +218,15 @@ struct RustExtractor<'graph, 'source> {
     /// collected) and restored on exit, so `call_site_fact` can stamp a
     /// provable `receiver_type` on `x.method()` when `x` is in this map.
     type_env: BTreeMap<String, String>,
+    /// Per-function trait-dispatch environment (issue #267): a receiver binding
+    /// identifier -> the trait path as written in source, built alongside
+    /// [`type_env`](Self::type_env) for bindings provably trait-typed — a
+    /// `&dyn Trait` ascription (params and `let` bindings), or a generic type
+    /// parameter with exactly one trait bound (`fn g<T: Trait>(t: T)` / `where
+    /// T: Trait`). Same shadowing veto as `type_env`: shadowed bindings are
+    /// dropped. Set/restored with `type_env` so `call_site_fact` can stamp
+    /// `dispatch_trait` on `x.method()` when `x` is in this map.
+    dispatch_trait_env: BTreeMap<String, String>,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -259,6 +268,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .first()
                 .is_some_and(|segment| segment == "tests"),
             type_env: BTreeMap::new(),
+            dispatch_trait_env: BTreeMap::new(),
         }
     }
 
@@ -691,14 +701,18 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             });
         }
         // Build this function's provable receiver-type environment (issue #441)
-        // and install it for the duration of the call-site collection, then
-        // restore the caller's environment. Nested functions collect their own
-        // call sites through their own `extract_function` and build their own
-        // environment, so scopes never bleed.
-        let type_env = self.build_type_env(node);
+        // and trait-dispatch environment (issue #267) and install them for the
+        // duration of the call-site collection, then restore the caller's
+        // environments. Nested functions collect their own call sites through
+        // their own `extract_function` and build their own environments, so
+        // scopes never bleed.
+        let (type_env, dispatch_trait_env) = self.build_type_env(node);
         let outer_type_env = std::mem::replace(&mut self.type_env, type_env);
+        let outer_dispatch_env =
+            std::mem::replace(&mut self.dispatch_trait_env, dispatch_trait_env);
         self.collect_call_sites(node, &id, &qualified_name);
         self.type_env = outer_type_env;
+        self.dispatch_trait_env = outer_dispatch_env;
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
@@ -806,91 +820,122 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if function.kind() == "generic_function" {
             function = function.child_by_field_name("function")?;
         }
-        let (display, segments, call_kind, receiver_owner, path_root, receiver_type) =
-            match function.kind() {
-                "identifier" => {
-                    let name = self.node_text(function).trim().to_owned();
-                    (
-                        name.clone(),
-                        vec![name],
-                        CallKind::Direct,
-                        None,
-                        CallPathRoot::Unqualified,
-                        None,
-                    )
+        let (
+            display,
+            segments,
+            call_kind,
+            receiver_owner,
+            path_root,
+            receiver_type,
+            dispatch_trait,
+        ) = match function.kind() {
+            "identifier" => {
+                let name = self.node_text(function).trim().to_owned();
+                (
+                    name.clone(),
+                    vec![name],
+                    CallKind::Direct,
+                    None,
+                    CallPathRoot::Unqualified,
+                    None,
+                    None,
+                )
+            }
+            "scoped_identifier" => {
+                let display = self.node_text(function).trim().to_owned();
+                let segments = self.normalize_call_path(&display)?;
+                // Classify the leading crate scope BEFORE it is lost to
+                // normalization (issue #440): a `crate`/`self`/`super` head names
+                // the caller's own crate; any other head may name a workspace
+                // crate, so retain the raw first segment for the registry lookup.
+                let path_root = match display.split("::").next().map(str::trim) {
+                    Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
+                    Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
+                    _ => CallPathRoot::Unqualified,
+                };
+                (
+                    display,
+                    segments,
+                    CallKind::Path,
+                    None,
+                    path_root,
+                    None,
+                    None,
+                )
+            }
+            "field_expression" => {
+                let field = function.child_by_field_name("field")?;
+                if field.kind() != "field_identifier" {
+                    return None;
                 }
-                "scoped_identifier" => {
-                    let display = self.node_text(function).trim().to_owned();
-                    let segments = self.normalize_call_path(&display)?;
-                    // Classify the leading crate scope BEFORE it is lost to
-                    // normalization (issue #440): a `crate`/`self`/`super` head names
-                    // the caller's own crate; any other head may name a workspace
-                    // crate, so retain the raw first segment for the registry lookup.
-                    let path_root = match display.split("::").next().map(str::trim) {
-                        Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
-                        Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
-                        _ => CallPathRoot::Unqualified,
-                    };
-                    (display, segments, CallKind::Path, None, path_root, None)
-                }
-                "field_expression" => {
-                    let field = function.child_by_field_name("field")?;
-                    if field.kind() != "field_identifier" {
-                        return None;
-                    }
-                    let name = self.node_text(field).trim().to_owned();
-                    let receiver_value = function.child_by_field_name("value");
-                    let receiver_is_self =
-                        receiver_value.is_some_and(|value| value.kind() == "self");
-                    let owner = receiver_is_self
-                        .then(|| {
-                            // A `self.method()` receiver call carries the owner of
-                            // the enclosing `Self` so the SelfMethod branch can
-                            // narrow to it: the impl owner inside an impl block
-                            // (unchanged), else the enclosing trait name inside a
-                            // trait body (issue #390). Inside a trait there is no
-                            // `impl_context`, so before this the owner was None and
-                            // the call collapsed to a plain `Method` that fanned out
-                            // to every same-named trait method. `impl_context` takes
-                            // precedence when both are set (a nested impl inside a
-                            // trait default body). The trait name is the raw
-                            // `trait_context` string, matching the trait-method
-                            // owner segment in `definition_match_segments`.
-                            self.impl_context
-                                .as_ref()
-                                .and_then(|impl_context| {
-                                    normalize_impl_owner(&impl_context.method_owner)
-                                })
-                                .or_else(|| self.trait_context.clone())
-                        })
-                        .flatten();
-                    let call_kind = if owner.is_some() {
-                        CallKind::SelfMethod
-                    } else {
-                        CallKind::Method
-                    };
-                    // Provable receiver type (issue #441): for a non-`self` receiver
-                    // that is a simple `identifier` binding whose type is in this
-                    // function's unshadowed type environment, stamp the reduced
-                    // nominal type so the resolver can narrow `x.method()` to that
-                    // type's own method. A `self` receiver keeps `receiver_owner`
-                    // only; a receiver that is not a bare identifier, or whose name
-                    // is not a provable binding, gets `None` (today's fan-out).
-                    let receiver_type = (!receiver_is_self)
-                        .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
-                        .flatten()
-                        .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
-                    (
-                        name.clone(),
-                        vec![name],
-                        call_kind,
-                        owner,
-                        CallPathRoot::Unqualified,
-                        receiver_type,
-                    )
-                }
-                _ => return None,
-            };
+                let name = self.node_text(field).trim().to_owned();
+                let receiver_value = function.child_by_field_name("value");
+                let receiver_is_self = receiver_value.is_some_and(|value| value.kind() == "self");
+                let owner = receiver_is_self
+                    .then(|| {
+                        // A `self.method()` receiver call carries the owner of
+                        // the enclosing `Self` so the SelfMethod branch can
+                        // narrow to it: the impl owner inside an impl block
+                        // (unchanged), else the enclosing trait name inside a
+                        // trait body (issue #390). Inside a trait there is no
+                        // `impl_context`, so before this the owner was None and
+                        // the call collapsed to a plain `Method` that fanned out
+                        // to every same-named trait method. `impl_context` takes
+                        // precedence when both are set (a nested impl inside a
+                        // trait default body). The trait name is the raw
+                        // `trait_context` string, matching the trait-method
+                        // owner segment in `definition_match_segments`.
+                        self.impl_context
+                            .as_ref()
+                            .and_then(|impl_context| {
+                                normalize_impl_owner(&impl_context.method_owner)
+                            })
+                            .or_else(|| self.trait_context.clone())
+                    })
+                    .flatten();
+                let call_kind = if owner.is_some() {
+                    CallKind::SelfMethod
+                } else {
+                    CallKind::Method
+                };
+                // Provable receiver type (issue #441): for a non-`self` receiver
+                // that is a simple `identifier` binding whose type is in this
+                // function's unshadowed type environment, stamp the reduced
+                // nominal type so the resolver can narrow `x.method()` to that
+                // type's own method. A `self` receiver keeps `receiver_owner`
+                // only; a receiver that is not a bare identifier, or whose name
+                // is not a provable binding, gets `None` (today's fan-out).
+                let receiver_type = (!receiver_is_self)
+                    .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+                    .flatten()
+                    .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
+                // Provable trait-dispatch binding (issue #267): for a
+                // non-`self` receiver that is a simple `identifier` binding
+                // whose ascribed type is provably trait-typed (`&dyn
+                // Trait`, `Box<dyn Trait>`, or a single-bound type
+                // parameter), stamp the trait path as written so the
+                // resolver can expand the call to every known in-crate
+                // implementor method.
+                let dispatch_trait = (!receiver_is_self)
+                    .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+                    .flatten()
+                    .and_then(|value| {
+                        self.dispatch_trait_env
+                            .get(self.node_text(value).trim())
+                            .cloned()
+                    });
+                (
+                    name.clone(),
+                    vec![name],
+                    call_kind,
+                    owner,
+                    CallPathRoot::Unqualified,
+                    receiver_type,
+                    dispatch_trait,
+                )
+            }
+            _ => return None,
+        };
         if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
             return None;
         }
@@ -903,6 +948,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             path_root,
             receiver_owner,
             receiver_type,
+            dispatch_trait,
             span: span(node),
         })
     }
@@ -953,9 +999,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         })
     }
 
-    /// Builds the per-function provable receiver-type environment (issue #441):
-    /// binding identifier -> reduced nominal type path, for a receiver whose
-    /// type is syntactically PROVABLE and UNSHADOWED in the function body.
+    /// Builds the per-function receiver-type environment (issue #441) AND the
+    /// trait-dispatch environment (issue #267).
     ///
     /// Entries come from (a) fn params with a simple-identifier pattern and a
     /// nominal type, and (b) `let x: T` declarations with a simple-identifier
@@ -963,17 +1008,35 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// pointer, and single-level generic types reduce to their core nominal
     /// type; anything else yields no entry ([`reduce_receiver_type`]).
     ///
+    /// The dispatch environment maps a binding to its trait path as written
+    /// when the ascribed type is provably trait-typed: a `dyn Trait` type
+    /// (directly, or inside `Box`/`Rc`/`Arc` — the std smart pointers whose
+    /// method calls deref to the trait object), or a bare type parameter with
+    /// exactly one trait bound (`fn g<T: Trait>(t: T)`, `where T: Trait`).
+    /// Multi-bound parameters and non-`dyn` types yield no dispatch entry.
+    ///
     /// SHADOWING VETO (conservative): every binding occurrence of each
     /// identifier anywhere in the body is counted — additional `let` shadows,
     /// `for x in`, closure params, `if let`/`while let`, and `match` arm
     /// bindings, including nested destructuring. Any identifier bound at MORE
-    /// THAN ONE site is non-provable and dropped, so a shadowed receiver falls
-    /// back to today's ambiguous fan-out (prefer a MISSING narrowing to a WRONG
-    /// one). Only expression-position identifiers (the receiver USE `x.m()`)
-    /// are never counted as binders, so a single typed binding survives.
-    fn build_type_env(&self, fn_node: Node<'_>) -> BTreeMap<String, String> {
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
+    /// THAN ONE site is non-provable and dropped from BOTH environments, so a
+    /// shadowed receiver falls back to today's ambiguous fan-out (prefer a
+    /// MISSING narrowing to a WRONG one). Only expression-position identifiers
+    /// (the receiver USE `x.m()`) are never counted as binders, so a single
+    /// typed binding survives.
+    fn build_type_env(
+        &self,
+        fn_node: Node<'_>,
+    ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let mut type_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut dispatch_env: BTreeMap<String, String> = BTreeMap::new();
         let mut binder_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+        // Type-parameter trait bounds for generic dispatch (issue #267): `T`
+        // -> its single trait bound's as-written path, from inline bounds and
+        // `where` clauses alike.
+        let mut type_param_bounds: BTreeMap<String, String> = BTreeMap::new();
+        self.collect_type_param_bounds(fn_node, &mut type_param_bounds);
 
         if let Some(params) = fn_node.child_by_field_name("parameters") {
             let mut cursor = params.walk();
@@ -990,21 +1053,123 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 for ident in &idents {
                     *binder_counts.entry(ident.clone()).or_default() += 1;
                 }
-                if pattern.kind() == "identifier"
-                    && let Some(type_node) = param.child_by_field_name("type")
-                    && let Some(reduced) = reduce_receiver_type(type_node, self.source)
-                {
-                    env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                if pattern.kind() != "identifier" {
+                    continue;
+                }
+                let Some(type_node) = param.child_by_field_name("type") else {
+                    continue;
+                };
+                let binding = self.node_text(pattern).trim().to_owned();
+                // Dispatch first: a `dyn Trait` ascription (even wrapped in
+                // `Box`/`Rc`/`Arc`) is trait-typed, never a nominal receiver
+                // type — `reduce_receiver_type` would reduce `Box<dyn Trait>`
+                // to the misleading `Box`.
+                if let Some(trait_path) = reduce_dispatch_trait(type_node, self.source) {
+                    dispatch_env.insert(binding, trait_path);
+                } else if let Some(reduced) = reduce_receiver_type(type_node, self.source) {
+                    type_env.insert(binding.clone(), reduced.clone());
+                    // A generic type-parameter receiver (`fn g<T: Trait>(t: T)`
+                    // or `fn g<T>(t: &T) where T: Trait`): the bound is the
+                    // dispatch trait.
+                    if let Some(bound) = type_param_bounds.get(reduced.as_str()) {
+                        dispatch_env.insert(binding, bound.clone());
+                    }
                 }
             }
         }
 
         if let Some(body) = fn_node.child_by_field_name("body") {
-            self.scan_body_binders(body, &mut env, &mut binder_counts);
+            self.scan_body_binders(
+                body,
+                &mut type_env,
+                &mut dispatch_env,
+                &type_param_bounds,
+                &mut binder_counts,
+            );
         }
 
-        env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
-        env
+        type_env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
+        dispatch_env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
+        (type_env, dispatch_env)
+    }
+
+    /// Collects `type_parameter_name -> single trait bound path` from a
+    /// function item's inline `type_parameters` and its `where_clause`
+    /// (issue #267). Only a parameter with EXACTLY ONE DISTINCT simple trait
+    /// bound across BOTH sources is recorded: bounds accumulate per parameter
+    /// (a `T: A` inline plus a `T: B` where-clause is two bounds, not one),
+    /// and multi-bound, lifetime-only, or complex bounds yield nothing.
+    fn collect_type_param_bounds(&self, fn_node: Node<'_>, out: &mut BTreeMap<String, String>) {
+        let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut push_bound = |name: String, bound: String| {
+            let entry = accumulated.entry(name).or_default();
+            if !entry.contains(&bound) {
+                entry.push(bound);
+            }
+        };
+        if let Some(params) = fn_node.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            let children: Vec<Node<'_>> = params.named_children(&mut cursor).collect();
+            for param in children {
+                if param.kind() != "type_parameter" {
+                    continue;
+                }
+                let Some(name_node) = param.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = node_source(name_node, self.source).trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(bounds) = param.child_by_field_name("bounds")
+                    && let Some(trait_path) = single_trait_bound_path(bounds, self.source)
+                {
+                    push_bound(name, trait_path);
+                }
+            }
+        }
+        // Where clauses: `fn g<T>(...) where T: Trait`. The grammar exposes the
+        // `where_clause` as a direct named child of the function item, not a
+        // field.
+        let where_clause = {
+            let mut cursor = fn_node.walk();
+            fn_node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "where_clause")
+        };
+        if let Some(where_clause) = where_clause {
+            let mut cursor = where_clause.walk();
+            let children: Vec<Node<'_>> = where_clause.named_children(&mut cursor).collect();
+            for predicate in children {
+                if predicate.kind() != "where_predicate" {
+                    continue;
+                }
+                let Some(left) = predicate.child_by_field_name("left") else {
+                    continue;
+                };
+                // A bare type parameter's `left` is a `type_identifier`; a
+                // concrete type's predicate (`where Vec<T>: Clone`) is not a
+                // dispatch source.
+                if left.kind() != "type_identifier" {
+                    continue;
+                }
+                let name = node_source(left, self.source).trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(bounds) = predicate.child_by_field_name("bounds")
+                    && let Some(trait_path) = single_trait_bound_path(bounds, self.source)
+                {
+                    push_bound(name, trait_path);
+                }
+            }
+        }
+        for (name, bounds) in accumulated {
+            // Exactly one DISTINCT bound across inline and where sources.
+            if let [bound] = bounds.as_slice() {
+                out.insert(name, bound.clone());
+            }
+        }
     }
 
     /// Recursively scans a function body, recording `let x: T` type-env entries
@@ -1017,7 +1182,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn scan_body_binders(
         &self,
         node: Node<'_>,
-        env: &mut BTreeMap<String, String>,
+        type_env: &mut BTreeMap<String, String>,
+        dispatch_env: &mut BTreeMap<String, String>,
+        type_param_bounds: &BTreeMap<String, String>,
         binder_counts: &mut BTreeMap<String, usize>,
     ) {
         let kind = node.kind();
@@ -1031,9 +1198,18 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     }
                     if pattern.kind() == "identifier"
                         && let Some(type_node) = node.child_by_field_name("type")
-                        && let Some(reduced) = reduce_receiver_type(type_node, self.source)
                     {
-                        env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                        let binding = self.node_text(pattern).trim().to_owned();
+                        // Dispatch first, mirroring the param handling above:
+                        // a `dyn Trait` ascription is trait-typed.
+                        if let Some(trait_path) = reduce_dispatch_trait(type_node, self.source) {
+                            dispatch_env.insert(binding, trait_path);
+                        } else if let Some(reduced) = reduce_receiver_type(type_node, self.source) {
+                            type_env.insert(binding.clone(), reduced.clone());
+                            if let Some(bound) = type_param_bounds.get(reduced.as_str()) {
+                                dispatch_env.insert(binding, bound.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -1071,7 +1247,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         for child in children {
-            self.scan_body_binders(child, env, binder_counts);
+            self.scan_body_binders(
+                child,
+                type_env,
+                dispatch_env,
+                type_param_bounds,
+                binder_counts,
+            );
         }
     }
 
@@ -1762,7 +1944,28 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
+        // Issue #267: (body ID, simple callee name) pairs with a trait-dispatch
+        // call site are repo-wide owned — the cross-file pass emits those
+        // pairs with their resolution labels (same-file included). The textual
+        // pass stays silent for them so its unlabeled edges never collide with
+        // (shadow) the owning pass's stable edge IDs.
+        let suppressed: BTreeSet<(String, String)> = self
+            .facts
+            .call_sites
+            .iter()
+            .filter(|call| call.dispatch_trait.is_some())
+            .filter_map(|call| {
+                call.callee_segments
+                    .last()
+                    .map(|name| (call.caller_id.clone(), name.clone()))
+            })
+            .collect();
+        emit_reference_edges(
+            self.graph,
+            &self.definitions,
+            &self.symbol_bodies,
+            &suppressed,
+        );
     }
 
     /// Resolves every deferred impl trait lookup after the whole file has
@@ -3131,6 +3334,105 @@ fn reduce_receiver_type(type_node: Node<'_>, source: &str) -> Option<String> {
             _ => return None,
         }
     }
+}
+
+/// Reduces a type ascription to its dispatch-trait path (issue #267): returns
+/// `Some` when the ascribed type is provably a trait object or a single-bound
+/// generic wrapper around one — the trait path as written in source. Peels
+/// reference/pointer wrappers (`&dyn Trait`, `&mut dyn Trait`, `*const dyn
+/// Trait`) and recurses into the type arguments of the std Deref smart
+/// pointers `Box`/`Rc`/`Arc` (`Box<dyn Trait>`), because method calls on those
+/// always deref to the trait object (inherent methods on these foreign types
+/// are impossible, so no static method set can be shadowed). Any other shape
+/// — nominal types, other generic wrappers, multi-trait `dyn A + B` — yields
+/// `None`: a MISSING dispatch hint beats a WRONG one.
+fn reduce_dispatch_trait(type_node: Node<'_>, source: &str) -> Option<String> {
+    let mut core = type_node;
+    loop {
+        match core.kind() {
+            "reference_type" | "pointer_type" => {
+                core = core.child_by_field_name("type")?;
+            }
+            "generic_type" => {
+                let base = core.child_by_field_name("type")?;
+                let base_leaf = node_source(base, source)
+                    .trim()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default();
+                if !matches!(base_leaf, "Box" | "Rc" | "Arc") {
+                    return None;
+                }
+                let args = core.child_by_field_name("type_arguments")?;
+                let mut cursor = args.walk();
+                let mut found: Option<String> = None;
+                for arg in args.named_children(&mut cursor) {
+                    if let Some(trait_path) = reduce_dispatch_trait(arg, source) {
+                        found = Some(trait_path);
+                        break;
+                    }
+                }
+                return found;
+            }
+            "dynamic_type" => {
+                return dispatch_trait_of_dynamic(core, source);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The trait path of a `dyn Trait` node (issue #267): the `trait` field's
+/// as-written path for a simple `type_identifier`/`scoped_type_identifier`;
+/// `None` for anything else (generic trait objects, `dyn A + B` shapes the
+/// grammar does not expose as a plain trait path).
+fn dispatch_trait_of_dynamic(dynamic_node: Node<'_>, source: &str) -> Option<String> {
+    let trait_node = dynamic_node.child_by_field_name("trait")?;
+    match trait_node.kind() {
+        "type_identifier" | "scoped_type_identifier" => {
+            let text = node_source(trait_node, source).trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The trait path when a `trait_bounds` node carries exactly one simple trait
+/// path and no other trait bounds (issue #267); `None` otherwise. Lifetime
+/// bounds (`'static`) are ignored — they don't affect method dispatch.
+/// Multi-bound parameters refuse to guess: dispatch through one of several
+/// bounds is not provable from syntax alone.
+fn single_trait_bound_path(bounds: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = bounds.walk();
+    let mut trait_paths: Vec<String> = Vec::new();
+    for child in bounds.named_children(&mut cursor) {
+        match child.kind() {
+            "lifetime" => {}
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_source(child, source).trim();
+                if text.is_empty() {
+                    return None;
+                }
+                trait_paths.push(text.to_owned());
+            }
+            "generic_type" => {
+                // `T: Into<String>` — the dispatch trait is the base path.
+                let base = child.child_by_field_name("type")?;
+                if !matches!(base.kind(), "type_identifier" | "scoped_type_identifier") {
+                    return None;
+                }
+                let text = node_source(base, source).trim();
+                if text.is_empty() {
+                    return None;
+                }
+                trait_paths.push(text.to_owned());
+            }
+            _ => return None,
+        }
+    }
+    (trait_paths.len() == 1)
+        .then(|| trait_paths.into_iter().next())
+        .flatten()
 }
 
 /// Collects every binding identifier a pattern introduces (issue #441), for the
@@ -5338,6 +5640,156 @@ pub mod inner {
             bindings,
             vec![("S", "crate::model::S"), ("T", "crate::traits::T")],
             "both the Self-type and trait import bindings must be captured (issue #423)"
+        );
+    }
+
+    // ── Trait-dispatch extraction (issue #267) ───────────────────────────
+
+    /// Extracts `source` and returns the `(caller_simple_name,
+    /// dispatch_trait)` pairs stamped on method call sites, in source order.
+    fn dispatch_traits_in(source: &str) -> Vec<(String, Option<String>)> {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        let facts = extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        let by_id: std::collections::BTreeMap<&str, &str> = facts
+            .definitions
+            .iter()
+            .map(|d| (d.id.as_str(), d.simple_name.as_str()))
+            .collect();
+        facts
+            .call_sites
+            .iter()
+            .filter(|call| call.call_kind == CallKind::Method)
+            .map(|call| {
+                (
+                    by_id
+                        .get(call.caller_id.as_str())
+                        .unwrap_or(&"?")
+                        .to_string(),
+                    call.dispatch_trait.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dyn_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(item: &dyn Renderable) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a &dyn Trait receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn boxed_dyn_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(item: Box<dyn Renderable>) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a Box<dyn Trait> receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn generic_bound_receiver_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw<T: Renderable>(item: T) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a T: Trait bound receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn where_clause_bound_receiver_stamps_the_dispatch_trait() {
+        let stamped =
+            dispatch_traits_in("fn draw<T>(item: T) where T: Renderable { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a where-clause bound receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn let_dyn_ascription_stamps_the_dispatch_trait() {
+        let stamped = dispatch_traits_in(
+            "fn draw() { let item: &dyn Renderable = make(); item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a let-bound &dyn Trait receiver must stamp its trait on the method call"
+        );
+    }
+
+    #[test]
+    fn multi_bound_receiver_stamps_nothing() {
+        // Two trait bounds: dispatch is ambiguous by construction, so the
+        // call keeps the honest legacy fan-out instead of guessing.
+        let stamped =
+            dispatch_traits_in("fn draw<T: Renderable + Clone>(item: T) { item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a multi-bound receiver must not stamp any dispatch trait"
+        );
+    }
+
+    #[test]
+    fn conflicting_inline_and_where_bounds_stamp_nothing() {
+        // One bound inline and a DIFFERENT bound in the where clause is two
+        // distinct bounds: dispatch is ambiguous, so nothing is stamped.
+        let stamped = dispatch_traits_in(
+            "fn draw<T: Renderable>(item: T) where T: Clone { item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "conflicting inline/where bounds must not stamp any dispatch trait"
+        );
+    }
+
+    #[test]
+    fn repeated_same_bound_stamps_the_trait() {
+        // The same bound written inline and in the where clause is still one
+        // distinct bound.
+        let stamped = dispatch_traits_in(
+            "fn draw<T: Renderable>(item: T) where T: Renderable { item.render(); }\n",
+        );
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), Some("Renderable".to_owned()))],
+            "a repeated identical bound is still a single dispatch trait"
+        );
+    }
+
+    #[test]
+    fn concrete_receiver_stamps_no_dispatch_trait() {
+        let stamped = dispatch_traits_in("fn draw(c: &Circle) { c.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a concrete receiver stays on the receiver_type path (issue #441)"
+        );
+    }
+
+    #[test]
+    fn shadowed_dyn_binding_stamps_nothing() {
+        // The second `item` shadows the first: the shadowing veto drops both
+        // env entries, so the call carries no dispatch metadata.
+        let stamped =
+            dispatch_traits_in("fn draw(item: &dyn Renderable) { let item = 5; item.render(); }\n");
+        assert_eq!(
+            stamped,
+            vec![("draw".to_owned(), None)],
+            "a shadowed binding must not carry stale dispatch metadata"
         );
     }
 }

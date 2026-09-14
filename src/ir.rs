@@ -928,6 +928,14 @@ impl UserContextFields {
 ///   is emitted to every candidate, each labeled `ambiguous`.
 /// - `unresolved` — no in-repo definition matched; the edge targets a
 ///   `Diagnostic` node recording the callee, never an invented symbol.
+/// - `unresolved_dispatch` — the call site is a trait-dispatch call (a
+///   `dyn Trait` or `T: Trait` receiver, issue #267) whose target set could
+///   not be reduced to a concrete in-crate symbol. Like `unresolved`, the
+///   edge targets a `Diagnostic` marker — named `unresolved_dispatch:
+///   Trait::method` and carrying the call-site span — never an invented
+///   symbol. It is a TYPED sibling of `unresolved` (the weakest signal in the
+///   ordering) so query lanes can enumerate dispatch boundaries exactly
+///   instead of lumping them with ordinary misses.
 ///
 /// Adding this optional field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
@@ -940,6 +948,9 @@ pub enum CallResolution {
     Ambiguous,
     /// No in-repo definition matched; the target is a `Diagnostic` marker.
     Unresolved,
+    /// A trait-dispatch call site with no reducible in-crate target; the
+    /// target is a typed `unresolved_dispatch: Trait::method` marker.
+    UnresolvedDispatch,
 }
 
 impl CallResolution {
@@ -950,6 +961,7 @@ impl CallResolution {
             Self::Resolved => "resolved",
             Self::Ambiguous => "ambiguous",
             Self::Unresolved => "unresolved",
+            Self::UnresolvedDispatch => "unresolved_dispatch",
         }
     }
 
@@ -961,6 +973,7 @@ impl CallResolution {
             "resolved" => Some(Self::Resolved),
             "ambiguous" => Some(Self::Ambiguous),
             "unresolved" => Some(Self::Unresolved),
+            "unresolved_dispatch" => Some(Self::UnresolvedDispatch),
             _ => None,
         }
     }
@@ -4591,5 +4604,57 @@ mod source_span_tests {
         assert_eq!(span.start_column, None);
         assert_eq!(span.end_column, None);
         assert_eq!(span.start_line, 2);
+    }
+}
+
+#[cfg(test)]
+mod call_resolution_tests {
+    use super::CallResolution;
+
+    #[test]
+    fn unresolved_dispatch_has_a_stable_wire_form() {
+        // Issue #267: trait-dispatch call sites that cannot be reduced to a
+        // concrete in-crate symbol carry a TYPED resolution — not the generic
+        // `unresolved` — so query lanes can enumerate the boundary exactly.
+        assert_eq!(
+            CallResolution::UnresolvedDispatch.as_str(),
+            "unresolved_dispatch"
+        );
+        assert_eq!(
+            CallResolution::from_wire("unresolved_dispatch"),
+            Some(CallResolution::UnresolvedDispatch)
+        );
+        // The existing wire forms keep working.
+        assert_eq!(
+            CallResolution::from_wire("resolved"),
+            Some(CallResolution::Resolved)
+        );
+        assert_eq!(
+            CallResolution::from_wire("ambiguous"),
+            Some(CallResolution::Ambiguous)
+        );
+        assert_eq!(
+            CallResolution::from_wire("unresolved"),
+            Some(CallResolution::Unresolved)
+        );
+        assert_eq!(CallResolution::from_wire("unresolved_dispatch_typo"), None);
+    }
+
+    #[test]
+    fn unresolved_dispatch_is_the_weakest_signal() {
+        // Weakest-link path semantics (`.max()`): a dispatch boundary never
+        // upgrades a path past an honest unresolved signal.
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Unresolved);
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Ambiguous);
+        assert!(CallResolution::UnresolvedDispatch > CallResolution::Resolved);
+    }
+
+    #[test]
+    fn unresolved_dispatch_serializes_through_serde() {
+        let json = serde_json::to_string(&CallResolution::UnresolvedDispatch)
+            .expect("resolution serializes");
+        assert_eq!(json, "\"unresolved_dispatch\"");
+        let back: CallResolution = serde_json::from_str(&json).expect("resolution deserializes");
+        assert_eq!(back, CallResolution::UnresolvedDispatch);
     }
 }

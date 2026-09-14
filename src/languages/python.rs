@@ -1,6 +1,6 @@
 //! Python Tree-sitter extraction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::{Node, Parser};
 
@@ -301,7 +301,12 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
+        emit_reference_edges(
+            self.graph,
+            &self.definitions,
+            &self.symbol_bodies,
+            &BTreeSet::new(),
+        );
     }
 
     fn superclass_names(&self, node: Node<'_>) -> Vec<String> {
