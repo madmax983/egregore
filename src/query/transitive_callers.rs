@@ -323,8 +323,7 @@ pub fn transitive_callers<'a>(
             cursor = parent_id;
         }
         // Weakest resolution wins: CallResolution orders resolved < ambiguous
-        // < unresolved < unresolved_dispatch, so the maximum present status
-        // is the weakest link.
+        // < unresolved, so the maximum present status is the weakest link.
         let path_resolution = path.iter().filter_map(|s| s.resolution).max();
         rows.push(TransitiveCallerRow {
             record,

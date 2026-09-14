@@ -1,6 +1,6 @@
 //! Language-neutral extraction helpers shared by the per-language extractors.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use tree_sitter::Node;
 
@@ -59,13 +59,6 @@ pub fn next_symbol_ordinal(
 /// gets a `References` edge. Self-references (body ID == target ID) and
 /// name-equality guard loops (name == body name) are skipped.
 ///
-/// `suppressed_calls` holds (body ID, definition name) pairs whose `Calls`
-/// edge is owned by a repo-wide resolution pass instead of this textual one
-/// (issue #267: trait-dispatch call pairs, same-file included — the cross-file
-/// pass emits them with their resolution labels). Skipping them here keeps the
-/// stable edge IDs from colliding with the pass that owns them. `References`
-/// edges are unaffected.
-///
 /// Precision contract (issue #134): callers must supply [`SymbolBody::text`]
 /// built by [`reference_text`], so names that appear only inside comments or
 /// string literals never produce an edge, and substring occurrences never
@@ -75,7 +68,6 @@ pub fn emit_reference_edges(
     graph: &mut Graph,
     definitions: &BTreeMap<String, String>,
     bodies: &[SymbolBody],
-    suppressed_calls: &BTreeSet<(String, String)>,
 ) {
     for body in bodies {
         for (name, target_id) in definitions {
@@ -84,12 +76,6 @@ pub fn emit_reference_edges(
                 continue;
             }
             if looks_like_call(&body.text, name) {
-                // Issue #267: trait-dispatch pairs are repo-wide owned; the
-                // textual pass stays silent so it never shadows the owning
-                // pass's resolution-labeled edge with an unlabeled twin.
-                if suppressed_calls.contains(&(body.id.clone(), name.clone())) {
-                    continue;
-                }
                 add_graph_edge(
                     graph,
                     EdgeLabel::Calls,

@@ -68,10 +68,6 @@ pub enum UnresolvedCalleeReason {
     /// `Diagnostic` marker recording the callee (issues #152/#134) or carries
     /// `resolution: "unresolved"` itself.
     UnresolvedCall,
-    /// The call is a trait-dispatch site (issue #267) with no in-crate
-    /// implementor method: the edge carries `resolution: "unresolved_dispatch"`
-    /// and targets the typed `unresolved_dispatch: Trait::method` marker.
-    UnresolvedDispatch,
     /// The edge's target record is not in the graph (dangling target, or a
     /// target that exists only as a tombstone) and the edge carries no
     /// unresolved-call signal of its own.
@@ -84,7 +80,6 @@ impl UnresolvedCalleeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnresolvedCall => "unresolved_call",
-            Self::UnresolvedDispatch => "unresolved_dispatch",
             Self::MissingTarget => "missing_target",
         }
     }
@@ -373,18 +368,8 @@ pub fn transitive_callees<'a>(
             match by_id.get(target_id).copied() {
                 Some(rec)
                     if matches!(record_node_kind(rec), Some(NodeKind::Diagnostic))
-                        || resolution == Some(CallResolution::Unresolved)
-                        || resolution == Some(CallResolution::UnresolvedDispatch) =>
+                        || resolution == Some(CallResolution::Unresolved) =>
                 {
-                    // A `resolution: "unresolved_dispatch"` edge (issue #267)
-                    // names its own typed reason; a Diagnostic marker or
-                    // `resolution: "unresolved"` edge without it is an
-                    // ordinary unresolved call.
-                    let reason = if resolution == Some(CallResolution::UnresolvedDispatch) {
-                        UnresolvedCalleeReason::UnresolvedDispatch
-                    } else {
-                        UnresolvedCalleeReason::UnresolvedCall
-                    };
                     unresolved
                         .entry((label, target_id, edge_id))
                         .or_insert(UnresolvedCalleeRow {
@@ -395,18 +380,16 @@ pub fn transitive_callees<'a>(
                             edge_id,
                             relation: label,
                             resolution,
-                            reason,
+                            reason: UnresolvedCalleeReason::UnresolvedCall,
                         });
                 }
                 Some(_) => {}
                 None => {
-                    // An edge already carrying an unresolved resolution status
-                    // identifies the call boundary by itself; the marker record
+                    // An edge already carrying `resolution: "unresolved"`
+                    // identifies an unresolved call by itself; the marker record
                     // being absent does not change why the target is unresolved.
                     // `missing_target` is reserved for edges without that signal.
-                    let reason = if resolution == Some(CallResolution::UnresolvedDispatch) {
-                        UnresolvedCalleeReason::UnresolvedDispatch
-                    } else if resolution == Some(CallResolution::Unresolved) {
+                    let reason = if resolution == Some(CallResolution::Unresolved) {
                         UnresolvedCalleeReason::UnresolvedCall
                     } else {
                         UnresolvedCalleeReason::MissingTarget
@@ -486,8 +469,7 @@ pub fn transitive_callees<'a>(
         rev.reverse();
         let path = rev;
         // Weakest resolution wins: CallResolution orders resolved < ambiguous
-        // < unresolved < unresolved_dispatch, so the maximum present status
-        // is the weakest link.
+        // < unresolved, so the maximum present status is the weakest link.
         let path_resolution = path.iter().filter_map(|s| s.resolution).max();
         rows.push(TransitiveCalleeRow {
             record,
@@ -641,111 +623,6 @@ mod liveness_parity_tests {
         assert!(
             ctx.rows.iter().any(|r| r.record.id() == "codegraph:v5:b"),
             "an edge re-ingested after its tombstone must resurface the callee"
-        );
-    }
-}
-
-#[cfg(test)]
-mod dispatch_boundary_tests {
-    //! Issue #267: a `resolution: "unresolved_dispatch"` CALLS edge must
-    //! surface as an unresolved row carrying the TYPED reason — never silently
-    //! dropped, never counted reachable.
-    use super::*;
-    use crate::ir::SourceSpan;
-
-    fn sym(id: &str, name: &str) -> GraphRecord {
-        GraphRecord::node(
-            id.to_owned(),
-            NodeKind::Symbol,
-            Some("src/lib.rs".to_owned()),
-            Some(SourceSpan {
-                start_byte: 0,
-                end_byte: 10,
-                start_line: 1,
-                end_line: 2,
-                start_column: None,
-                end_column: None,
-            }),
-            Some(name.to_owned()),
-            format!("symbol {name}"),
-        )
-    }
-
-    fn dispatch_marker(id: &str, name: &str) -> GraphRecord {
-        GraphRecord::node(
-            id.to_owned(),
-            NodeKind::Diagnostic,
-            Some("src/draw.rs".to_owned()),
-            Some(SourceSpan {
-                start_byte: 40,
-                end_byte: 60,
-                start_line: 4,
-                end_line: 4,
-                start_column: None,
-                end_column: None,
-            }),
-            Some(name.to_owned()),
-            format!("unresolved trait-dispatch target {name}"),
-        )
-    }
-
-    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
-        GraphRecord::edge(
-            EdgeLabel::Calls,
-            source.to_owned(),
-            target.to_owned(),
-            Some("1.0".to_owned()),
-            "calls".to_owned(),
-        )
-        .with_resolution(resolution)
-    }
-
-    #[test]
-    fn unresolved_dispatch_wire_form_is_stable() {
-        assert_eq!(
-            UnresolvedCalleeReason::UnresolvedDispatch.as_str(),
-            "unresolved_dispatch"
-        );
-    }
-
-    #[test]
-    fn unresolved_dispatch_edge_surfaces_a_typed_unresolved_row() {
-        let records = vec![
-            sym("codegraph:v5:draw", "draw"),
-            dispatch_marker(
-                "codegraph:v5:marker",
-                "unresolved_dispatch: Orphan::orphan_render",
-            ),
-            calls(
-                "codegraph:v5:draw",
-                "codegraph:v5:marker",
-                CallResolution::UnresolvedDispatch,
-            ),
-        ];
-        let ctx = transitive_callees(&records, "codegraph:v5:draw", 5).expect("anchor live");
-        assert_eq!(
-            ctx.unresolved.len(),
-            1,
-            "the dispatch boundary must be enumerated, not dropped"
-        );
-        let row = &ctx.unresolved[0];
-        assert_eq!(row.reason, UnresolvedCalleeReason::UnresolvedDispatch);
-        assert_eq!(row.resolution, Some(CallResolution::UnresolvedDispatch));
-        assert!(
-            ctx.rows.is_empty(),
-            "the marker must never count as a reachable callee"
-        );
-    }
-
-    #[test]
-    fn plain_unresolved_reason_is_unchanged() {
-        assert_eq!(
-            UnresolvedCalleeReason::UnresolvedCall.as_str(),
-            "unresolved_call"
-        );
-        assert_eq!(
-            UnresolvedCalleeReason::MissingTarget.as_str(),
-            "missing_target"
         );
     }
 }

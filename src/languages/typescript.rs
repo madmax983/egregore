@@ -1,9 +1,6 @@
 //! TypeScript and TSX Tree-sitter extraction.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path};
 
 use tree_sitter::{Node, Parser};
 
@@ -415,12 +412,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(
-            self.graph,
-            &self.definitions,
-            &self.symbol_bodies,
-            &BTreeSet::new(),
-        );
+        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
     /// Resolves deferred `Implements` edges now that the full `definitions` map

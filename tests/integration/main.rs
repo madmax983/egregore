@@ -91,6 +91,8 @@ mod query_symbols;
 mod query_undocumented;
 mod query_unreferenced;
 mod query_unsafe_sites;
+// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
+mod query_blind_spots;
 mod query_unwrap_expect;
 mod query_verification_coverage;
 mod query_verification_freshness;
@@ -125,7 +127,6 @@ mod task_query;
 mod temporal;
 mod temporal_status;
 mod token_cost;
-mod trait_dispatch;
 mod trait_method_signatures;
 mod traj;
 mod transaction_time;

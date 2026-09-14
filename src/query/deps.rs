@@ -41,10 +41,6 @@ pub enum UnresolvedDependencyReason {
     /// `Diagnostic` marker recording the callee (issues #152/#134) or carries
     /// `resolution: "unresolved"` itself.
     UnresolvedCall,
-    /// The call is a trait-dispatch site (issue #267) with no in-crate
-    /// implementor method: the edge carries `resolution: "unresolved_dispatch"`
-    /// and targets the typed `unresolved_dispatch: Trait::method` marker.
-    UnresolvedDispatch,
     /// The edge's target record is not in the graph (dangling target, or a
     /// target that exists only as a tombstone) and the edge carries no
     /// unresolved-call signal of its own.
@@ -57,7 +53,6 @@ impl UnresolvedDependencyReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnresolvedCall => "unresolved_call",
-            Self::UnresolvedDispatch => "unresolved_dispatch",
             Self::MissingTarget => "missing_target",
         }
     }
@@ -199,17 +194,8 @@ pub fn symbol_dependencies<'a>(
         match by_id.get(target.as_str()).copied() {
             Some(node)
                 if matches!(record_node_kind(node), Some(NodeKind::Diagnostic))
-                    || *resolution == Some(CallResolution::Unresolved)
-                    || *resolution == Some(CallResolution::UnresolvedDispatch) =>
+                    || *resolution == Some(CallResolution::Unresolved) =>
             {
-                // A `resolution: "unresolved_dispatch"` edge (issue #267) names
-                // its own typed reason; a Diagnostic marker or `resolution:
-                // "unresolved"` edge without it is an ordinary unresolved call.
-                let reason = if *resolution == Some(CallResolution::UnresolvedDispatch) {
-                    UnresolvedDependencyReason::UnresolvedDispatch
-                } else {
-                    UnresolvedDependencyReason::UnresolvedCall
-                };
                 unresolved
                     .entry((relation, target.as_str(), edge_id.as_str()))
                     .or_insert(UnresolvedDependencyRow {
@@ -218,7 +204,7 @@ pub fn symbol_dependencies<'a>(
                         edge_id: edge_id.as_str(),
                         relation,
                         resolution: *resolution,
-                        reason,
+                        reason: UnresolvedDependencyReason::UnresolvedCall,
                     });
             }
             Some(node) => {
@@ -232,13 +218,11 @@ pub fn symbol_dependencies<'a>(
                     });
             }
             None => {
-                // An edge already carrying an unresolved resolution status
-                // identifies the call boundary by itself; the marker record
+                // An edge already carrying `resolution: "unresolved"`
+                // identifies an unresolved call by itself; the marker record
                 // being absent does not change why the target is unresolved.
                 // `missing_target` is reserved for edges without that signal.
-                let reason = if *resolution == Some(CallResolution::UnresolvedDispatch) {
-                    UnresolvedDependencyReason::UnresolvedDispatch
-                } else if *resolution == Some(CallResolution::Unresolved) {
+                let reason = if *resolution == Some(CallResolution::Unresolved) {
                     UnresolvedDependencyReason::UnresolvedCall
                 } else {
                     UnresolvedDependencyReason::MissingTarget
@@ -380,99 +364,6 @@ mod liveness_parity_tests {
                 .iter()
                 .all(|u| u.target_id != "codegraph:v5:b"),
             "a superseded earlier edge version must not also report the target unresolved"
-        );
-    }
-}
-
-#[cfg(test)]
-mod dispatch_boundary_tests {
-    //! Issue #267: an `unresolved_dispatch` CALLS edge lands in the
-    //! unresolved category with its own typed reason, mirroring the
-    //! transitive-callees lane.
-    use super::*;
-    use crate::ir::SourceSpan;
-
-    fn sym(id: &str, name: &str) -> GraphRecord {
-        GraphRecord::node(
-            id.to_owned(),
-            NodeKind::Symbol,
-            Some("src/lib.rs".to_owned()),
-            Some(SourceSpan {
-                start_byte: 0,
-                end_byte: 10,
-                start_line: 1,
-                end_line: 2,
-                start_column: None,
-                end_column: None,
-            }),
-            Some(name.to_owned()),
-            format!("symbol {name}"),
-        )
-    }
-
-    fn dispatch_marker(id: &str, name: &str) -> GraphRecord {
-        GraphRecord::node(
-            id.to_owned(),
-            NodeKind::Diagnostic,
-            Some("src/draw.rs".to_owned()),
-            Some(SourceSpan {
-                start_byte: 40,
-                end_byte: 60,
-                start_line: 4,
-                end_line: 4,
-                start_column: None,
-                end_column: None,
-            }),
-            Some(name.to_owned()),
-            format!("unresolved trait-dispatch target {name}"),
-        )
-    }
-
-    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
-        GraphRecord::edge(
-            EdgeLabel::Calls,
-            source.to_owned(),
-            target.to_owned(),
-            Some("1.0".to_owned()),
-            "calls".to_owned(),
-        )
-        .with_resolution(resolution)
-    }
-
-    #[test]
-    fn unresolved_dispatch_wire_form_is_stable() {
-        assert_eq!(
-            UnresolvedDependencyReason::UnresolvedDispatch.as_str(),
-            "unresolved_dispatch"
-        );
-    }
-
-    #[test]
-    fn unresolved_dispatch_edge_lands_in_unresolved_with_typed_reason() {
-        let records = vec![
-            sym("codegraph:v5:draw", "draw"),
-            dispatch_marker(
-                "codegraph:v5:marker",
-                "unresolved_dispatch: Orphan::orphan_render",
-            ),
-            calls(
-                "codegraph:v5:draw",
-                "codegraph:v5:marker",
-                CallResolution::UnresolvedDispatch,
-            ),
-        ];
-        let ctx = symbol_dependencies(&records, "codegraph:v5:draw").expect("anchor live");
-        assert_eq!(
-            ctx.unresolved.len(),
-            1,
-            "the dispatch boundary must be enumerated, not dropped"
-        );
-        let row = &ctx.unresolved[0];
-        assert_eq!(row.reason, UnresolvedDependencyReason::UnresolvedDispatch);
-        assert_eq!(row.resolution, Some(CallResolution::UnresolvedDispatch));
-        assert!(
-            ctx.dependencies.is_empty(),
-            "the marker must never count as a resolved dependency"
         );
     }
 }

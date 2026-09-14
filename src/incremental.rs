@@ -136,14 +136,10 @@ use crate::{
 /// cached: it is recomputed on every refresh, so a source file byte-identical
 /// to its cached version whose owning `Cargo.toml` was added, renamed, or
 /// deleted is still re-attributed.
-/// 26 -> 27: #267 trait-dispatch call sites. `CallSiteFact` gains
-/// `dispatch_trait` (the as-written trait path for provably trait-typed
-/// receivers); cached facts from before the field existed would replay
-/// without it and silently lose dispatch edges/markers.
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 27;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 26;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
