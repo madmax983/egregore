@@ -292,13 +292,6 @@ pub fn resolve_failure_handle(
         });
     }
 
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
     // Latest-write-wins tombstone / temporal liveness (issue #421): over an
     // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
     // again, and a record/edge that still has a temporal (history) version is not
@@ -307,6 +300,14 @@ pub fn resolve_failure_handle(
     // current-state read so `--graph` and `--data-dir` agree. See
     // `super::liveness`.
     let liveness = Liveness::new(records);
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .filter(|&id| liveness.deleted(id))
+        .collect();
     let deleted = |id: &str| liveness.deleted(id);
     let in_scope = |id: &str| -> bool {
         repo_scope.is_none_or(|scope| repo_index.owner_of(id) == Some(scope))
@@ -668,13 +669,6 @@ pub fn failure_history_context<'a>(
     target: &ResolvedFailureTarget,
 ) -> FailureHistoryContext<'a> {
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
     // Latest-write-wins tombstone / temporal liveness (issue #421): over an
     // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
     // again, and history-bearing reads keep records/edges that carry a temporal
@@ -683,6 +677,14 @@ pub fn failure_history_context<'a>(
     // matching the embedded current-state read so `--graph` and `--data-dir`
     // agree. See `super::liveness`.
     let liveness = Liveness::new(records);
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .filter(|&id| liveness.deleted(id))
+        .collect();
     let deleted = |id: &str| liveness.deleted(id);
     let present = |id: &str| -> Option<&'a GraphRecord> {
         if deleted(id) {
@@ -1470,6 +1472,130 @@ mod liveness_parity_tests {
         assert!(
             target.stale && target.is_empty(),
             "a tombstone with no later re-ingest keeps the handle stale"
+        );
+    }
+
+    fn task(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            None,
+            "task".to_owned(),
+        )
+    }
+
+    fn canonical_task_id() -> String {
+        format!("project:v1:{}", "a".repeat(64))
+    }
+
+    #[test]
+    fn task_handle_reingested_after_tombstone_resolves_live() {
+        // The task-handle branch of `resolve_failure_handle` filtered on raw
+        // tombstone membership: a task re-ingested AFTER its own tombstone was
+        // reported stale over `--graph` while `--data-dir` resolved it live.
+        let id = canonical_task_id();
+        let records = vec![task(&id), tomb(&id), task(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert_eq!(
+            target.kind,
+            FailureTargetKind::Task,
+            "a revived task handle must still resolve to its task"
+        );
+        assert!(
+            !target.stale,
+            "a task revived after its tombstone must resolve non-stale"
+        );
+        assert!(target.anchor_ids.contains(&id));
+    }
+
+    #[test]
+    fn task_handle_tombstone_without_reingest_is_stale() {
+        let id = canonical_task_id();
+        let records = vec![task(&id), tomb(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert!(
+            target.stale && target.is_empty(),
+            "a task tombstone with no later re-ingest keeps the handle stale"
+        );
+    }
+
+    fn evidence_link_to(target: &str) -> crate::ir::EvidenceLink {
+        crate::ir::EvidenceLink {
+            target_record_id: Some(target.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "OBSERVES".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }
+    }
+
+    fn failed_verification_with_link(id: &str, link: crate::ir::EvidenceLink) -> GraphRecord {
+        let mut rec = failed_verification(id);
+        if let GraphRecord::Node { evidence_links, .. } = &mut rec {
+            *evidence_links = Some(vec![link]);
+        }
+        rec
+    }
+
+    #[test]
+    fn revived_evidence_target_yields_no_stale_diagnostic() {
+        // `push_attempt_link_diagnostics` classified link targets on raw
+        // tombstone membership: an evidence target re-ingested AFTER its own
+        // tombstone was misreported `stale_evidence_target` over `--graph`
+        // while `--data-dir` saw it live.
+        let anchor = "codegraph:v5:anchor";
+        let target = "codegraph:v5:target";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            sym(target),
+            tomb(target),
+            sym(target),
+            failed_verification_with_link(v, evidence_link_to(target)),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .all(|d| !(d.code == "stale_evidence_target" && d.target_handle == target)),
+            "a revived evidence target must not be diagnosed stale: {:?}",
+            ctx.diagnostics
+                .iter()
+                .map(|d| (&d.code, &d.target_handle))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn tombstoned_evidence_target_without_reingest_is_stale_diagnostic() {
+        let anchor = "codegraph:v5:anchor";
+        let target = "codegraph:v5:target";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            sym(target),
+            tomb(target),
+            failed_verification_with_link(v, evidence_link_to(target)),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .any(|d| d.code == "stale_evidence_target" && d.target_handle == target),
+            "a tombstoned-without-reingest evidence target stays stale: {:?}",
+            ctx.diagnostics
+                .iter()
+                .map(|d| (&d.code, &d.target_handle))
+                .collect::<Vec<_>>(),
         );
     }
 

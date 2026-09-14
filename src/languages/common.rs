@@ -64,29 +64,14 @@ pub fn next_symbol_ordinal(
 /// string literals never produce an edge, and substring occurrences never
 /// classify as calls ([`contains_identifier`] / [`looks_like_call`] both
 /// require identifier token boundaries).
-///
-/// `shadowed_names` maps a symbol-body ID to the bare simple names a nested
-/// definition shadows for that body (issue #422: a block-local `fn`
-/// shadows the same bare name for its enclosing function body). A shadowed
-/// BARE name key emits no edge — the bare call binds the nested definition,
-/// whose edge the scope-gated resolver emits instead. Qualified keys
-/// (`alpha::helper`) are never shadowed: an explicit path selects the outer
-/// definition and bypasses the shadowing.
 pub fn emit_reference_edges(
     graph: &mut Graph,
     definitions: &BTreeMap<String, String>,
     bodies: &[SymbolBody],
-    shadowed_names: &BTreeMap<String, Vec<String>>,
 ) {
     for body in bodies {
-        let shadowed = shadowed_names.get(&body.id);
         for (name, target_id) in definitions {
             if body.id == *target_id || name == &body.name || !contains_identifier(&body.text, name)
-            {
-                continue;
-            }
-            if !name.contains("::")
-                && shadowed.is_some_and(|names| names.iter().any(|simple| simple == name))
             {
                 continue;
             }

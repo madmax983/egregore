@@ -2054,6 +2054,7 @@ fn emit_task_records(
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary: format!(
@@ -2146,6 +2147,7 @@ fn emit_ac_record(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
@@ -2237,6 +2239,7 @@ fn emit_external_link_record(
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        call_site_spans: None,
         is_exhaustive: None,
         temporal: None,
         summary: format!("'{}' has ExternalLink", link.parent_local_id),

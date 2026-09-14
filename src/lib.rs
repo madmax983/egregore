@@ -305,7 +305,7 @@ fn scan_repository_at_with_override_inner(
                     graph.push(record.with_valid_time_inferred(transaction_time));
                 }
                 if !facts.is_empty() {
-                    facts_by_file.insert(source_file.repo_relative_path.clone(), *facts);
+                    facts_by_file.insert(source_file.repo_relative_path.clone(), facts);
                 }
             }
             // A non-UTF-8 or unreadable file is skipped (issue #438): record its
@@ -617,12 +617,10 @@ pub(crate) fn scan_coverage_records(
 /// carrying a deterministic `Diagnostic` node and the accounting the caller
 /// threads into scan coverage so the file is honestly counted UNINDEXED.
 pub(crate) enum SourceFileScanOutcome {
-    /// The file decoded and extracted normally. `facts` is boxed so the
-    /// large [`FileFacts`] struct does not bloat the enum variant (the same
-    /// boxing the `Skipped` variant already applies to its diagnostic node).
+    /// The file decoded and extracted normally.
     Extracted {
         records: Vec<GraphRecord>,
-        facts: Box<languages::cross_file::FileFacts>,
+        facts: languages::cross_file::FileFacts,
     },
     /// The file was skipped (non-UTF-8 or unreadable). `diagnostic` names the
     /// repo-relative path and the fixed decode/read-failure reason;
@@ -722,10 +720,7 @@ pub(crate) fn scan_source_file_records(
         });
     };
     let (records, facts) = scan_source_text_records(source_file, source, repository_id)?;
-    Ok(SourceFileScanOutcome::Extracted {
-        records,
-        facts: Box::new(facts),
-    })
+    Ok(SourceFileScanOutcome::Extracted { records, facts })
 }
 
 pub(crate) fn scan_source_text_records(
