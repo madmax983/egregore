@@ -162,6 +162,67 @@ fn ambiguous_simple_names_emit_labeled_edges_to_all_candidates() {
 }
 
 #[test]
+fn resolved_calls_edges_retain_call_site_spans_ambiguous_edges_do_not() {
+    // Issue #462: per-call-site spans survive edge deduplication on resolved
+    // CALLS edges (enabling SCIP reference occurrences); ambiguous edges
+    // carry none, per the #233 fabrication-guard discipline.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub fn shared_helper() -> usize {\n    7\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "use crate::alpha::shared_helper;\n\npub fn beta_caller() -> usize {\n    shared_helper()\n}\n",
+            ),
+            ("src/delta.rs", "pub fn dupe() -> usize {\n    2\n}\n"),
+            (
+                "src/gamma.rs",
+                "pub fn dupe() -> usize {\n    3\n}\n\npub fn calls_dupe() -> usize {\n    dupe()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let helper = symbol_id(&records, "function", "alpha::shared_helper", "src/alpha.rs");
+    let beta_caller = symbol_id(&records, "function", "beta::beta_caller", "src/beta.rs");
+
+    let edge = calls_edge(&records, &beta_caller, &helper)
+        .expect("resolved cross-file CALLS edge should exist");
+    assert_eq!(edge["resolution"], "resolved");
+    let spans = edge["call_site_spans"]
+        .as_array()
+        .expect("a resolved CALLS edge must retain its call-site spans");
+    assert_eq!(spans.len(), 1, "one call site should yield one span");
+    assert_eq!(
+        spans[0]["start_line"].as_u64(),
+        Some(4),
+        "the `shared_helper()` call sits on line 4"
+    );
+    assert_eq!(spans[0]["end_line"].as_u64(), Some(4));
+
+    // The bare `dupe()` call in gamma.rs matches two in-repo definitions, so
+    // both edges (the cross-file fan-out to delta::dupe and the same-file
+    // edge to gamma::dupe) are ambiguous and must carry no spans.
+    let delta_dupe = symbol_id(&records, "function", "delta::dupe", "src/delta.rs");
+    let gamma_dupe = symbol_id(&records, "function", "gamma::dupe", "src/gamma.rs");
+    let calls_dupe = symbol_id(&records, "function", "gamma::calls_dupe", "src/gamma.rs");
+    for target in [&delta_dupe, &gamma_dupe] {
+        let ambiguous =
+            calls_edge(&records, &calls_dupe, target).expect("ambiguous CALLS edge should exist");
+        assert_eq!(ambiguous["resolution"], "ambiguous");
+        assert!(
+            ambiguous.get("call_site_spans").is_none(),
+            "an ambiguous CALLS edge must not retain call-site spans, got: {ambiguous}"
+        );
+    }
+}
+
+#[test]
 fn unresolved_external_calls_are_labeled_not_dropped_or_invented() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
@@ -605,15 +666,20 @@ fn trait_method_call_edges_are_byte_stable_across_repeated_scans() {
 // --- Trait-method attribution is DIRECT-membership only (issue #390) --------
 
 #[test]
-fn block_local_fn_in_a_trait_method_body_has_corrected_identity_and_in_scope_recall() {
+fn block_local_fn_in_a_trait_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
     // Issue #413 (round 3, Codex finding A) — flips the earlier #412 recall
     // assertion, coordinator-authorized. A `fn helper` defined block-local
     // inside a default trait method body keeps its CORRECTED identity: a plain
     // free function (kind `function`, module-qualified `alpha::helper`, never a
-    // trait method). It stays out of the FLAT call index (lexically unreachable
-    // from other scopes — see the no-wrong-edge tests below), but issue #422
-    // restores LEXICALLY-SCOPED recall: the bare `helper()` call in the
-    // enclosing method body resolves to its own block-local definition.
+    // trait method). But it is lexically unreachable through the flat call
+    // index, so it is NOT exported as a call candidate: its own bare `helper()`
+    // call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -638,9 +704,12 @@ fn block_local_fn_in_a_trait_method_body_has_corrected_identity_and_in_scope_rec
         "the block-local helper must not be a trait-method target (identity stays corrected)"
     );
 
-    // Issue #422: the in-scope bare `helper()` call resolves to its OWN
-    // block-local definition (lexical scoping), not left unresolved.
-    assert_calls_edge_with_resolution(&records, &f, &helper, "resolved");
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
+    assert!(
+        calls_edge(&records, &f, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
+    );
 }
 
 #[test]
@@ -677,15 +746,19 @@ fn block_local_fn_in_a_trait_method_is_not_a_trait_method_target() {
 }
 
 #[test]
-fn block_local_fn_in_an_impl_method_body_has_corrected_identity_and_in_scope_recall() {
+fn block_local_fn_in_an_impl_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
     // Issue #413 (round 3, Codex finding A). A `fn helper` defined block-local
     // inside an impl method body keeps its CORRECTED identity: a plain free
     // function (kind `function`, module-qualified `alpha::helper`, never a
-    // `method` `alpha::S::helper`, no owner DEFINES). It stays out of the FLAT
-    // call index (lexically unreachable from other scopes — see the
-    // no-wrong-edge tests below), but issue #422 restores LEXICALLY-SCOPED
-    // recall: the bare `helper()` call in the enclosing method body resolves
-    // to its own block-local definition.
+    // `method` `alpha::S::helper`, no owner DEFINES). But it is lexically
+    // unreachable through the flat call index, so it is NOT exported as a call
+    // candidate: its own bare `helper()` call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -712,9 +785,12 @@ fn block_local_fn_in_an_impl_method_body_has_corrected_identity_and_in_scope_rec
         "the impl-nested helper must not be mis-attributed as method S::helper"
     );
 
-    // Issue #422: the in-scope bare `helper()` call resolves to its OWN
-    // block-local definition (lexical scoping), not left unresolved.
-    assert_calls_edge_with_resolution(&records, &m, &helper, "resolved");
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
+    assert!(
+        calls_edge(&records, &m, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
+    );
 }
 
 #[test]
@@ -819,248 +895,6 @@ fn module_fn_call_not_ambiguous_with_same_named_block_local_fn() {
                 && record["resolution"] == "ambiguous"
         }),
         "g()'s helper() must resolve to the module helper only, never ambiguous with a block-local"
-    );
-}
-
-// --- Lexically-scoped block-local recall (issue #422) -----------------------
-
-#[test]
-fn in_scope_call_resolves_to_block_local_fn_in_a_free_function() {
-    // Issue #422: the issue's own example shape. A block-local `fn helper`
-    // inside a free function is lexically reachable from the enclosing body,
-    // so the bare `helper()` call there resolves to its own definition —
-    // without re-entering the flat call index (a call from any OTHER scope
-    // still never binds it; see the no-wrong-edge tests below).
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[(
-            "src/alpha.rs",
-            "pub fn outer() -> u32 {\n    fn helper() -> u32 {\n        3\n    }\n    helper()\n}\n",
-        )],
-    );
-
-    let records = scan_fixture(repo);
-    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-
-    assert_calls_edge_with_resolution(&records, &outer, &helper, "resolved");
-}
-
-#[test]
-fn call_nested_in_a_closure_resolves_to_the_enclosing_block_local_fn() {
-    // Issue #422: a call nested inside a closure within the enclosing body
-    // carries the enclosing function's caller id, so it is in the block-local
-    // fn's lexical scope and resolves to it.
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[(
-            "src/alpha.rs",
-            "pub fn outer() -> u32 {\n    fn helper() -> u32 {\n        3\n    }\n    let run = || helper();\n    run()\n}\n",
-        )],
-    );
-
-    let records = scan_fixture(repo);
-    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-
-    assert_calls_edge_with_resolution(&records, &outer, &helper, "resolved");
-}
-
-#[test]
-fn block_local_fn_shadows_a_same_named_module_fn_for_in_scope_calls() {
-    // Issue #422: lexical scoping means the block-local `fn helper` SHADOWS
-    // the module-level `fn helper` for calls in the enclosing body. The
-    // in-scope call resolves to the block-local ONLY — never an ambiguous
-    // fan-out across the shadow boundary.
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[
-            (
-                "src/alpha.rs",
-                "pub fn helper() -> u32 {\n    7\n}\n\npub fn outer() -> u32 {\n    fn helper() -> u32 {\n        3\n    }\n    helper()\n}\n",
-            ),
-            ("src/beta.rs", "pub fn g() -> u32 {\n    helper()\n}\n"),
-        ],
-    );
-
-    let records = scan_fixture(repo);
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-    // The block-local helper shares the qualified name `alpha::helper` with
-    // the module fn but is a distinct symbol. Disambiguate by role, not by
-    // record order: the block-local is the target of outer's scope-gated
-    // edge (its summary carries the `(block-local, ...)` marker).
-    let helper_ids: Vec<String> = records
-        .iter()
-        .filter(|record| {
-            record["record_type"] == "node"
-                && record["kind"] == "Symbol"
-                && record["symbol_kind"] == "function"
-                && record["name"] == "alpha::helper"
-                && record["repo_relative_path"] == "src/alpha.rs"
-        })
-        .map(|record| {
-            record["id"]
-                .as_str()
-                .expect("symbol should have an ID")
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(
-        helper_ids.len(),
-        2,
-        "module fn and block-local fn must be two distinct alpha::helper symbols"
-    );
-    let block_helper = helper_ids
-        .iter()
-        .find(|id| {
-            records.iter().any(|record| {
-                record["record_type"] == "edge"
-                    && record["label"] == "CALLS"
-                    && record["source"] == outer
-                    && record["target"] == **id
-                    && record["summary"]
-                        .as_str()
-                        .is_some_and(|summary| summary.contains("(block-local,"))
-            })
-        })
-        .expect("outer should have a scope-gated edge to the block-local helper")
-        .clone();
-    let module_helper = helper_ids
-        .iter()
-        .find(|id| **id != block_helper)
-        .expect("there should be a second alpha::helper symbol")
-        .clone();
-
-    // The in-scope call binds the block-local, resolved — never ambiguous
-    // with the shadowed module fn.
-    assert_calls_edge_with_resolution(&records, &outer, &block_helper, "resolved");
-    assert!(
-        !records.iter().any(|record| {
-            record["record_type"] == "edge"
-                && record["label"] == "CALLS"
-                && record["source"] == outer
-                && record["resolution"] == "ambiguous"
-        }),
-        "outer()'s helper() must resolve to the block-local only, never ambiguous with the shadowed module fn"
-    );
-    // The shadowed module fn gets NO edge from the enclosing body: the
-    // per-file text pass suppresses the shadowed bare name (issue #422), so
-    // the graph never claims outer() calls the module helper.
-    assert!(
-        calls_edge(&records, &outer, &module_helper).is_none(),
-        "outer()'s helper() binds the block-local; no CALLS edge to the shadowed module fn may exist"
-    );
-    // And the out-of-scope call still binds the module fn alone (the
-    // no-wrong-edge guard holds alongside the new recall).
-    let g = symbol_id(&records, "function", "beta::g", "src/beta.rs");
-    assert_calls_edge_with_resolution(&records, &g, &module_helper, "resolved");
-}
-
-#[test]
-fn call_from_another_function_in_the_same_file_does_not_bind_a_block_local_fn() {
-    // NO-WRONG-EDGE (issue #422): the same-file analog of
-    // `bare_call_does_not_bind_a_block_local_fn_buried_in_an_impl_method`. A
-    // bare `helper()` from a DIFFERENT function in the same file must NEVER
-    // bind the block-local fn buried in `outer` — the scope gate admits only
-    // the enclosing scope's own calls.
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[(
-            "src/alpha.rs",
-            "pub fn outer() -> u32 {\n    fn helper() -> u32 {\n        3\n    }\n    helper()\n}\n\npub fn other() -> u32 {\n    helper()\n}\n",
-        )],
-    );
-
-    let records = scan_fixture(repo);
-    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-    let other = symbol_id(&records, "function", "alpha::other", "src/alpha.rs");
-
-    // The in-scope call recalls; the out-of-scope call never binds.
-    assert_calls_edge_with_resolution(&records, &outer, &helper, "resolved");
-    assert!(
-        calls_edge(&records, &other, &helper).is_none(),
-        "other()'s bare helper() must not bind the block-local fn buried in outer()"
-    );
-}
-
-#[test]
-fn two_same_named_block_local_fns_in_sibling_blocks_are_ambiguous() {
-    // Issue #422, no-wrong-edge doctrine: two `fn helper`s in sibling blocks
-    // of one enclosing function share one scope identity, and without
-    // block-span tracking the resolver cannot tell which block a call sits
-    // in — so the in-scope calls are EXPLICITLY AMBIGUOUS, never a silent
-    // pick of one.
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[(
-            "src/alpha.rs",
-            "pub fn outer(flag: bool) -> u32 {\n    if flag {\n        fn helper() -> u32 {\n            1\n        }\n        helper()\n    } else {\n        fn helper() -> u32 {\n            2\n        }\n        helper()\n    }\n}\n",
-        )],
-    );
-
-    let records = scan_fixture(repo);
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-    let helpers = records
-        .iter()
-        .filter(|record| {
-            record["record_type"] == "node"
-                && record["kind"] == "Symbol"
-                && record["name"] == "alpha::helper"
-        })
-        .map(|record| {
-            record["id"]
-                .as_str()
-                .expect("symbol should have an ID")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        helpers.len(),
-        2,
-        "both branch-local helpers must be distinct symbols"
-    );
-    for helper in &helpers {
-        assert_calls_edge_with_resolution(&records, &outer, helper, "ambiguous");
-    }
-}
-
-#[test]
-fn recursive_call_inside_a_block_local_fn_mints_no_edge() {
-    // Issue #422: a recursive `helper()` call inside the block-local fn's own
-    // body matches the scope gate (caller == the def itself), but self-edges
-    // are never minted — mirroring how module-level self-recursion is treated
-    // (no edge, and no unresolved-call diagnostic since the name does bind).
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path();
-    write_fixture(
-        repo,
-        &[(
-            "src/alpha.rs",
-            "pub fn outer(n: u32) -> u32 {\n    fn helper(n: u32) -> u32 {\n        if n == 0 {\n            0\n        } else {\n            helper(n - 1)\n        }\n    }\n    helper(n)\n}\n",
-        )],
-    );
-
-    let records = scan_fixture(repo);
-    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
-    let outer = symbol_id(&records, "function", "alpha::outer", "src/alpha.rs");
-
-    // The in-scope call from the enclosing body recalls; the recursive call
-    // mints no self-edge.
-    assert_calls_edge_with_resolution(&records, &outer, &helper, "resolved");
-    assert!(
-        calls_edge(&records, &helper, &helper).is_none(),
-        "a recursive call inside a block-local fn must not mint a self-edge"
     );
 }
 
@@ -1321,6 +1155,72 @@ fn impl_self_call_binds_an_implemented_trait_default() {
     let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
 
     assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+}
+
+#[test]
+fn impl_self_call_binds_an_implemented_trait_default_for_an_imported_self_type() {
+    // RECALL (issue #423): the `impl T for S` relation's Self type `S` is bound
+    // by a `use` import (`use crate::model::S;`), which pre-#423 extraction did
+    // not capture — only bare pending-TRAIT names landed in
+    // `use_trait_imports`. The repo-wide pass scope-walked bare `S` to nothing
+    // and dropped the relation, so `self.read()` stayed unresolved even though
+    // `S` provably implements `T`. Capturing the implementing type's import
+    // binding recovers the edge: `f -> T::read` binds `resolved`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            ("src/model.rs", "pub struct S;\n"),
+            (
+                "src/traits.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/user.rs",
+                "use crate::model::S;\nuse crate::traits::T;\nimpl T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "traits::read", "src/traits.rs");
+    let f = symbol_id(&records, "method", "user::S::f", "src/user.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+}
+
+#[test]
+fn impl_self_call_never_binds_through_an_externally_imported_self_type() {
+    // NO-WRONG-EDGE (issue #423): the no-wrong-edge guard on the recovered
+    // recall path stays intact — a relation whose bare Self type binds to an
+    // EXTERNAL import (`use std::any::S;`) is still dropped (import veto, no
+    // scope-walk fall-through), so `self.read()` binds nothing: a MISS, never
+    // a wrong edge to the local trait default.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/traits.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/user.rs",
+                "use std::any::S;\nuse crate::traits::T;\nimpl T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "traits::read", "src/traits.rs");
+    let f = symbol_id(&records, "method", "user::S::f", "src/user.rs");
+
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "self.read() must not bind T::read when the relation's Self type is externally imported"
+    );
 }
 
 #[test]

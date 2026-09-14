@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{CommitOrder, RepositoryIndex};
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
 
@@ -130,6 +131,16 @@ pub fn file_churn(
     let is_owned =
         |id: &str| -> bool { repo_id.is_none_or(|r_id| index.owner_of(id) == Some(r_id)) };
 
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph`, a File node or CHANGED_IN edge re-ingested AFTER its own
+    // tombstone is live again, matching the embedded `--data-dir`
+    // current-state read. The `tombstoned` set below therefore retains a
+    // deleted_id only while its tombstone is still the id's most recent
+    // write. Ids carrying a temporal/history version are exempt — the
+    // embedded read keeps every temporal snapshot even for tombstoned
+    // records — so the same gate also covers the CHANGED_IN edge scan's
+    // historical-provenance exemption. See `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -139,6 +150,7 @@ pub fn file_churn(
                 None
             }
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
 
     // Commit node record ID → SHA, and per-repository-scope SHA sets.

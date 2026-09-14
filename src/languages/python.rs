@@ -301,14 +301,7 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        // No nested-definition shadowing in this language's extractor: the
-        // shadow map stays empty and the text pass is byte-identical.
-        emit_reference_edges(
-            self.graph,
-            &self.definitions,
-            &self.symbol_bodies,
-            &BTreeMap::new(),
-        );
+        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
     fn superclass_names(&self, node: Node<'_>) -> Vec<String> {
