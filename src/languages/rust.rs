@@ -17,9 +17,9 @@ use crate::{
             path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact, DefinitionFact, FileFacts,
-            ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact,
-            RouteRegistrationFact, UseImportFact, crate_root_id,
+            BlockLocalDefinitionFact, CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact,
+            DefinitionFact, FileFacts, ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact,
+            PendingImplFact, RouteRegistrationFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -218,6 +218,13 @@ struct RustExtractor<'graph, 'source> {
     /// collected) and restored on exit, so `call_site_fact` can stamp a
     /// provable `receiver_type` on `x.method()` when `x` is in this map.
     type_env: BTreeMap<String, String>,
+    /// Symbol IDs of the lexically-enclosing functions/methods/tests currently
+    /// being extracted (issue #422). Pushed on entering `extract_function`,
+    /// popped on exit, so a block-local `fn` can record its enclosing scope's
+    /// identity for lexically-scoped call recall. Closures never push (they
+    /// are not symbols), so calls inside a closure body correctly inherit the
+    /// enclosing function's scope.
+    enclosing_fn_ids: Vec<String>,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -259,6 +266,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .first()
                 .is_some_and(|segment| segment == "tests"),
             type_env: BTreeMap::new(),
+            enclosing_fn_ids: Vec::new(),
         }
     }
 
@@ -658,22 +666,31 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
         let is_trait_method = self.is_direct_trait_method(node);
+        // The lexically-enclosing function/method/test symbol, if any — the
+        // scope identity a block-local `fn` declared here records for
+        // lexically-scoped call recall (issue #422). Captured BEFORE this
+        // function's own id is pushed onto `enclosing_fn_ids` below.
+        let enclosing_scope_id = self.enclosing_fn_ids.last().cloned();
+        let is_block_local = Self::is_block_local_fn(node);
         // A block-local `fn` (declared inside a function/closure BODY) is
         // lexically unreachable from other scopes (issue #413 round 3, Codex
         // finding A). Its Symbol node keeps the corrected free-function identity
         // (kind `function`, module-qualified name, no false `Owner::fn` method,
         // no owner DEFINES — `add_symbol` above is intentionally NOT gated, so
         // the node + its DEFINES edge and referential closure are preserved).
-        // But it MUST NOT enter ANY call-candidate set, or a call from another
-        // scope could bind the buried item — a wrong or ambiguous edge (and a
-        // confident WRONG edge when the real target is external, leaving the
-        // block-local the sole in-repo candidate). Two candidate sets feed call
-        // resolution, so both are gated: the per-file name→id map
+        // But it MUST NOT enter ANY flat call-candidate set, or a call from
+        // another scope could bind the buried item — a wrong or ambiguous edge
+        // (and a confident WRONG edge when the real target is external, leaving
+        // the block-local the sole in-repo candidate). Two candidate sets feed
+        // call resolution, so both stay gated: the per-file name→id map
         // (`self.definitions`, read by the issue #134 `emit_reference_edges`
         // same-file pass) AND the repo-wide `FileFacts::definitions`
         // (cross-file + same-file-labeling). Lexically-scoped recall of
-        // intra-block calls is deferred to a follow-up.
-        if !Self::is_block_local_fn(node) {
+        // intra-block calls rides a THIRD, scope-gated set instead
+        // (`FileFacts::block_local_definitions`, issue #422): the def records
+        // its enclosing scope's identity, and the resolver admits it as a
+        // candidate ONLY for calls from that scope.
+        if !is_block_local {
             self.definitions.insert(local_name.clone(), id.clone());
             self.definitions.insert(qualified_name.clone(), id.clone());
             self.facts.definitions.push(DefinitionFact {
@@ -689,7 +706,26 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 is_trait_method,
                 repo_relative_path: self.file.repo_relative_path.clone(),
             });
+        } else if let Some(enclosing_scope_id) = enclosing_scope_id {
+            // Issue #422: a block-local `fn` with an enclosing function symbol
+            // joins the scope-gated candidate set (never the flat index).
+            // `local_name` is moved (not cloned): nothing below uses it.
+            self.facts
+                .block_local_definitions
+                .push(BlockLocalDefinitionFact {
+                    id: id.clone(),
+                    qualified_name: qualified_name.clone(),
+                    simple_name: local_name,
+                    symbol_kind: symbol_kind.to_owned(),
+                    enclosing_scope_id,
+                    repo_relative_path: self.file.repo_relative_path.clone(),
+                });
         }
+        // A block-local `fn` with NO enclosing function symbol (e.g. inside a
+        // `const` initializer at module level) records no scoped fact either:
+        // no call site can carry a matching caller id, so its calls stay
+        // unresolved — a MISS, never a WRONG edge.
+        self.enclosing_fn_ids.push(id.clone());
         // Build this function's provable receiver-type environment (issue #441)
         // and install it for the duration of the call-site collection, then
         // restore the caller's environment. Nested functions collect their own
@@ -712,6 +748,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if is_test_fn {
             self.test_scope_depth -= 1;
         }
+        self.enclosing_fn_ids.pop();
     }
 
     /// Match segments for a callable definition: the module path, plus the
@@ -1762,7 +1799,25 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
+        // A block-local `fn` shadows its bare simple name for the enclosing
+        // body (issue #422): the text pass must not emit an edge from the
+        // enclosing body to the shadowed module-level definition — the bare
+        // call binds the block-local, whose edge the scope-gated resolver
+        // emits instead. Grouped here (after the full walk) so definitions
+        // nested anywhere in the body are all visible.
+        let mut shadowed_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for definition in &self.facts.block_local_definitions {
+            shadowed_names
+                .entry(definition.enclosing_scope_id.clone())
+                .or_default()
+                .push(definition.simple_name.clone());
+        }
+        emit_reference_edges(
+            self.graph,
+            &self.definitions,
+            &self.symbol_bodies,
+            &shadowed_names,
+        );
     }
 
     /// Resolves every deferred impl trait lookup after the whole file has
@@ -1836,13 +1891,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     /// Serializes the captured module-item `use`-import PATHS relevant to this
-    /// file's bare pending impls (issue #393) and bare implementing types of
-    /// its trait-impl relations (issue #423) into
-    /// [`FileFacts::use_trait_imports`], so the deferred cross-file resolver
-    /// can bind a bare imported trait/type name to its true aliased target.
-    /// Only imports that a bare pending impl or relation in the SAME module
-    /// scope actually names are emitted, keeping the fact vector (and cache)
-    /// minimal. Output is deterministically ordered.
+    /// file's bare pending impls into [`FileFacts::use_trait_imports`] (issue
+    /// #393), so the deferred cross-file resolver can bind a bare imported
+    /// trait/type name to its true aliased target. Only imports that a bare
+    /// pending impl in the SAME module scope actually names are emitted, keeping
+    /// the fact vector (and cache) minimal. Output is deterministically ordered.
     fn finalize_use_imports(&mut self) {
         let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
         let mut imports: Vec<UseImportFact> = Vec::new();
@@ -1850,32 +1903,30 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             if pending.trait_path.contains("::") {
                 continue;
             }
-            self.push_import_binding(
-                &mut seen,
-                &mut imports,
-                &pending.module_names,
-                &pending.trait_path,
-            );
-        }
-        // Issue #423: the IMPLEMENTS-gated self-dispatch join (issue #414,
-        // hardened in #420) resolves each relation's `impl_type_path` through
-        // the import-aware resolver, but `use_trait_imports` previously
-        // captured only TRAIT bindings — a bare Self type bound by an import
-        // (`use crate::model::S;`) scope-walked to nothing and the relation was
-        // dropped (a recall gap, never a wrong edge). Capture the implementing
-        // type's import binding too; the resolver's existing veto/ambiguity
-        // guards still drop external/ambiguous Self types, so no-wrong-edge
-        // holds unchanged.
-        for relation in &self.facts.impl_trait_relations {
-            if relation.impl_type_path.contains("::") {
+            let key = (pending.module_names.clone(), pending.trait_path.clone());
+            if seen.contains(&key) {
                 continue;
             }
-            self.push_import_binding(
-                &mut seen,
-                &mut imports,
-                &relation.module_names,
-                &relation.impl_type_path,
-            );
+            if let Some(paths) = self
+                .import_paths_by_scope
+                .get(&pending.module_names)
+                .and_then(|scope| scope.get(&pending.trait_path))
+            {
+                seen.insert(key);
+                // Emit ONE fact per DISTINCT resolved path (finding E): a bare
+                // name bound to 2+ paths by cfg-gated imports surfaces as
+                // multiple `use_trait_imports` entries the resolver treats as
+                // ambiguous (`lookup_use_import` returns `None` on distinct-path
+                // multiplicity), so import-aware resolution never fires and no
+                // edge is minted. A single binding still emits exactly one fact.
+                for path in paths {
+                    imports.push(UseImportFact {
+                        module_names: pending.module_names.clone(),
+                        simple_name: pending.trait_path.clone(),
+                        resolved_path: path.clone(),
+                    });
+                }
+            }
         }
         // Sort by resolved_path too so multiple same-name facts are ordered
         // deterministically (byte-identical output across runs).
@@ -1887,40 +1938,6 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             ))
         });
         self.facts.use_trait_imports = imports;
-    }
-
-    /// Emits one [`UseImportFact`] per distinct resolved path for the bare
-    /// `simple_name` bound by a module-item `use` in `module_names`, unless the
-    /// (scope, name) pair already emitted one. A bare name bound to 2+ paths by
-    /// cfg-gated imports surfaces as multiple `use_trait_imports` entries the
-    /// resolver treats as ambiguous (`lookup_use_import` returns `None` on
-    /// distinct-path multiplicity), so import-aware resolution never fires and
-    /// no edge is minted. A single binding still emits exactly one fact.
-    fn push_import_binding(
-        &self,
-        seen: &mut BTreeSet<(Vec<String>, String)>,
-        imports: &mut Vec<UseImportFact>,
-        module_names: &[String],
-        simple_name: &str,
-    ) {
-        let key = (module_names.to_vec(), simple_name.to_owned());
-        if seen.contains(&key) {
-            return;
-        }
-        if let Some(paths) = self
-            .import_paths_by_scope
-            .get(module_names)
-            .and_then(|scope| scope.get(simple_name))
-        {
-            seen.insert(key);
-            for path in paths {
-                imports.push(UseImportFact {
-                    module_names: module_names.to_vec(),
-                    simple_name: simple_name.to_owned(),
-                    resolved_path: path.clone(),
-                });
-            }
-        }
     }
 
     /// Resolves a normalized impl trait path against THIS file's indexed
@@ -5308,36 +5325,6 @@ pub mod inner {
         assert_eq!(
             find_node(&graph, NodeKind::Import).content_signature(),
             None
-        );
-    }
-
-    #[test]
-    fn finalize_use_imports_captures_the_implementing_type_import_binding() {
-        // Issue #423: `use crate::model::S; use crate::traits::T; impl T for S
-        // {}`. The relation's Self type `S` is a bare IMPORT-bound name, not a
-        // bare pending-trait name, so pre-#423 extraction captured only `T`'s
-        // binding and the repo-wide pass scope-walked `S` to nothing, dropping
-        // the relation (a recall gap — never a wrong edge). Both bindings must
-        // be captured so the IMPLEMENTS-gated self-dispatch join can resolve
-        // the imported local Self type.
-        let source = "use crate::model::S;\nuse crate::traits::T;\nimpl T for S {}\n";
-        let file = SourceFile {
-            path: PathBuf::from("src/user.rs"),
-            repo_relative_path: "src/user.rs".to_owned(),
-        };
-        let mut graph = Graph::default();
-        let facts = extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
-            .expect("source should parse");
-        let mut bindings: Vec<(&str, &str)> = facts
-            .use_trait_imports
-            .iter()
-            .map(|import| (import.simple_name.as_str(), import.resolved_path.as_str()))
-            .collect();
-        bindings.sort_unstable();
-        assert_eq!(
-            bindings,
-            vec![("S", "crate::model::S"), ("T", "crate::traits::T")],
-            "both the Self-type and trait import bindings must be captured (issue #423)"
         );
     }
 }
