@@ -1607,6 +1607,19 @@ pub enum GraphRecord {
         /// edge carries exactly one basis — none is emitted without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         basis: Option<CorrelationBasis>,
+        /// Per-call-site source spans retained from the deduplicated call sites
+        /// that produced this edge (issue #462); present only on `CALLS`
+        /// edges whose `resolution` is `Resolved`. Each span is interpreted in
+        /// the caller (edge `source`) symbol's file. `None` on every other
+        /// edge: ambiguous/unresolved `CALLS` edges carry no spans (the #233
+        /// fabrication-guard discipline — only provably single-target call
+        /// sites may become reference occurrences), and non-`CALLS` edges and
+        /// legacy records never carry it. Additive per
+        /// `docs/schema/schema-versioning.md`: `#[serde(default,
+        /// skip_serializing_if)]`, and never an identity input — the stable
+        /// edge ID stays `(label, source, target)` regardless of spans.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_site_spans: Option<Vec<SourceSpan>>,
         /// Struct-literal exhaustiveness marker (issue #443); present only on
         /// `CONSTRUCTS` edges. `Some(true)` when at least one collapsed
         /// construction site is the E0063-breakable exhaustive form (no
@@ -2274,6 +2287,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2303,6 +2317,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2339,6 +2354,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary,
@@ -2429,6 +2445,34 @@ impl GraphRecord {
     pub const fn construct_is_exhaustive(&self) -> Option<bool> {
         match self {
             Self::Edge { is_exhaustive, .. } => *is_exhaustive,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches per-call-site spans to a resolved `CALLS` edge record
+    /// (issue #462). Callers must only pass spans from `Resolved` call sites
+    /// and only call this on edges whose `resolution` is `Resolved`; the
+    /// fabrication-guard discipline is enforced by the resolution passes, not
+    /// here. No-op on node and tombstone records.
+    #[must_use]
+    pub fn with_call_site_spans(mut self, spans: Vec<SourceSpan>) -> Self {
+        if let Self::Edge {
+            call_site_spans, ..
+        } = &mut self
+        {
+            *call_site_spans = Some(spans);
+        }
+        self
+    }
+
+    /// Returns the retained per-call-site spans when this record is an edge
+    /// carrying them; `None` otherwise (issue #462).
+    #[must_use]
+    pub fn call_site_spans(&self) -> Option<&[SourceSpan]> {
+        match self {
+            Self::Edge {
+                call_site_spans, ..
+            } => call_site_spans.as_deref(),
             Self::Node { .. } | Self::Tombstone { .. } => None,
         }
     }

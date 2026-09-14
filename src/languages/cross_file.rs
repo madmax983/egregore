@@ -406,7 +406,8 @@ pub struct FileFacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_impls: Vec<PendingImplFact>,
     /// Module-item `use`-import bindings, for import-aware cross-file
-    /// `IMPLEMENTS` resolution (issue #393).
+    /// `IMPLEMENTS` resolution (issue #393) and imported implementing-type
+    /// resolution for the IMPLEMENTS-gated self-dispatch join (issue #423).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub use_trait_imports: Vec<UseImportFact>,
     /// Comprehensive `impl Trait for Type` relations, for the IMPLEMENTS-gated
@@ -970,9 +971,13 @@ pub fn cross_file_call_records(
 ) -> Vec<GraphRecord> {
     let index = DefinitionIndex::build(facts_by_file);
 
-    // (source, target) -> strongest resolution + summary, deduplicating
-    // repeated call sites between the same pair.
-    let mut edges: BTreeMap<(String, String), (CallResolution, String)> = BTreeMap::new();
+    // (source, target) -> (strongest resolution, summary, resolved call-site
+    // spans), deduplicating repeated call sites between the same pair. Spans
+    // are retained only from `Resolved` call sites and attached only when the
+    // pair's final resolution is `Resolved` (issue #462; the #233
+    // fabrication-guard discipline).
+    let mut edges: BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)> =
+        BTreeMap::new();
     // (file, callee display) -> first-seen span, for diagnostic nodes.
     let mut diagnostics: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
     // (file, callee display, caller ID) -> caller name, for unresolved edges.
@@ -1030,15 +1035,20 @@ pub fn cross_file_call_records(
             *span,
         ));
     }
-    for ((source, target), (resolution, summary)) in edges {
+    for ((source, target), (resolution, summary, spans)) in edges {
         let confidence = match resolution {
             CallResolution::Resolved => Some("1.0".to_owned()),
             CallResolution::Ambiguous | CallResolution::Unresolved => None,
         };
-        records.push(
-            GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
-                .with_resolution(resolution),
-        );
+        let mut record = GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
+            .with_resolution(resolution);
+        // Only a provably single-target pair keeps its call-site spans; an
+        // ambiguous pair drops them even when a resolved site contributed
+        // (issue #462, the #233 fabrication-guard discipline).
+        if resolution == CallResolution::Resolved && !spans.is_empty() {
+            record = record.with_call_site_spans(spans);
+        }
+        records.push(record);
     }
     for ((path, display, caller_id), caller_name) in diagnostic_edges {
         let target = unresolved_call_diagnostic_id(repository_id, &path, &display);
@@ -1828,7 +1838,9 @@ fn normalize_absolute_trait_path(target: &str, module_names: &[String]) -> Optio
 /// repo-wide pass. Per-file `CALLS` edges with no corresponding call site
 /// (e.g. calls inside macro token trees, constructor-style matches) keep no
 /// resolution field — absence means "outside the resolution contract", never
-/// "resolved".
+/// "resolved". A pair labeled `resolved` also keeps the deduplicated spans of
+/// its `Resolved` call sites on the edge (`call_site_spans`, issue #462);
+/// `ambiguous` pairs keep none, per the #233 fabrication-guard discipline.
 ///
 /// The pass is deterministic: pair statuses come from `BTreeMap` iteration
 /// and repeated call sites for one pair keep the strongest status.
@@ -1847,6 +1859,7 @@ pub fn label_same_file_call_resolutions(
             target,
             confidence,
             resolution,
+            call_site_spans,
             ..
         } = record
         else {
@@ -1855,10 +1868,16 @@ pub fn label_same_file_call_resolutions(
         if resolution.is_some() {
             continue;
         }
-        let Some(status) = resolutions.get(&(source.clone(), target.clone())) else {
+        let Some((status, spans)) = resolutions.get(&(source.clone(), target.clone())) else {
             continue;
         };
         *resolution = Some(*status);
+        // A `Resolved` pair keeps its deduplicated call-site spans; an
+        // ambiguous pair drops them (issue #462, the #233 fabrication-guard
+        // discipline).
+        if *status == CallResolution::Resolved && !spans.is_empty() {
+            *call_site_spans = Some(spans.clone());
+        }
         if *status == CallResolution::Ambiguous {
             *confidence = None;
         }
@@ -1872,9 +1891,13 @@ pub fn label_same_file_call_resolutions(
 /// matches definitions in other files is `ambiguous`), but only pairs whose
 /// candidate lives in the caller's file are returned — cross-file pairs are
 /// emitted with their status by [`cross_file_call_records`].
+///
+/// The returned spans are the deduplicated call-site spans of the pair's
+/// `Resolved` call sites only (issue #462); ambiguous sites contribute none,
+/// per the #233 fabrication-guard discipline.
 fn same_file_call_resolutions(
     facts_by_file: &BTreeMap<String, FileFacts>,
-) -> BTreeMap<(String, String), CallResolution> {
+) -> BTreeMap<(String, String), (CallResolution, Vec<SourceSpan>)> {
     let index = DefinitionIndex::build(facts_by_file);
     let mut resolutions = BTreeMap::new();
     for (path, facts) in facts_by_file {
@@ -1895,10 +1918,16 @@ fn same_file_call_resolutions(
                 }
                 let entry = resolutions
                     .entry((call.caller_id.clone(), candidate.id.clone()))
-                    .or_insert(status);
+                    .or_insert((status, Vec::new()));
                 // Prefer the strongest status when several call sites hit one pair.
-                if status < *entry {
-                    *entry = status;
+                if status < entry.0 {
+                    entry.0 = status;
+                }
+                // Only `Resolved` call sites contribute spans; ambiguous sites
+                // are dropped even when the pair later resolves via another
+                // site (issue #462, the #233 fabrication-guard discipline).
+                if status == CallResolution::Resolved && !entry.1.contains(&call.span) {
+                    entry.1.push(call.span);
                 }
             }
         }
@@ -1912,7 +1941,7 @@ fn record_candidate_edge(
     candidate: &DefinitionFact,
     resolution: CallResolution,
     candidate_count: usize,
-    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
 ) {
     // Same-file targets are already covered by the per-file reference pass;
     // emitting them again would duplicate stable edge IDs.
@@ -1933,10 +1962,17 @@ fn record_candidate_edge(
     let key = (call.caller_id.clone(), candidate.id.clone());
     let entry = edges
         .entry(key)
-        .or_insert_with(|| (resolution, summary.clone()));
+        .or_insert_with(|| (resolution, summary.clone(), Vec::new()));
     // Prefer the strongest status when several call sites hit one pair.
     if resolution < entry.0 {
-        *entry = (resolution, summary);
+        entry.0 = resolution;
+        entry.1 = summary;
+    }
+    // Only `Resolved` call sites contribute spans; ambiguous sites are
+    // dropped even when the pair later resolves via another site (issue #462,
+    // the #233 fabrication-guard discipline).
+    if resolution == CallResolution::Resolved && !entry.2.contains(&call.span) {
+        entry.2.push(call.span);
     }
 }
 
@@ -2466,12 +2502,29 @@ mod tests {
         }
     }
 
-    fn call(
+    fn span_at(
+        start_byte: usize,
+        end_byte: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> SourceSpan {
+        SourceSpan {
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+            start_column: None,
+            end_column: None,
+        }
+    }
+
+    fn call_at(
         caller_id: &str,
         display: &str,
         segments: &[&str],
         kind: CallKind,
         owner: Option<&str>,
+        span: SourceSpan,
     ) -> CallSiteFact {
         CallSiteFact {
             caller_id: caller_id.to_owned(),
@@ -2484,8 +2537,18 @@ mod tests {
             path_root: CallPathRoot::Unqualified,
             receiver_owner: owner.map(ToOwned::to_owned),
             receiver_type: None,
-            span: span(),
+            span,
         }
+    }
+
+    fn call(
+        caller_id: &str,
+        display: &str,
+        segments: &[&str],
+        kind: CallKind,
+        owner: Option<&str>,
+    ) -> CallSiteFact {
+        call_at(caller_id, display, segments, kind, owner, span())
     }
 
     fn facts(
@@ -3302,6 +3365,206 @@ mod tests {
             "two call sites for one pair must collapse to a single edge"
         );
         assert_eq!(records.len(), 1);
+    }
+
+    // ── Call-site span retention on edges (issue #462) ───────────────────
+
+    #[test]
+    fn resolved_cross_file_edge_retains_deduplicated_call_site_spans() {
+        let helper = definition("helper", "function", "src/a.rs", &["a", "helper"]);
+        let span_a = span_at(10, 16, 2, 2);
+        let span_b = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            ("src/a.rs", vec![helper], vec![]),
+            (
+                "src/b.rs",
+                vec![],
+                vec![
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                    call_at(
+                        "caller",
+                        "a::helper",
+                        &["a", "helper"],
+                        CallKind::Path,
+                        None,
+                        span_b,
+                    ),
+                    // A repeated call site at an already-seen span must not
+                    // duplicate the span on the edge.
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                ],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        assert_eq!(records.len(), 1, "sites must still collapse to one edge");
+        let edge = &records[0];
+        assert_eq!(edge.resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            edge.call_site_spans(),
+            Some([span_a, span_b].as_slice()),
+            "a resolved edge must retain every distinct call-site span, in scan order"
+        );
+    }
+
+    #[test]
+    fn ambiguous_cross_file_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/c.rs",
+                vec![],
+                vec![call_at(
+                    "caller",
+                    "dupe",
+                    &["dupe"],
+                    CallKind::Direct,
+                    None,
+                    span_at(3, 7, 1, 1),
+                )],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let edges: Vec<&GraphRecord> = records
+            .iter()
+            .filter(|record| matches!(record, GraphRecord::Edge { .. }))
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "an ambiguous call must fan out to both candidates"
+        );
+        for edge in edges {
+            assert_eq!(edge.resolution(), Some(CallResolution::Ambiguous));
+            assert_eq!(
+                edge.call_site_spans(),
+                None,
+                "an ambiguous edge must not retain call-site spans (fabrication guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn same_file_resolved_edge_retains_call_site_spans() {
+        let span_a = span_at(10, 16, 2, 2);
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "helper",
+                "function",
+                "src/a.rs",
+                &["a", "helper"],
+            )],
+            vec![call_at(
+                "caller",
+                "helper",
+                &["helper"],
+                CallKind::Direct,
+                None,
+                span_a,
+            )],
+        )]);
+        let mut records = vec![per_file_calls_edge("caller", "helper")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([span_a].as_slice()),
+            "a resolved same-file edge must retain its call-site span"
+        );
+    }
+
+    #[test]
+    fn same_file_ambiguous_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![call("caller", "dupe", &["dupe"], CallKind::Direct, None)],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Ambiguous));
+        assert_eq!(
+            records[0].call_site_spans(),
+            None,
+            "an ambiguous same-file edge must not retain call-site spans (fabrication guard)"
+        );
+    }
+
+    #[test]
+    fn same_file_mixed_pair_keeps_only_resolved_site_spans() {
+        // One pair, two call sites: a path-qualified site that resolves
+        // uniquely and a bare site that is ambiguous. The pair labels
+        // `resolved` (strongest wins) but only the resolved site's span may
+        // be retained — the ambiguous site's span is dropped, never promoted.
+        let resolved_span = span_at(10, 16, 2, 2);
+        let ambiguous_span = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![
+                    call_at(
+                        "caller",
+                        "a::dupe",
+                        &["a", "dupe"],
+                        CallKind::Path,
+                        None,
+                        resolved_span,
+                    ),
+                    call_at(
+                        "caller",
+                        "dupe",
+                        &["dupe"],
+                        CallKind::Direct,
+                        None,
+                        ambiguous_span,
+                    ),
+                ],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([resolved_span].as_slice()),
+            "only resolved call sites may contribute spans to a resolved edge"
+        );
     }
 
     // --- Cross-file IMPLEMENTS resolution (issue #344) ---------------------
