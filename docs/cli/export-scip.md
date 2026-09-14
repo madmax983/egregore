@@ -17,17 +17,13 @@ The reason is structural, not a bug: Egregore's cross-symbol graph edges
 (`CALLS` / `IMPORTS` / `REFERENCES` / `IMPLEMENTS`) are **positionless** — they
 name a source and a target record but carry no source coordinate, and a SCIP
 reference occurrence requires a position. Rather than fabricate ranges, this
-slice omits them (see [Fabrication guards](#fabrication-guards-ac7)). Both
-follow-ups below have landed at the data level; emitting reference occurrences
-remains future exporter work:
+slice omits them (see [Fabrication guards](#fabrication-guards-ac7)). Two
+follow-ups track lifting these limits:
 
 * **#462** — _Retain `CallSiteFact.span` on edges to enable SCIP reference
-  occurrences._ **Landed:** a resolved `CALLS` edge now carries
-  `call_site_spans` — the deduplicated per-call-site spans (interpreted in the
-  caller symbol's file), attached by both the cross-file and same-file
-  resolution passes. Ambiguous/unresolved edges carry none, per the
-  fabrication-guard discipline. Emitting reference occurrences from this data
-  is still future SCIP-exporter work.
+  occurrences._ The extractor computes per-call-site spans but drops them when
+  deduplicating edges; retaining them unlocks reference occurrences (implies a
+  codegraph schema decision).
 * **#463** — _Column-precision SCIP ranges._ **Implemented**: the Tree-sitter
   extractors record zero-based byte-offset columns on `SourceSpan`
   (`start_column` / `end_column`, additive and never identity inputs), so
@@ -156,11 +152,8 @@ SCIP interchange format instead; it does not alter the JSONL dump.
 
 ## Out of scope
 
-* **Reference / implementation occurrences** (callers, implementors) — the
-  positional edge data now exists (#462: `call_site_spans` on resolved `CALLS`
-  edges); emitting them from `eg export scip` is future work, also gated on
-  the edge-resolution work #134/#148/#152.
-* **Column-precise ranges** — #463, implemented.
+* **Reference / implementation occurrences** (callers, implementors) — blocked on
+  positional edge data (#462), plus the edge-resolution work #134/#148/#152.
 * **LSIF emission**, **temporal / historical export** (SCIP is single-snapshot),
   **importing SCIP** produced by other indexers, and any **hosted indexing,
   remote crawl, or automatic upload**.

@@ -412,7 +412,14 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
+        // No nested-definition shadowing in this language's extractor: the
+        // shadow map stays empty and the text pass is byte-identical.
+        emit_reference_edges(
+            self.graph,
+            &self.definitions,
+            &self.symbol_bodies,
+            &BTreeMap::new(),
+        );
     }
 
     /// Resolves deferred `Implements` edges now that the full `definitions` map

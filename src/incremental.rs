@@ -373,7 +373,7 @@ fn scan_repository_incremental_at_inner(
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
             let (records, facts) = match scan_source_file_records(&source_file, &repository_id)? {
-                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, facts),
+                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, *facts),
                 // A non-UTF-8 or unreadable file is skipped (issue #438): cache
                 // the diagnostic as this file's sole record so an unchanged file
                 // reuses it next refresh. Byte hashing above already succeeds

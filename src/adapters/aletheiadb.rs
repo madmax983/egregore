@@ -3209,7 +3209,6 @@ impl EmbeddedAletheiaSink {
             frame_resolution,
             frame_index,
             basis,
-            call_site_spans,
             is_exhaustive,
             temporal,
             summary,
@@ -3249,16 +3248,6 @@ impl EmbeddedAletheiaSink {
         // Struct-literal exhaustiveness marker on `CONSTRUCTS` edges (issue #443).
         let is_exhaustive_str = is_exhaustive.map(|value| if value { "true" } else { "false" });
         builder = insert_optional(builder, "is_exhaustive", is_exhaustive_str);
-        // Retained per-call-site spans on resolved `CALLS` edges (issue #462),
-        // stored as a JSON array of `SourceSpan`s, mirroring `producer_json`.
-        let call_site_spans_json = call_site_spans
-            .as_deref()
-            .and_then(|spans| serde_json::to_string(spans).ok());
-        builder = insert_optional(
-            builder,
-            "call_site_spans_json",
-            call_site_spans_json.as_deref(),
-        );
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -4140,9 +4129,8 @@ impl EmbeddedAletheiaSink {
     }
 
     // A long but flat field-by-field edge reconstruction; each optional edge
-    // property (resolution, frame_resolution, frame_index, basis,
-    // call_site_spans_json, is_exhaustive, …) is parsed inline, so the line
-    // count exceeds the default lint threshold.
+    // property (resolution, frame_resolution, frame_index, basis, is_exhaustive,
+    // …) is parsed inline, so the line count exceeds the default lint threshold.
     #[allow(clippy::too_many_lines)]
     fn read_edge_record_internal(
         &self,
@@ -4241,18 +4229,6 @@ impl EmbeddedAletheiaSink {
                 )?
                 .as_deref(),
             )?,
-            call_site_spans: optional_str_property(
-                record_id,
-                "call_site_spans_json",
-                edge.get_property("call_site_spans_json"),
-            )?
-            .as_deref()
-            .map(|json| {
-                serde_json::from_str::<Vec<SourceSpan>>(json).map_err(|error| {
-                    read_back_error(record_id, format!("call_site_spans_json invalid: {error}"))
-                })
-            })
-            .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(
@@ -7941,80 +7917,6 @@ mod tests {
         drop(sink);
         let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
         assert_latest_edge_wins(&sink);
-    }
-
-    #[test]
-    fn edge_call_site_spans_round_trip_through_embedded_store() {
-        // Issue #462: the retained per-call-site spans on a resolved CALLS
-        // edge must survive the embedded store's property encoding, so a
-        // re-ingest and a read-back both preserve them.
-        let temp = tempfile::tempdir().expect("temp dir");
-        let data_dir = temp.path().join("call-site-spans-store");
-        let source_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "caller"]);
-        let target_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "callee"]);
-        let spans = vec![
-            SourceSpan {
-                start_byte: 10,
-                end_byte: 16,
-                start_line: 2,
-                end_line: 2,
-                start_column: None,
-                end_column: None,
-            },
-            SourceSpan {
-                start_byte: 40,
-                end_byte: 46,
-                start_line: 5,
-                end_line: 5,
-                start_column: None,
-                end_column: None,
-            },
-        ];
-        let edge = GraphRecord::edge(
-            EdgeLabel::Calls,
-            source_symbol_id.clone(),
-            target_symbol_id.clone(),
-            Some("1.0".to_owned()),
-            "caller calls callee".to_owned(),
-        )
-        .with_resolution(crate::ir::CallResolution::Resolved)
-        .with_call_site_spans(spans.clone());
-        let edge_id = edge.id().to_owned();
-
-        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
-        sink.write_record(&current_symbol_record(
-            &source_symbol_id,
-            "caller symbol",
-            10,
-        ))
-        .expect("caller should write");
-        sink.write_record(&current_symbol_record(
-            &target_symbol_id,
-            "callee symbol",
-            10,
-        ))
-        .expect("callee should write");
-        sink.write_record(&edge).expect("edge should write");
-
-        let assert_spans_round_tripped = |sink: &EmbeddedAletheiaSink| {
-            let round_tripped = sink
-                .read_all_records()
-                .expect("read_all_records should succeed")
-                .into_iter()
-                .find(|record| record.id() == edge_id)
-                .expect("edge must appear in read_all_records");
-            assert_eq!(
-                round_tripped.call_site_spans(),
-                Some(spans.as_slice()),
-                "call-site spans must survive the embedded round-trip"
-            );
-        };
-        assert_spans_round_tripped(&sink);
-
-        // Reopen: the spans must survive a rebuild from persisted properties.
-        drop(sink);
-        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
-        assert_spans_round_tripped(&sink);
     }
 
     fn temporal_observed(
