@@ -181,6 +181,22 @@ The semantic index finds code by **meaning**, not by name. Querying `"write node
 
 See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no-result exit codes, and operator actions.
 
+### 9. Wire the MCP server into your agent
+
+`eg mcp` is the agent integration path: a stdio MCP server exposing three
+read-only, citation-bearing tools (`inspect_store`, `symbol_context`,
+`task_evidence`) against a running daemon. Start the daemon, register the
+server in your agent host, and run the handshake smoke test:
+
+```powershell
+egregore daemon start --data-dir .egregore
+```
+
+Copy-paste registration configs for Claude Code, Codex CLI, and Cursor, the
+five-step operator flow, per-tool output contracts, and the
+missing-store/stale-store error envelope an agent must gate on are in
+[docs/cli/mcp.md](docs/cli/mcp.md).
+
 ---
 
 ## Why not just use ripgrep?
@@ -240,6 +256,8 @@ egregore bundle export --root-selector <selector> \
     --graph <path> --out <path>                            # export evidence bundle
 egregore bundle inspect <path>                              # inspect bundle manifest
 egregore bundle verify <path>                               # verify bundle integrity, coverage, and safety
+egregore daemon start --data-dir .egregore                   # local shared-store daemon
+egregore mcp --data-dir .egregore                            # stdio MCP server: read-only agent tools (see docs/cli/mcp.md)
 # eg import github <owner>/<repo> --out github.jsonl          # planned — see docs/schema/import-github.md
 ```
 
@@ -255,6 +273,7 @@ Implemented surfaces:
 - `ingest` — dry-run, embedded AletheiaDB, and daemon adapters
 - `import-codex` — Codex session/rollout JSONL → agent-memory graph records (M3)
 - `query symbol / file / drift / semantic` — structural and semantic agent queries
+- `mcp` — stdio MCP server exposing read-only agent tools (`inspect_store`, `symbol_context`, `task_evidence`) against a running daemon; see [docs/cli/mcp.md](docs/cli/mcp.md)
 - Incremental file-cache planning with tombstones
 - AletheiaDB embedding re-export through the optional `embeddings` feature
 - Semantic drift records and query helpers for symbol-at-commit and largest-drift workflows

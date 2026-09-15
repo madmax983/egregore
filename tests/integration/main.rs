@@ -60,6 +60,7 @@ mod local_project_jsonl_doc;
 mod log_deltas;
 mod manifest_deps;
 mod mcp;
+mod mcp_stdio;
 mod memory_audit;
 mod memory_health;
 mod memory_recall;
