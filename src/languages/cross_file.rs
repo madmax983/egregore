@@ -37,6 +37,7 @@
 //! duplicate (caller, target) pairs collapse to one edge preferring the
 //! strongest status.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,38 @@ pub struct DefinitionFact {
     /// never invoke a trait method). Defaults to `false`.
     #[serde(default)]
     pub is_trait_method: bool,
+    /// Repo-relative path of the defining file.
+    pub repo_relative_path: String,
+}
+
+/// A block-local `fn` definition (issue #422).
+///
+/// Declared inside a function or closure BODY, hence lexically unreachable
+/// from other scopes. It is NOT pooled into the flat module-level
+/// [`DefinitionFact`] index (issue #413 round 3 closed that wrong-edge
+/// vector); it is carried separately so the resolver can recall it ONLY for
+/// calls in its own lexical scope.
+///
+/// The scope gate is [`BlockLocalDefinitionFact::enclosing_scope_id`]: this
+/// def is a candidate solely for a bare (`Direct`) call whose `caller_id`
+/// equals the enclosing scope (calls in the enclosing function/method body,
+/// including closures and nested blocks, which inherit the enclosing caller
+/// id) or equals the def's own id (a recursive call inside its own body). A
+/// bare call from any OTHER scope never sees it — the #413 guard.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockLocalDefinitionFact {
+    /// Stable record ID of the Symbol node.
+    pub id: String,
+    /// Qualified display name (module-qualified, e.g. `alpha::helper`).
+    pub qualified_name: String,
+    /// Unqualified name (last path segment).
+    pub simple_name: String,
+    /// Symbol kind: `function` or `test` (a block-local `fn` is never a
+    /// `method` — issue #413 corrected that attribution).
+    pub symbol_kind: String,
+    /// Stable record ID of the lexically-enclosing function/method/test
+    /// symbol whose body contains this definition.
+    pub enclosing_scope_id: String,
     /// Repo-relative path of the defining file.
     pub repo_relative_path: String,
 }
@@ -393,6 +426,11 @@ pub struct FileFacts {
     /// Callable definitions in the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub definitions: Vec<DefinitionFact>,
+    /// Block-local `fn` definitions in the file (issue #422). Lexically
+    /// scoped: candidates only for calls in their own enclosing scope, never
+    /// pooled into [`FileFacts::definitions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_local_definitions: Vec<BlockLocalDefinitionFact>,
     /// Call sites found inside recorded symbol bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_sites: Vec<CallSiteFact>,
@@ -430,6 +468,7 @@ impl FileFacts {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.definitions.is_empty()
+            && self.block_local_definitions.is_empty()
             && self.call_sites.is_empty()
             && self.construct_sites.is_empty()
             && self.route_registration_sites.is_empty()
@@ -1270,42 +1309,19 @@ fn resolve_aux_helper_mod(
         .then_some(dir_candidate)
 }
 
-/// Computes a crate-root REASSIGNMENT map for auxiliary-target (test / example /
-/// bench) HELPER module files, closing the recall gap where a shared helper like
-/// `tests/common/mod.rs` — path-classified into its OWN synthetic crate root
-/// `test:common` by [`crate_root_id`] — actually belongs to the entry crate that
-/// `mod`-includes it (`test:it` for `tests/it.rs`). Issue #394 restricts a
-/// pending impl's candidate traits to its own crate root, so without this remap
-/// an `impl crate::T for Foo` in the helper cannot resolve a trait `T` defined in
-/// the entry file — a MISSING `IMPLEMENTS` edge (Codex round-2/3, PR #399: "test
-/// / example helper modules are stamped their own root").
+/// Walks each aux ENTRY crate root's ([`aux_entry_crate_root`]) transitive plain
+/// `mod <name>;` declarations ([`resolve_aux_helper_mod`], nested helpers
+/// included) and returns, for every reached helper file, the SORTED list of
+/// distinct entry crate roots that include it.
 ///
-/// Path alone cannot decide the owning crate; the `mod` inclusion graph must be
-/// consulted. Each aux ENTRY crate root ([`aux_entry_crate_root`]) seeds a walk
-/// down its transitive plain `mod <name>;` declarations (nested helpers
-/// included). A helper reachable from EXACTLY ONE entry crate is remapped to that
-/// entry's crate root; a helper reachable from ZERO or from 2+ distinct entry
-/// crates keeps its path-based crate root (conservative — a shared or standalone
-/// helper stays unresolved rather than binding one interpretation, preserving the
-/// no-wrong-edge invariant). A helper that is ITSELF an aux entry crate root
-/// (`tests/common.rs`, which cargo also compiles as its own test target) counts
-/// as belonging to its own crate and is never remapped.
-///
-/// Only test/example/bench helper files are reassigned; `lib`/`bin`/`build`
-/// assignment is untouched. The returned map is helper repo-relative path ->
-/// reassigned crate root, applied by [`cross_file_implements_records`] as an
-/// in-pass fact remap — no serialized fact shape changes, so
-/// `CACHE_SCHEMA_VERSION` is unaffected.
-///
-/// Documented residual bound: only the `crate_root` partition key is remapped,
-/// not a helper symbol's crate-root-relative `qualified_name`. A DEEPLY nested
-/// helper that defines a root-level symbol colliding by simple name with the
-/// entry crate's own root symbol can therefore become same-name-ambiguous and
-/// stay unresolved (a conservative MISSING edge), never a wrong edge. The
-/// direct, canonical single-`mod` helper case (the reported gap) resolves.
-fn reassign_aux_helper_crate_roots(
+/// The seed of each walk is the entry crate root itself (owns its CONTAINING
+/// directory); every reached helper is an ordinary module file. `visited` is
+/// per-entry, so inclusion cycles terminate. A `BTreeSet` accumulates the
+/// includer roots, so each helper's list is sorted and duplicate-free —
+/// deterministic and byte-identical across runs.
+fn aux_helper_includer_roots(
     facts_by_file: &BTreeMap<String, FileFacts>,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, Vec<String>> {
     let known_paths: std::collections::BTreeSet<String> = facts_by_file.keys().cloned().collect();
     // helper repo-relative path -> the distinct entry crate roots that
     // transitively include it via plain `mod` declarations.
@@ -1338,31 +1354,148 @@ fn reassign_aux_helper_crate_roots(
             }
         }
     }
+    reached
+        .into_iter()
+        .map(|(helper, roots)| (helper, roots.into_iter().collect()))
+        .collect()
+}
+
+/// Computes a crate-root REASSIGNMENT map for auxiliary-target (test / example /
+/// bench) HELPER module files, closing the recall gap where a shared helper like
+/// `tests/common/mod.rs` — path-classified into its OWN synthetic crate root
+/// `test:common` by [`crate_root_id`] — actually belongs to the entry crate that
+/// `mod`-includes it (`test:it` for `tests/it.rs`). Issue #394 restricts a
+/// pending impl's candidate traits to its own crate root, so without this remap
+/// an `impl crate::T for Foo` in the helper cannot resolve a trait `T` defined in
+/// the entry file — a MISSING `IMPLEMENTS` edge (Codex round-2/3, PR #399: "test
+/// / example helper modules are stamped their own root").
+///
+/// Path alone cannot decide the owning crate; the `mod` inclusion graph
+/// ([`aux_helper_includer_roots`]) is consulted. A helper reachable from EXACTLY
+/// ONE entry crate is remapped to that entry's crate root; a helper reachable
+/// from ZERO entry crates keeps its path-based crate root (conservative — a
+/// standalone helper stays unresolved rather than binding one interpretation,
+/// preserving the no-wrong-edge invariant). A helper shared by 2+ distinct entry
+/// crates is NOT remapped here either (no single owner to pick); issue #401
+/// recovers its recall instead via [`multi_includer_aux_helper_roots`] +
+/// [`duplicate_multi_includer_helpers`]. A helper that is ITSELF an aux entry
+/// crate root (`tests/common.rs`, which cargo also compiles as its own test
+/// target) counts as belonging to its own crate and is never remapped.
+///
+/// Only test/example/bench helper files are reassigned; `lib`/`bin`/`build`
+/// assignment is untouched. The returned map is helper repo-relative path ->
+/// reassigned crate root, applied by [`cross_file_implements_records`] as an
+/// in-pass fact remap — no serialized fact shape changes, so
+/// `CACHE_SCHEMA_VERSION` is unaffected.
+///
+/// Documented residual bound: only the `crate_root` partition key is remapped,
+/// not a helper symbol's crate-root-relative `qualified_name`. A DEEPLY nested
+/// helper that defines a root-level symbol colliding by simple name with the
+/// entry crate's own root symbol can therefore become same-name-ambiguous and
+/// stay unresolved (a conservative MISSING edge), never a wrong edge. The
+/// direct, canonical single-`mod` helper case (the reported gap) resolves.
+fn reassign_aux_helper_crate_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, String> {
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
-    for (helper, roots) in reached {
+    for (helper, roots) in aux_helper_includer_roots(facts_by_file) {
         // Conservative multi/zero-includer bound: only a single-includer helper
-        // is remapped.
-        if roots.len() != 1 {
+        // is remapped. A helper shared by 2+ entry crates is duplicated per
+        // includer root instead (issue #401); it never lands in this map.
+        let [new_root] = roots.as_slice() else {
             continue;
-        }
+        };
         // A file cargo compiles as its OWN aux target belongs to its own crate;
         // never steal it into the including entry (it lives in 2+ crates).
         if aux_entry_crate_root(&helper).is_some() {
             continue;
         }
-        let new_root = roots.into_iter().next().expect("exactly one includer");
-        if crate_root_id(&helper) != new_root {
-            remap.insert(helper, new_root);
+        if crate_root_id(&helper) != *new_root {
+            remap.insert(helper, new_root.clone());
         }
     }
     remap
 }
 
+/// Computes the multi-includer helper map for auxiliary-target (test / example /
+/// bench) HELPER module files (issue #401): every helper file transitively
+/// `mod`-included by 2+ DISTINCT entry crate roots, mapped to the SORTED list of
+/// those entry roots.
+///
+/// Cargo compiles each integration-test / example / bench target as its own
+/// crate, so a helper shared by `tests/a.rs` and `tests/b.rs` is REALLY compiled
+/// once per including target — but path-based [`crate_root_id`] stamps it one
+/// synthetic root (`test:common`), and [`reassign_aux_helper_crate_roots`]
+/// conservatively leaves multi-includer helpers un-remapped (no single owner to
+/// pick). [`cross_file_implements_records`] therefore DUPLICATES such a helper's
+/// facts once per including crate root
+/// ([`duplicate_multi_includer_helpers`]): each duplicate resolves strictly
+/// within its own crate root (#394 isolation), so the duplication recovers the
+/// lost `IMPLEMENTS` recall with no wrong-edge risk — one edge per real
+/// compilation.
+///
+/// A helper that is ITSELF an aux entry crate root (`tests/common.rs`, which
+/// cargo also compiles as its own test target) belongs to its own crate and is
+/// never duplicated into its includers.
+#[must_use]
+fn multi_includer_aux_helper_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, Vec<String>> {
+    aux_helper_includer_roots(facts_by_file)
+        .into_iter()
+        .filter(|(helper, roots)| roots.len() >= 2 && aux_entry_crate_root(helper).is_none())
+        .collect()
+}
+
+/// Duplicates a multi-includer aux helper's facts once per including entry
+/// crate root (issue #401). For each helper in `multi`, one copy of its
+/// [`FileFacts::impl_targets`] / [`FileFacts::pending_impls`] is appended per
+/// includer root with `crate_root` rewritten to that root — mirroring the real
+/// compilations cargo performs (the helper is compiled once per including test
+/// / example / bench target). The helper's original path-stamped copies are
+/// kept, so the phantom partition resolves exactly as before (status quo, never
+/// worse). Only the `crate_root` partition key changes; qualified names, module
+/// paths, and imports are untouched — a pure re-partition, deterministic and
+/// byte-identical across runs.
+#[must_use]
+fn duplicate_multi_includer_helpers(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    multi: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, FileFacts> {
+    let mut out = facts_by_file.clone();
+    for (path, roots) in multi {
+        let Some(facts) = out.get_mut(path) else {
+            continue;
+        };
+        // Build the per-root copies from the ORIGINAL vectors first: appending
+        // while iterating the same vector would trip the borrow checker (and
+        // duplicating the duplicates would be wrong).
+        let mut extra_targets: Vec<ImplTargetFact> = Vec::new();
+        let mut extra_pending: Vec<PendingImplFact> = Vec::new();
+        for root in roots {
+            for target in &facts.impl_targets {
+                let mut duplicate = target.clone();
+                duplicate.crate_root.clone_from(root);
+                extra_targets.push(duplicate);
+            }
+            for pending in &facts.pending_impls {
+                let mut duplicate = pending.clone();
+                duplicate.crate_root.clone_from(root);
+                extra_pending.push(duplicate);
+            }
+        }
+        facts.impl_targets.extend(extra_targets);
+        facts.pending_impls.extend(extra_pending);
+    }
+    out
+}
+
 /// Applies a [`reassign_aux_helper_crate_roots`] remap to a CLONE of the facts,
-/// rewriting the `crate_root` on every `ImplTargetFact` and `PendingImplFact` of
-/// each remapped helper file. Only the `crate_root` partition key changes;
-/// qualified names, module paths, and imports are untouched, so this is a pure
-/// re-partition, deterministic and byte-identical across runs.
+/// rewriting the `crate_root` on every `ImplTargetFact`, `PendingImplFact`, and
+/// `ImplTraitRelationFact` of each remapped helper file. Only the `crate_root`
+/// partition key changes; qualified names, module paths, and imports are
+/// untouched, so this is a pure re-partition, deterministic and byte-identical
+/// across runs.
 fn apply_crate_root_remap(
     facts_by_file: &BTreeMap<String, FileFacts>,
     remap: &BTreeMap<String, String>,
@@ -1375,6 +1508,13 @@ fn apply_crate_root_remap(
             }
             for pending in &mut facts.pending_impls {
                 pending.crate_root.clone_from(new_root);
+            }
+            // The IMPLEMENTS-gated self-dispatch join (issue #414) keys
+            // `impl_trait_relations` by `crate_root`, so a helper's relations
+            // move with the rest of its facts: otherwise the CALLS pass would
+            // look them up under the entry root and miss (issue #475).
+            for relation in &mut facts.impl_trait_relations {
+                relation.crate_root.clone_from(new_root);
             }
         }
     }
@@ -1436,12 +1576,36 @@ fn join_segments(dir: &[String], suffix: &str) -> Option<String> {
 /// `CALLS` edges, in deterministic order. It also appends the `CONSTRUCTS`
 /// struct-literal edges (issue #443) via [`cross_file_construct_records`], so
 /// every driver that emits cross-file CALLS gets CONSTRUCTS with no extra wiring.
+///
+/// Auxiliary-target helper modules (`tests/common/mod.rs`) are reassigned to
+/// the entry crate that `mod`-includes them (issue #475) before resolution, on
+/// both the index side and the caller side, exactly as the IMPLEMENTS and
+/// CONSTRUCTS passes do.
 #[must_use]
 pub fn cross_file_call_records(
     repository_id: &str,
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> Vec<GraphRecord> {
-    let index = DefinitionIndex::build(facts_by_file);
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them, exactly as
+    // [`cross_file_construct_records`] does (issue #475): a `crate::…` call in
+    // such a helper resolves against the including ENTRY crate in Rust, but
+    // path-based [`crate_root_id`] stamps the helper its OWN synthetic root
+    // (`test:common`), which confines the call to the wrong partition and drops
+    // its CALLS edge. The remap rewrites both the index side (helper
+    // definitions partition under the entry root via the remap-aware
+    // [`DefinitionIndex`]) and the caller side (each call site's
+    // `caller_crate_root`, looked up below). When nothing needs remapping the
+    // borrowed facts are used directly, keeping output byte-identical.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
 
     // (source, target) -> strongest resolution + summary, deduplicating
     // repeated call sites between the same pair.
@@ -1452,11 +1616,24 @@ pub fn cross_file_call_records(
     let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
 
     for (path, facts) in facts_by_file {
-        let caller_crate_root = crate_root_id(path);
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
             };
+            // Lexically-scoped block-local recall (issue #422): an in-scope
+            // block-local def shadows the flat pool for this call — a bare
+            // call in the enclosing body binds the block-local, never a
+            // same-named module-level def, and a call from any other scope
+            // never sees the block-local at all (the #413 guard, enforced by
+            // `block_local_candidates`' scope gate).
+            let block_locals = index.block_local_candidates(call, simple_name);
+            if record_block_local_call(call, &block_locals, &mut edges) {
+                continue;
+            }
             let candidates = index.candidates(call, simple_name, &caller_crate_root);
             match candidates.len() {
                 0 => {
@@ -1557,7 +1734,9 @@ pub fn cross_file_route_records(
     // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
     // entry crate that `mod`-includes them, exactly as
     // [`cross_file_construct_records`] does, so a `crate::…`-scoped registration
-    // in such a helper resolves against the including entry crate.
+    // in such a helper resolves against the including entry crate. The remap
+    // also partitions a helper's own handler definitions under the entry root
+    // on the index side (issue #475), via the remap-aware [`DefinitionIndex`].
     let remap = reassign_aux_helper_crate_roots(facts_by_file);
     let remapped;
     let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
@@ -1566,7 +1745,7 @@ pub fn cross_file_route_records(
         remapped = apply_crate_root_remap(facts_by_file, &remap);
         &remapped
     };
-    let index = DefinitionIndex::build(facts_by_file);
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
 
     // (owner_id, handler_symbol_id) -> summary, collapsing repeated
     // registrations between the same pair.
@@ -1814,6 +1993,21 @@ pub fn cross_file_implements_records(
     } else {
         remapped = apply_crate_root_remap(facts_by_file, &remap);
         &remapped
+    };
+    // Issue #401: a helper `mod`-included by 2+ entry crates is compiled once
+    // per including test/example/bench target, so its facts are duplicated per
+    // includer crate root before the index is built. Each duplicate resolves
+    // strictly within its own crate root (#394 isolation), recovering the lost
+    // `IMPLEMENTS` recall with no wrong-edge risk — one edge per real
+    // compilation. When no helper is shared the borrowed facts are used
+    // directly, keeping output byte-identical.
+    let multi = multi_includer_aux_helper_roots(facts_by_file);
+    let duplicated;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if multi.is_empty() {
+        facts_by_file
+    } else {
+        duplicated = duplicate_multi_includer_helpers(facts_by_file, &multi);
+        &duplicated
     };
     let index = ImplTargetIndex::build(facts_by_file);
     // (source impl ID, trait target ID) -> summary, deduplicating so a source
@@ -2351,14 +2545,54 @@ pub fn label_same_file_call_resolutions(
 fn same_file_call_resolutions(
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> BTreeMap<(String, String), CallResolution> {
-    let index = DefinitionIndex::build(facts_by_file);
+    // Same aux-helper crate-root remap as the cross-file CALLS pass
+    // (issue #475): a helper's call sites and definitions partition under the
+    // including entry crate, so the repo-wide candidate count behind each
+    // same-file label is computed under the true crate root.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = DefinitionIndex::build(facts_by_file, remap.clone());
     let mut resolutions = BTreeMap::new();
     for (path, facts) in facts_by_file {
-        let caller_crate_root = crate_root_id(path);
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
             };
+            // Block-local defs shadow the flat pool here too (issue #422): a
+            // call the scope gate admits binds the block-local. (The per-file
+            // text pass already suppresses its own edge from the enclosing
+            // body to the shadowed same-named module-level def, so no stale
+            // pair reaches this map.)
+            let block_locals = index.block_local_candidates(call, simple_name);
+            if !block_locals.is_empty() {
+                let status = match block_locals.len() {
+                    1 => CallResolution::Resolved,
+                    _ => CallResolution::Ambiguous,
+                };
+                for definition in block_locals {
+                    if definition.repo_relative_path != *path || definition.id == call.caller_id {
+                        continue;
+                    }
+                    let entry = resolutions
+                        .entry((call.caller_id.clone(), definition.id.clone()))
+                        .or_insert(status);
+                    // Prefer the strongest status when several call sites hit one pair.
+                    if status < *entry {
+                        *entry = status;
+                    }
+                }
+                continue;
+            }
             let candidates = index.candidates(call, simple_name, &caller_crate_root);
             let status = match candidates.len() {
                 0 => continue,
@@ -2380,6 +2614,72 @@ fn same_file_call_resolutions(
         }
     }
     resolutions
+}
+
+/// Records a lexically-scoped block-local call edge (issue #422), mirroring
+/// [`record_candidate_edge`] without its same-file skip.
+fn record_block_local_edge(
+    call: &CallSiteFact,
+    definition: &BlockLocalDefinitionFact,
+    resolution: CallResolution,
+    candidate_count: usize,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+) {
+    // A block-local def lives in the caller's own file by construction (the
+    // scope gate only matches caller ids from the enclosing scope), so the
+    // per-file reference pass can never emit this pair — no same-file skip is
+    // needed to avoid duplicate stable edge IDs. Self-recursion
+    // (`definition.id == call.caller_id`) mints no edge, mirroring
+    // `record_candidate_edge`'s treatment of module-level self-recursion.
+    if definition.id == call.caller_id {
+        return;
+    }
+    let summary = match resolution {
+        CallResolution::Resolved => format!(
+            "{} calls {} (block-local, resolved)",
+            call.caller_name, definition.qualified_name
+        ),
+        CallResolution::Ambiguous => format!(
+            "{} calls {} (block-local, ambiguous: {candidate_count} in-scope candidates)",
+            call.caller_name, definition.qualified_name
+        ),
+        CallResolution::Unresolved => unreachable!("unresolved calls never bind a candidate"),
+        CallResolution::UnresolvedDispatch => {
+            unreachable!("unresolved dispatch never binds a candidate")
+        }
+    };
+    let key = (call.caller_id.clone(), definition.id.clone());
+    let entry = edges
+        .entry(key)
+        .or_insert_with(|| (resolution, summary.clone()));
+    // Prefer the strongest status when several call sites hit one pair.
+    if resolution < entry.0 {
+        *entry = (resolution, summary);
+    }
+}
+
+/// Records the lexically-scoped block-local edges for one call site (issue
+/// #422), returning `true` when the scope gate admitted at least one
+/// block-local candidate. A handled call binds the block-local INSTEAD of
+/// the flat pool (shadowing), so the caller must skip flat candidate
+/// resolution for it.
+fn record_block_local_call(
+    call: &CallSiteFact,
+    block_locals: &[&BlockLocalDefinitionFact],
+    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+) -> bool {
+    if block_locals.is_empty() {
+        return false;
+    }
+    let resolution = if block_locals.len() == 1 {
+        CallResolution::Resolved
+    } else {
+        CallResolution::Ambiguous
+    };
+    for definition in block_locals {
+        record_block_local_edge(call, definition, resolution, block_locals.len(), edges);
+    }
+    true
 }
 
 fn record_candidate_edge(
@@ -2480,6 +2780,12 @@ fn unresolved_call_diagnostic(
 
 struct DefinitionIndex<'facts> {
     by_simple_name: BTreeMap<&'facts str, Vec<&'facts DefinitionFact>>,
+    /// Simple name -> block-local `fn` definitions (issue #422), sorted by
+    /// (path, qualified name, ID) like [`DefinitionIndex::by_simple_name`].
+    /// Consulted ONLY through [`DefinitionIndex::block_local_candidates`],
+    /// which applies the lexical scope gate — never pooled with the flat
+    /// index.
+    block_locals_by_name: BTreeMap<&'facts str, Vec<&'facts BlockLocalDefinitionFact>>,
     /// `(crate_root, implementing_type) -> {trait qualified name}`: the set of
     /// trait qualified names each type provably implements, for IMPLEMENTS-gated
     /// self-dispatch (issue #414). Built by resolving every
@@ -2500,10 +2806,21 @@ struct DefinitionIndex<'facts> {
     /// that type's method. The `implemented` map above is derived from this
     /// same index; retaining it lets the `Method` arm reuse it directly.
     impl_index: ImplTargetIndex<'facts>,
+    /// Aux-helper crate-root remap (issue #475): helper repo-relative path ->
+    /// the including entry crate's root, from
+    /// [`reassign_aux_helper_crate_roots`]. [`Self::definition_crate_root`]
+    /// consults it so a helper's definitions partition under the entry crate
+    /// they truly belong to instead of their synthetic path-derived root.
+    /// Empty when no helper needed reassignment, in which case partitioning is
+    /// exactly the path-derived [`crate_root_id`] behavior.
+    aux_helper_roots: BTreeMap<String, String>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
-    fn build(facts_by_file: &'facts BTreeMap<String, FileFacts>) -> Self {
+    fn build(
+        facts_by_file: &'facts BTreeMap<String, FileFacts>,
+        aux_helper_roots: BTreeMap<String, String>,
+    ) -> Self {
         let mut by_simple_name: BTreeMap<&str, Vec<&DefinitionFact>> = BTreeMap::new();
         for facts in facts_by_file.values() {
             for definition in &facts.definitions {
@@ -2524,6 +2841,30 @@ impl<'facts> DefinitionIndex<'facts> {
             candidates.dedup_by(|a, b| a.id == b.id);
         }
 
+        // Lexically-scoped block-local definitions (issue #422): indexed by
+        // simple name but kept OUT of the flat `by_simple_name` pool, so only
+        // the scope-gated `block_local_candidates` can ever surface them.
+        let mut block_locals_by_name: BTreeMap<&str, Vec<&BlockLocalDefinitionFact>> =
+            BTreeMap::new();
+        for facts in facts_by_file.values() {
+            for definition in &facts.block_local_definitions {
+                block_locals_by_name
+                    .entry(definition.simple_name.as_str())
+                    .or_default()
+                    .push(definition);
+            }
+        }
+        for candidates in block_locals_by_name.values_mut() {
+            candidates.sort_by(|a, b| {
+                (&a.repo_relative_path, &a.qualified_name, &a.id).cmp(&(
+                    &b.repo_relative_path,
+                    &b.qualified_name,
+                    &b.id,
+                ))
+            });
+            candidates.dedup_by(|a, b| a.id == b.id);
+        }
+
         // Build the workspace crate-name registry (issue #440): every crate
         // directory the scanned file set reveals contributes its inferred name
         // -> library crate-root binding, so a `dep_crate::…` qualified call can
@@ -2534,11 +2875,14 @@ impl<'facts> DefinitionIndex<'facts> {
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
         // crate-root-relative qualified name via the repo-wide impl-target
-        // index (issue #414). A plain `build` (no aux-helper crate-root remap)
-        // is used deliberately — this join is conservative and stays within one
-        // crate root, so it never needs the #399 out-of-line remap. An
-        // unresolvable trait path (external/std, ambiguous) contributes nothing,
-        // so the gate degrades to unresolved (a MISS, never a WRONG edge).
+        // index (issue #414). The facts carry the aux-helper crate-root remap
+        // when the caller applied [`reassign_aux_helper_crate_roots`]
+        // (issue #475): a helper's impl relations then join under the including
+        // entry crate they truly belong to, and the remap is conservative
+        // (single-includer helpers only), so the join still never crosses a
+        // true crate boundary. An unresolvable trait path (external/std,
+        // ambiguous) contributes nothing, so the gate degrades to unresolved
+        // (a MISS, never a WRONG edge).
         let impl_index = ImplTargetIndex::build(facts_by_file);
         let mut implemented: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for facts in facts_by_file.values() {
@@ -2604,10 +2948,25 @@ impl<'facts> DefinitionIndex<'facts> {
 
         Self {
             by_simple_name,
+            block_locals_by_name,
             implemented,
             crate_name_roots,
             impl_index,
+            aux_helper_roots,
         }
+    }
+
+    /// The crate root a definition partitions under for call-target
+    /// confinement (issue #475): the aux-helper remap when the definition's
+    /// file was reassigned to its including entry crate, else the
+    /// path-derived [`crate_root_id`].
+    fn definition_crate_root(&self, definition: &DefinitionFact) -> Cow<'_, str> {
+        self.aux_helper_roots
+            .get(&definition.repo_relative_path)
+            .map_or_else(
+                || Cow::Owned(crate_root_id(&definition.repo_relative_path)),
+                |root| Cow::Borrowed(root.as_str()),
+            )
     }
 
     /// The set of trait qualified names the type `impl_type` provably implements
@@ -2712,7 +3071,7 @@ impl<'facts> DefinitionIndex<'facts> {
             .into_iter()
             .filter(|definition| {
                 definition.is_trait_method
-                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
+                    && self.definition_crate_root(definition) == *caller_crate_root
                     && definition.match_segments.len() >= 2
                     && implemented.contains(
                         &definition.match_segments[..definition.match_segments.len() - 1]
@@ -2728,6 +3087,39 @@ impl<'facts> DefinitionIndex<'facts> {
             return Vec::new();
         }
         gated
+    }
+
+    /// Returns the in-scope block-local `fn` candidates for a call site
+    /// (issue #422), deterministically ordered. A block-local def is a
+    /// candidate ONLY for a bare (`Direct`) call whose caller is the
+    /// lexically-enclosing scope — `call.caller_id` equals the def's
+    /// `enclosing_scope_id` (calls in the enclosing function/method body,
+    /// including closures and nested blocks, which inherit the enclosing
+    /// caller id) — or the def itself (`call.caller_id == def.id`, a recursive
+    /// call inside its own body). Calls from any other scope see nothing: the
+    /// #413 no-wrong-edge guard.
+    ///
+    /// A non-empty result SHADOWS the flat pool: the caller is lexically
+    /// inside the def's scope, so the block-local wins over any same-named
+    /// module-level def (Rust name resolution), and the flat candidates must
+    /// not also claim the call.
+    fn block_local_candidates(
+        &self,
+        call: &CallSiteFact,
+        simple_name: &str,
+    ) -> Vec<&'facts BlockLocalDefinitionFact> {
+        if call.call_kind != CallKind::Direct {
+            return Vec::new();
+        }
+        let Some(pool) = self.block_locals_by_name.get(simple_name) else {
+            return Vec::new();
+        };
+        pool.iter()
+            .copied()
+            .filter(|definition| {
+                call.caller_id == definition.enclosing_scope_id || call.caller_id == definition.id
+            })
+            .collect()
     }
 
     /// Returns the in-repo candidates for a call site, deterministically
@@ -2874,9 +3266,9 @@ impl<'facts> DefinitionIndex<'facts> {
                 pool.iter()
                     .copied()
                     .filter(|definition| {
-                        target_root.is_none_or(|root| {
-                            crate_root_id(&definition.repo_relative_path) == root
-                        }) && segments_end_with(&definition.match_segments, segments)
+                        target_root
+                            .is_none_or(|root| self.definition_crate_root(definition) == *root)
+                            && segments_end_with(&definition.match_segments, segments)
                     })
                     .collect()
             }
@@ -2945,12 +3337,29 @@ mod tests {
         }
     }
 
-    fn call(
+    fn span_at(
+        start_byte: usize,
+        end_byte: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> SourceSpan {
+        SourceSpan {
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+            start_column: None,
+            end_column: None,
+        }
+    }
+
+    fn call_at(
         caller_id: &str,
         display: &str,
         segments: &[&str],
         kind: CallKind,
         owner: Option<&str>,
+        span: SourceSpan,
     ) -> CallSiteFact {
         CallSiteFact {
             caller_id: caller_id.to_owned(),
@@ -2964,8 +3373,18 @@ mod tests {
             receiver_owner: owner.map(ToOwned::to_owned),
             receiver_type: None,
             dispatch_trait: None,
-            span: span(),
+            span,
         }
+    }
+
+    fn call(
+        caller_id: &str,
+        display: &str,
+        segments: &[&str],
+        kind: CallKind,
+        owner: Option<&str>,
+    ) -> CallSiteFact {
+        call_at(caller_id, display, segments, kind, owner, span())
     }
 
     fn facts(
@@ -3300,7 +3719,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call(
             "caller",
             "Device::read",
@@ -3333,7 +3752,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Method, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3361,7 +3780,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Direct, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3382,7 +3801,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::Path, None);
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3402,7 +3821,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "A::read", &["A", "read"], CallKind::Path, None);
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3426,7 +3845,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call(
             "caller",
             "Device::read",
@@ -3494,7 +3913,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3526,7 +3945,7 @@ mod tests {
             )],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3548,7 +3967,7 @@ mod tests {
             ],
             vec![],
         )]);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "g", &["g"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "g", "lib")
@@ -3606,7 +4025,7 @@ mod tests {
         // `read`), binds ONLY `T::read`. The unrelated `U::read` (S does not
         // implement `U`) is excluded even though it shares the simple name.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
             .candidates(&call, "read", "lib")
@@ -3626,7 +4045,7 @@ mod tests {
         // relation leaves `S`'s implemented-trait set empty, so `self.read()`
         // binds nothing — a MISS, never a WRONG edge to `T::read` or `U::read`.
         let facts = self_dispatch_facts(false);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "lib").is_empty(),
@@ -3641,7 +4060,7 @@ mod tests {
         // finds no proof for `S`, so the trait default is not bound — a
         // cross-crate-root trait degrades to unresolved, never a wrong edge.
         let facts = self_dispatch_facts(true);
-        let index = DefinitionIndex::build(&facts);
+        let index = DefinitionIndex::build(&facts, BTreeMap::new());
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
         assert!(
             index.candidates(&call, "read", "bin:tool").is_empty(),
@@ -4168,6 +4587,13 @@ mod tests {
                         &[],
                         "test:common",
                     )],
+                    impl_trait_relations: vec![ImplTraitRelationFact {
+                        impl_type: "Foo".to_owned(),
+                        impl_type_path: "Foo".to_owned(),
+                        trait_path: "crate::T".to_owned(),
+                        crate_root: "test:common".to_owned(),
+                        module_names: Vec::new(),
+                    }],
                     ..FileFacts::default()
                 },
             ),
@@ -4180,11 +4606,53 @@ mod tests {
             Some("test:it"),
             "a single-includer helper is reassigned to the including entry crate"
         );
-        // The remap rewrites crate_root on both fact kinds.
+        // The remap rewrites crate_root on all three fact kinds.
         let remapped = apply_crate_root_remap(&facts, &remap);
         let helper = &remapped["tests/common/mod.rs"];
         assert_eq!(helper.impl_targets[0].crate_root, "test:it");
         assert_eq!(helper.pending_impls[0].crate_root, "test:it");
+        assert_eq!(helper.impl_trait_relations[0].crate_root, "test:it");
+    }
+
+    #[test]
+    fn definition_crate_root_prefers_aux_helper_remap() {
+        // Issue #475: a definition in a remapped helper file partitions under
+        // the including entry crate's root, not its synthetic path-derived
+        // root; every other definition keeps the path-derived root.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    definitions: vec![definition(
+                        "helper-deep",
+                        "function",
+                        "tests/common/mod.rs",
+                        &["inner", "deep"],
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    definitions: vec![definition(
+                        "lib-root",
+                        "function",
+                        "src/lib.rs",
+                        &["root_fn"],
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let remap = BTreeMap::from([("tests/common/mod.rs".to_owned(), "test:it".to_owned())]);
+        let index = DefinitionIndex::build(&facts, remap);
+        let helper_def = &facts["tests/common/mod.rs"].definitions[0];
+        assert_eq!(index.definition_crate_root(helper_def), "test:it");
+        let lib_def = &facts["src/lib.rs"].definitions[0];
+        assert_eq!(index.definition_crate_root(lib_def), "lib");
     }
 
     #[test]
@@ -4214,6 +4682,131 @@ mod tests {
         assert!(
             remap.is_empty(),
             "a helper shared by 2+ entry crates is left unresolved: {remap:?}"
+        );
+    }
+
+    #[test]
+    fn multi_includer_helper_roots_lists_each_including_entry_crate() {
+        // `tests/common/mod.rs` is `mod`-included by both `tests/a.rs` and
+        // `tests/b.rs`: the multi-includer map (issue #401) lists BOTH entry
+        // crate roots, sorted, instead of picking one.
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/a.rs".to_owned(), mod_only_facts(&["common"])),
+            ("tests/b.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let multi = multi_includer_aux_helper_roots(&facts);
+        assert_eq!(
+            multi.get("tests/common/mod.rs"),
+            Some(&vec!["test:a".to_owned(), "test:b".to_owned()]),
+            "a helper shared by 2+ entry crates lists every includer root: {multi:?}"
+        );
+    }
+
+    #[test]
+    fn own_aux_target_helper_is_excluded_from_multi_includer_map() {
+        // `tests/common.rs` is included by both entries, but cargo ALSO compiles
+        // it as its own test target `test:common` — it belongs to 3 crates, so
+        // it is never duplicated into the including entries (conservative,
+        // matching `helper_that_is_its_own_aux_target_is_not_reassigned`).
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/a.rs".to_owned(), mod_only_facts(&["common"])),
+            ("tests/b.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let multi = multi_includer_aux_helper_roots(&facts);
+        assert!(
+            multi.is_empty(),
+            "a file cargo compiles as its own aux target is never duplicated: {multi:?}"
+        );
+    }
+
+    #[test]
+    fn shared_helper_included_by_two_entries_mints_implements_edge_per_including_crate() {
+        // `tests/a.rs` and `tests/b.rs` each define a root `trait T` and each
+        // `mod common;` the shared helper. The helper's `impl crate::T for Foo`
+        // cannot pick one crate — but cargo compiles the helper ONCE PER
+        // including test target, so the pass duplicates the helper's facts per
+        // includer root (issue #401) and mints one edge per real compilation.
+        // Each duplicate resolves strictly within its own crate root (#394
+        // isolation), so no wrong edge is possible — only recovered recall.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "tests/a.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("a-T", "T", &[], "trait", "test:a")],
+                    out_of_line_mods: mod_only_facts(&["common"]).out_of_line_mods,
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "tests/b.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("b-T", "T", &[], "trait", "test:b")],
+                    out_of_line_mods: mod_only_facts(&["common"]).out_of_line_mods,
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    pending_impls: vec![pending_impl_in(
+                        "impl-helper-Foo",
+                        "crate::T",
+                        &[],
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_implements_records("repo", &facts);
+        let mut pairs = implements_pairs(&records);
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("impl-helper-Foo".to_owned(), "a-T".to_owned()),
+                ("impl-helper-Foo".to_owned(), "b-T".to_owned()),
+            ],
+            "the shared helper's impl must edge-back to EACH including crate's T: {records:?}"
         );
     }
 

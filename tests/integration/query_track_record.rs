@@ -529,6 +529,9 @@ fn verification(
 ///   unscoped query emits an explicit all-zero row rather than silence.
 /// * Diagnostics: one observation with no `agent_id`, one candidate with no
 ///   terminal decision, one verification linked to no session.
+// Long fixture builder: allow the pedantic lints the rest of the suite
+// already allows on fixtures (see agent_sessions.rs).
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn seed_track_record() -> Fixture {
     let mut builder = Builder::new();
 
@@ -565,7 +568,12 @@ fn seed_track_record() -> Fixture {
 
     // Candidate A: an EARLIER rejected decision is superseded by the LATEST
     // approved decision — only the latest may land in a bucket.
-    let cand_a = candidate(&mut builder, "CandA", "cand-a", &[obs_a1.clone()]);
+    let cand_a = candidate(
+        &mut builder,
+        "CandA",
+        "cand-a",
+        std::slice::from_ref(&obs_a1),
+    );
     decision(
         &mut builder,
         "DecAEarly",
@@ -583,7 +591,12 @@ fn seed_track_record() -> Fixture {
         "2026-06-01T10:05:00Z",
     );
 
-    let cand_a2 = candidate(&mut builder, "CandA2", "cand-a2", &[obs_a2.clone()]);
+    let cand_a2 = candidate(
+        &mut builder,
+        "CandA2",
+        "cand-a2",
+        std::slice::from_ref(&obs_a2),
+    );
     let _dec_a2 = decision(
         &mut builder,
         "DecA2",
@@ -593,7 +606,12 @@ fn seed_track_record() -> Fixture {
         "2026-06-01T10:06:00Z",
     );
 
-    let cand_a3 = candidate(&mut builder, "CandA3", "cand-a3", &[obs_a1.clone()]);
+    let cand_a3 = candidate(
+        &mut builder,
+        "CandA3",
+        "cand-a3",
+        std::slice::from_ref(&obs_a1),
+    );
     let _dec_a3 = decision(
         &mut builder,
         "DecA3",
@@ -647,7 +665,12 @@ fn seed_track_record() -> Fixture {
         Some(&obs_b3),
     );
 
-    let cand_b = candidate(&mut builder, "CandB", "cand-b", &[obs_b1.clone()]);
+    let cand_b = candidate(
+        &mut builder,
+        "CandB",
+        "cand-b",
+        std::slice::from_ref(&obs_b1),
+    );
     let _dec_b = decision(
         &mut builder,
         "DecB",
@@ -657,7 +680,12 @@ fn seed_track_record() -> Fixture {
         "2026-06-01T10:08:00Z",
     );
 
-    let cand_b2 = candidate(&mut builder, "CandB2", "cand-b2", &[obs_b2.clone()]);
+    let cand_b2 = candidate(
+        &mut builder,
+        "CandB2",
+        "cand-b2",
+        std::slice::from_ref(&obs_b2),
+    );
     let _dec_b2 = decision(
         &mut builder,
         "DecB2",
@@ -676,7 +704,7 @@ fn seed_track_record() -> Fixture {
         Some(&run_b),
     );
     cite_symbol(&mut builder, &ver_b, &sym_a);
-    let ver_b2 = verification(
+    let _ver_b2 = verification(
         &mut builder,
         "VerB2",
         "ver-b2",
@@ -734,7 +762,7 @@ fn seed_track_record() -> Fixture {
         &mut builder,
         "CandPending",
         "cand-pending",
-        &[obs_a2.clone()],
+        std::slice::from_ref(&obs_a2),
     );
     // Verification linked to no session: unattributable, counted in diagnostics.
     verification(
@@ -783,10 +811,7 @@ fn agent_row<'a>(agents: &'a [Value], agent_id: &str) -> &'a Value {
 }
 
 fn bucket<'a>(row: &'a Value, section: &str, name: Option<&str>) -> &'a Value {
-    match name {
-        Some(n) => &row[section][n],
-        None => &row[section],
-    }
+    name.map_or(&row[section], |n| &row[section][n])
 }
 
 fn id_set(value: &Value, field: &str) -> Vec<String> {
@@ -808,7 +833,8 @@ fn assert_bucket(
     expected_decisions: &[&str],
 ) {
     let b = bucket(row, section, name);
-    let count = b["count"].as_u64().expect("count should be a number") as usize;
+    let count = usize::try_from(b["count"].as_u64().expect("count should be a number"))
+        .expect("count should fit in usize");
     let label = name.unwrap_or(section);
     assert_eq!(
         count, expected_count,
@@ -829,7 +855,7 @@ fn assert_bucket(
     expected.sort();
     assert_eq!(
         got, expected,
-        "{section}.{name} {id_field} for agent {}",
+        "{section}.{label} {id_field} for agent {}",
         row["agent_id"]
     );
     if section == "promotion_outcomes" {
@@ -867,6 +893,7 @@ fn assert_bucket(
 /// every bucket attributed to the right agent with zero cross-agent
 /// misattribution. Plus an idle agent (`agent-idle`) with no qualifying
 /// records, which must still get an explicit all-zero row.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn divergent_fates_are_attributed_per_agent() {
     let fixture = seed_track_record();
@@ -1161,7 +1188,8 @@ fn divergent_fates_are_attributed_per_agent() {
 fn idle_agent_gets_explicit_empty_row() {
     let fixture = seed_track_record();
     let envelope = query_json(&fixture, &[]);
-    let row = agent_row(&agents_of(&envelope), "agent-idle");
+    let agents = agents_of(&envelope);
+    let row = agent_row(&agents, "agent-idle");
     assert_eq!(row["agent_kind"], "codex");
     for (section, sub) in [
         ("observations_written", None),
@@ -1193,14 +1221,10 @@ fn idle_agent_gets_explicit_empty_row() {
     // Repo-scoped: the idle agent never cited repo-a, so it stays out.
     let scoped = query_json(&fixture, &["--repo", "repo-a"]);
     let scoped_agents = agents_of(&scoped);
-    let ids: Vec<&str> = scoped_agents
+    let idle_leaks = scoped_agents
         .iter()
-        .map(|a| a["agent_id"].as_str().expect("agent_id"))
-        .collect();
-    assert!(
-        !ids.contains(&"agent-idle"),
-        "idle agent must not leak into --repo scope"
-    );
+        .any(|a| a["agent_id"].as_str() == Some("agent-idle"));
+    assert!(!idle_leaks, "idle agent must not leak into --repo scope");
 }
 
 /// `eg query agents` is the documented alias: byte-identical output.
@@ -1374,8 +1398,11 @@ fn repo_scoping_filters_agents() {
 }
 
 /// Success metric: an operator ranks agents by observation-acceptance rate
-/// (approved + edited_then_approved promotions ÷ promotion-decided
+/// (approved + `edited_then_approved` promotions ÷ `promotion-decided`
 /// observations) from one command's citable output.
+// Rate arithmetic on small integer counts: the u64->f64 cast is exact for
+// these magnitudes; allow the pedantic precision lint.
+#[allow(clippy::cast_precision_loss)]
 #[test]
 fn acceptance_rate_is_computable_from_citable_output() {
     let fixture = seed_track_record();

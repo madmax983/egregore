@@ -1780,6 +1780,11 @@ impl EmbeddedAletheiaSink {
     /// read.
     pub fn inspect_current_records(&self) -> AdapterResult<InspectStoreReport> {
         let active_tombstoned = self.active_deleted_ids()?;
+        // Issue #472: record IDs whose ACTIVE tombstone is a repository-eviction
+        // tombstone (self-verifying). Their temporal candidates are suppressed
+        // from this current-state view; ordinary `forget` tombstones keep
+        // serving temporal candidates (issue #231).
+        let eviction_suppressed = self.active_eviction_tombstoned_ids()?;
         // Physical IDs of the current per-commit temporal candidates:
         // `read_all_records` serves every per-commit candidate (even for
         // tombstoned records, so `--at <commit>` views can resolve past
@@ -1845,7 +1850,11 @@ impl EmbeddedAletheiaSink {
                 record_type.as_deref() == Some("node")
                     && !active_tombstoned.contains(record_id.as_str())
             } else if current_temporal.contains(&node_id) {
-                true
+                // Issue #472: a temporal candidate targeted by an ACTIVE
+                // repository-eviction tombstone is suppressed from the current
+                // view. Ordinary `forget` tombstones keep serving temporal
+                // candidates (issue #231 bi-temporal honesty).
+                !eviction_suppressed.contains(record_id.as_str())
             } else {
                 !active_tombstoned.contains(record_id.as_str())
                     && self.node_lookup.non_temporal.get(record_id.as_str()) == Some(&node_id)
@@ -2228,6 +2237,48 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(deleted)
+    }
+
+    /// Returns the set of record IDs whose ACTIVE tombstone is a
+    /// repository-eviction tombstone (issue #472).
+    ///
+    /// Mirrors [`Self::active_deleted_ids`] but keeps only self-verifying
+    /// eviction tombstones: the stored tombstone record's own ID must equal
+    /// `repo_evict::eviction_tombstone_id(deleted_id)` recomputed from its
+    /// target — no schema field, no summary marker. Ordinary `forget`
+    /// tombstones are excluded so they keep the issue #231 temporal exemption.
+    /// A tombstone superseded by a later write of its target (stale) suppresses
+    /// nothing, so re-ingest revives the ID under latest-write-wins.
+    fn active_eviction_tombstoned_ids(&self) -> AdapterResult<std::collections::BTreeSet<String>> {
+        let mut suppressed = std::collections::BTreeSet::new();
+        for &tombstone_node_id in self.tombstone_ids.values() {
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|e| read_back_error("active_eviction_tombstoned_ids", e.to_string()))?;
+            let Some(tombstone_id) = optional_str_property(
+                "active_eviction_tombstoned_ids",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            let Some(deleted_id) = optional_str_property(
+                "active_eviction_tombstoned_ids",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?
+            else {
+                continue;
+            };
+            if tombstone_id == crate::repo_evict::eviction_tombstone_id(&deleted_id).0
+                && !self.tombstone_node_is_stale(tombstone_node_id, &deleted_id)
+            {
+                suppressed.insert(deleted_id);
+            }
+        }
+        Ok(suppressed)
     }
 
     /// Returns true when the physical tombstone at `tombstone_node_id` no

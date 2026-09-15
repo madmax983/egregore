@@ -30,7 +30,7 @@ use aletheia_egregore::{
     daemon::active_metadata,
     ir::{GraphRecord, SourceSpan},
 };
-use assert_cmd::Command as AssertCommand;
+use assert_cmd::cargo::cargo_bin;
 use serde_json::{Value, json};
 
 /// Maximum time to wait for the daemon to publish active metadata.
@@ -72,7 +72,7 @@ fn seed_store(data_dir: &Path) {
 // ── Daemon lifecycle ──────────────────────────────────────────────────────────
 
 fn start_daemon(data_dir: &Path) {
-    let status = ProcessCommand::new(AssertCommand::cargo_bin("egregore"))
+    let status = ProcessCommand::new(cargo_bin("egregore"))
         .arg("daemon")
         .arg("start")
         .arg("--data-dir")
@@ -93,7 +93,7 @@ fn start_daemon(data_dir: &Path) {
 }
 
 fn stop_daemon(data_dir: &Path) {
-    let _ = ProcessCommand::new(AssertCommand::cargo_bin("egregore"))
+    let _ = ProcessCommand::new(cargo_bin("egregore"))
         .arg("daemon")
         .arg("stop")
         .arg("--data-dir")
@@ -132,9 +132,8 @@ impl StdioSession {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = String::new();
-                let bytes = match reader.read_line(&mut line) {
-                    Ok(n) => n,
-                    Err(_) => break,
+                let Ok(bytes) = reader.read_line(&mut line) else {
+                    break;
                 };
                 let eof = bytes == 0;
                 if tx.send(Ok(line)).is_err() || eof {
@@ -167,7 +166,7 @@ impl StdioSession {
         serde_json::from_str::<Value>(&line).expect("mcp response should be a JSON object")
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    fn request(&mut self, method: &str, params: &Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({
@@ -191,7 +190,7 @@ impl StdioSession {
 }
 
 fn spawn_mcp_server(data_dir: &Path) -> Child {
-    ProcessCommand::new(AssertCommand::cargo_bin("egregore"))
+    ProcessCommand::new(cargo_bin("egregore"))
         .arg("mcp")
         .arg("--data-dir")
         .arg(data_dir)
@@ -219,7 +218,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         // 1. initialize must succeed and identify the server.
         let init = session.request(
             "initialize",
-            json!({
+            &json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": { "name": "eg-stdio-smoke-test", "version": "0.0.0" },
@@ -238,7 +237,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         session.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
         // 2. tools/list must return exactly the three documented tools.
-        let list = session.request("tools/list", json!({}));
+        let list = session.request("tools/list", &json!({}));
         let names: Vec<String> = list["result"]["tools"]
             .as_array()
             .ok_or_else(|| format!("tools/list result has no tools array: {list}"))?
@@ -267,7 +266,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         //    a repo-relative file/span citation handle.
         let call = session.request(
             "tools/call",
-            json!({
+            &json!({
                 "name": "symbol_context",
                 "arguments": {
                     "symbol_name": SYMBOL_NAME,

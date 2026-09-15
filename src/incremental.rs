@@ -139,7 +139,7 @@ use crate::{
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 26;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 27;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -373,7 +373,7 @@ fn scan_repository_incremental_at_inner(
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
             let (records, facts) = match scan_source_file_records(&source_file, &repository_id)? {
-                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, facts),
+                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, *facts),
                 // A non-UTF-8 or unreadable file is skipped (issue #438): cache
                 // the diagnostic as this file's sole record so an unchanged file
                 // reuses it next refresh. Byte hashing above already succeeds

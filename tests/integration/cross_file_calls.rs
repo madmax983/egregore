@@ -1293,6 +1293,72 @@ fn impl_self_method_call_unaffected_by_trait_widening() {
 // --- IMPLEMENTS-gated self-dispatch to trait defaults (issue #414) ----------
 
 #[test]
+fn impl_self_call_binds_an_implemented_trait_default_for_an_imported_self_type() {
+    // RECALL (issue #423): the `impl T for S` relation's Self type `S` is bound
+    // by a `use` import (`use crate::model::S;`), which pre-#423 extraction did
+    // not capture — only bare pending-TRAIT names landed in
+    // `use_trait_imports`. The repo-wide pass scope-walked bare `S` to nothing
+    // and dropped the relation, so `self.read()` stayed unresolved even though
+    // `S` provably implements `T`. Capturing the implementing type's import
+    // binding recovers the edge: `f -> T::read` binds `resolved`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            ("src/model.rs", "pub struct S;\n"),
+            (
+                "src/traits.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/user.rs",
+                "use crate::model::S;\nuse crate::traits::T;\nimpl T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "traits::read", "src/traits.rs");
+    let f = symbol_id(&records, "method", "user::S::f", "src/user.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+}
+
+#[test]
+fn impl_self_call_never_binds_through_an_externally_imported_self_type() {
+    // NO-WRONG-EDGE (issue #423): the no-wrong-edge guard on the recovered
+    // recall path stays intact — a relation whose bare Self type binds to an
+    // EXTERNAL import (`use std::any::S;`) is still dropped (import veto, no
+    // scope-walk fall-through), so `self.read()` binds nothing: a MISS, never
+    // a wrong edge to the local trait default.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/traits.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/user.rs",
+                "use std::any::S;\nuse crate::traits::T;\nimpl T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "traits::read", "src/traits.rs");
+    let f = symbol_id(&records, "method", "user::S::f", "src/user.rs");
+
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "self.read() must not bind T::read when the relation's Self type is externally imported"
+    );
+}
+
+#[test]
 fn impl_self_call_binds_an_implemented_trait_default() {
     // RECALL (issue #414): `impl T for S {}` adopts the trait default `T::read`;
     // an inherent `impl S { fn f(&self){ self.read(); } }` calls it via `self`.
@@ -2427,4 +2493,87 @@ fn narrowed_receiver_edges_are_byte_stable_across_repeated_scans() {
             .expect("graph should reserialize");
         assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
     }
+}
+
+// ── aux-helper `crate::` calls resolve to the entry crate (issue #475) ───────
+
+#[test]
+fn crate_qualified_call_in_test_helper_resolves_to_entry_crate() {
+    // A function `target_fn` defined in an inline module `nested` of the
+    // integration-test ENTRY file `tests/it.rs` (crate root `test:it`) is
+    // called via a `crate::nested::target_fn()` path in the helper module
+    // `tests/common/mod.rs` that `tests/it.rs` pulls in with `mod common;`.
+    // Rust resolves `crate::` in the helper against the including ENTRY crate,
+    // but path-based `crate_root_id` stamps the helper its OWN synthetic root
+    // `test:common`, so without the aux-helper crate-root remap (issue #475)
+    // the call is confined to `test:common`, misses `target_fn` under
+    // `test:it`, and its CALLS edge disappears.
+    //
+    // The fixture uses a multi-segment path on purpose: a single-segment
+    // `crate::foo()` call degrades to the repo-wide free-function pool (no
+    // confinement), so only a multi-segment path exercises the
+    // crate-root-confined resolution filter this issue is about. This mirrors
+    // the IMPLEMENTS/CONSTRUCTS aux-helper fixtures (`impl crate::T for Foo` /
+    // `crate::Deal { … }` in a helper) faithfully.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "tests/it.rs",
+                concat!(
+                    "mod common;\n\n",
+                    "pub mod nested {\n    pub fn target_fn() -> usize {\n        42\n    }\n}\n\n",
+                    "#[test]\nfn t() {\n    let _ = nested::target_fn();\n}\n",
+                ),
+            ),
+            (
+                "tests/common/mod.rs",
+                "pub fn drive() -> usize {\n    crate::nested::target_fn()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let target = symbol_id(&records, "function", "nested::target_fn", "tests/it.rs");
+    let caller = symbol_id(&records, "function", "drive", "tests/common/mod.rs");
+    assert_calls_edge_with_resolution(&records, &caller, &target, "resolved");
+}
+
+#[test]
+fn crate_qualified_call_to_helper_definition_resolves_under_entry_crate() {
+    // The reverse direction of the aux-helper gap (issue #475): `pub fn deep()`
+    // is defined in an inline module `inner` of the helper module
+    // `tests/common/mod.rs` — path-stamped its OWN synthetic root `test:common`
+    // — and called via `crate::inner::deep()` from the entry file `tests/it.rs`
+    // (crate root `test:it`). Without the index-side aux-helper remap, the
+    // caller's `crate::` confinement targets `test:it` while the helper's
+    // definition partitions under `test:common`, so the CALLS edge is missed
+    // even though the caller side needs no remap. Multi-segment path for the
+    // same reason as the caller-side test above: only it exercises the
+    // crate-root-confined filter.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "tests/it.rs",
+                concat!(
+                    "mod common;\n\n",
+                    "pub fn entry_caller() -> usize {\n    crate::inner::deep()\n}\n",
+                ),
+            ),
+            (
+                "tests/common/mod.rs",
+                "pub mod inner {\n    pub fn deep() -> usize {\n        7\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let target = symbol_id(&records, "function", "inner::deep", "tests/common/mod.rs");
+    let caller = symbol_id(&records, "function", "entry_caller", "tests/it.rs");
+    assert_calls_edge_with_resolution(&records, &caller, &target, "resolved");
 }
