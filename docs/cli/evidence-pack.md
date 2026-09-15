@@ -685,21 +685,6 @@ Re-verifies an assembled pack offline and read-only:
   `false` while stripping the `merged_pr_without_approving_review` gap rows, or
   flipping `passed` over a failing measurement, therefore fails Integrity even
   though every row hash is still valid.
-  Fifth (issue #355 follow-up, "derive on read"), the **control/catalog binding
-  hash**: `manifest.control_catalog_binding_hash` is a BLAKE3 hash over the
-  pack's own carried data — the catalog pin's identity fields (`catalog_id`,
-  schema version, `catalog_hash`), `manifest.control_id`, and the bound
-  `(class, requirement)` section pairs — recomputed and compared by Integrity
-  *after* the section-requirements bind, so a selectively relabeled pack (a
-  hand-edited `control_id` or `catalog_pin` naming a different control or
-  catalog, with a stale hash) fails. An offline verify never needs the external
-  catalog: the expected bind is *derived on read* from the artifact itself.
-  Honest limit: the pin's `catalog_hash` stays an opaque echo — without the
-  catalog, verify cannot recompute the catalog's own hash, so a total-rewrite
-  attacker who consistently recomputes the pin and the bind achieves a
-  self-consistent (relabeled) pack. The bind guarantees no *selective* relabel:
-  `control_id`/`catalog_pin` cannot drift from the sections the verdicts were
-  recomputed over.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive

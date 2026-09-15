@@ -112,6 +112,7 @@ compile time.
 | `ToolCall` | `agent_memory` | see `docs/schema/agent-actions.md` | `ToolCall {tool_name} status={status}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `FileEdit` | `agent_memory` | see `docs/schema/agent-actions.md` | `FileEdit {repo_relative_path} kind={edit_kind}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `Failure` | `agent_memory` | `["node", "failure", kind, turn_id, action_idx]` | `Failure {kind} turn={t}` | Failed command or invalid patch; `failure_kind` = `command_failure` or `patch_invalid`. |
+| `Failure` (live-authored) | `agent_memory` | `["node", "failure", "live", kind, agent_id, agent_kind, session_id, observed_at, source_handle, exit_code, text_hash, links_hash]` | `Failure {kind} by {agent} in {session}: {excerpt}` | Live-authored via `eg write failure` (any reserved `failure_kind`); citable through `FAILED_ON` / `REFERENCES_TASK` evidence links; idempotent on identical inputs. |
 | `Observation` | `agent_memory` | writer-chosen | free | Agent-authored claim with confidence and provenance. Carries `evidence_links`. |
 | `Retraction` | `agent_memory` | `["node", "retraction", target_record_id]` | `Retraction event for {target_record_id}` | Auditable operator retraction event written by `eg forget` (issue #231). One per target: the ID is deterministic in the retracted handle. |
 
@@ -252,7 +253,7 @@ A failed command, invalid patch, rejected assumption, or blocked workflow.
 | `failure_kind` | string | yes | `command_failure`, `patch_invalid`, `assumption_rejected`, `workflow_blocked`. |
 | `exit_code` | i64 | optional | Exit code when `failure_kind` is `command_failure` or `patch_invalid`. |
 | `text` | string | yes | Redacted output excerpt. |
-| traj-importer provenance | see above | yes | |
+| traj-importer provenance | see above | yes | Traj-imported failures carry traj provenance; live-authored failures carry the `eg write` provenance contract instead (`agent_id`, `agent_kind`, `session_id`, `observed_at`, `source_handle`). |
 
 #### `Decision` record shape
 
@@ -353,7 +354,7 @@ removing a label is a schema version bump.
 | `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |
 | `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |
-| `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
+| `FAILED_ON` | `agent_memory`, `verification` | `codegraph`, `artifact` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File`, `Artifact` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
 | `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
 | `REFERENCES_TASK` | `log` | `project` | `ErrorSignature` | `Task`, `GitHubIssue`, `LocalTask` | many:many | no |
@@ -418,6 +419,7 @@ Both functions null-terminate each input part before hashing, so
 | `FileEdit` | defined in [`docs/schema/agent-actions.md`](agent-actions.md) |
 | `Failure` (command) | `["node", "failure", "command_failure", turn_id, action_idx]` |
 | `Failure` (patch) | `["node", "failure", "patch_invalid", turn_id, action_idx]` |
+| `Failure` (live-authored) | `["node", "failure", "live", kind, agent_id, agent_kind, session_id, observed_at, source_handle, exit_code, text_hash, links_hash]` |
 
 ---
 

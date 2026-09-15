@@ -60,7 +60,9 @@ Evidence-backed audit subcommands have their own pages:
   recall-time filtering of superseded and contradicted memories
   ([recall-supersession.md](recall-supersession.md), issue #92).
 - `eg query failures` — **prior failed attempts** linked to a code or task
-  handle ([failure-history.md](failure-history.md), issue #63).
+  handle ([failure-history.md](failure-history.md), issue #63), including
+  failures recorded live via `eg write failure`
+  ([write-failure.md](write-failure.md), issue #264).
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
