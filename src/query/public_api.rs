@@ -402,10 +402,7 @@ pub fn public_api_surface<'a>(
         names.entry(name.as_str()).or_insert((id, item_kind));
     }
 
-    // Imports edge map: import record ID → owning module/file record ID. Only
-    // the extractor's containment-shaped `File —IMPORTS→ Import` edges are
-    // indexed here: the issue-#444 `File —IMPORTS→ Module|File` target edges
-    // are dependency edges, not ownership.
+    // Imports edge map: import record ID → owning module/file record ID.
     let mut import_owner: BTreeMap<&str, &str> = BTreeMap::new();
     for record in records {
         if let GraphRecord::Edge {
@@ -419,16 +416,7 @@ pub fn public_api_surface<'a>(
             // Import edges carry no version-varying metadata (only source/target
             // topology, keyed by target below), so plain latest-write-wins
             // liveness is sufficient — no `is_latest_edge_version` needed here.
-            let target_is_import = nodes.get(target.as_str()).is_some_and(|node| {
-                matches!(
-                    node,
-                    GraphRecord::Node {
-                        kind: NodeKind::Import,
-                        ..
-                    }
-                )
-            });
-            if target_is_import && !liveness.deleted(id.as_str()) {
+            if !liveness.deleted(id.as_str()) {
                 import_owner.insert(target.as_str(), source.as_str());
             }
         }

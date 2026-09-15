@@ -107,6 +107,8 @@ pub mod schema_constraints;
 pub mod schema_version;
 /// SCIP code-intelligence export (issue #233).
 pub mod scip;
+/// Calibrated confidence floor and abstention for semantic search (issue #263).
+pub mod semantic_confidence;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
 /// Transitive memory supersession and contradiction resolution (issue #92).
@@ -337,26 +339,6 @@ fn scan_repository_at_with_override_inner(
     {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
-    // Declared Cargo manifests, harvested BEFORE the import-target pass: the
-    // pass resolves absolute `<crate_name>::…` imports against owning-package
-    // names. Harvesting is a pure function of the repo root, so moving it
-    // ahead of the dependency scan changes nothing downstream.
-    let manifest_facts = manifest_deps::scan_manifest_package_facts(repo_root)?;
-    let attribution = crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
-    // Inbound IMPORTS edges to imported Module/File targets (issue #444):
-    // each resolvable Rust `use` mints `File —IMPORTS→ Module|File` from the
-    // importing file to the imported module, so "who imports module X" is
-    // traversable without `jq` over the JSONL. Fail-closed: unresolvable
-    // imports mint no edge.
-    let import_target_edges = languages::cross_file::cross_file_import_target_edges(
-        &repository_id,
-        graph.records(),
-        &facts_by_file,
-        &attribution,
-    );
-    for record in import_target_edges {
-        graph.push(record.with_valid_time_inferred(transaction_time));
-    }
     // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
     // backed by Tree-sitter call sites with the shared resolution status.
     languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
@@ -380,8 +362,9 @@ fn scan_repository_at_with_override_inner(
     // must see EVERY `File`-producing extractor's output — per-file source
     // extraction above and manifest extraction just now — the same ordering
     // constraint `reconcile_scan_coverage` was placed for. Attribution is never
-    // an identity input, so no record ID moves. The index was built above for
-    // the import-target pass; only the stamping runs here.
+    // an identity input, so no record ID moves.
+    let manifest_facts = manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
     crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135): finalize the tally against the

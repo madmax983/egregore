@@ -35,6 +35,8 @@ eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
+eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
+eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
@@ -107,6 +109,17 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query unreferenced` — symbols with **no recorded inbound reference
   edges**, as prune-triage leads with citable handles — never proof of dead
   code ([unreferenced.md](unreferenced.md), issue #113).
+- `eg query blind-spots` — code targets (symbols and/or files) with **zero
+  cross-domain evidence** into the agent-memory, verification, or project
+  domains, ranked riskiest-first by inbound structural reference count —
+  the inverse question: which code does the graph know nothing about
+  ([blind-spots.md](blind-spots.md), issue #265).
+- `eg query track-record` (alias `eg query agents`) — **per-agent track
+  record** over the downstream fate of agent-authored observations:
+  observations written, promotion outcomes by terminal verdict,
+  superseded observations, and linked verification outcomes — deterministic,
+  trust-separated, every nonzero bucket citing resolvable handles
+  ([agent-track-record.md](agent-track-record.md), issue #262).
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
@@ -1168,6 +1181,53 @@ eg query semantic "write nodes to database storage" --data-dir .egregore-semanti
 ```
 
 The `record_id` is stable across re-scans of the same commit and can be cited in agent-memory records. The `repo_relative_path` and `span` together give a file and line-range handle that agents can pass directly to editor tools or other `eg` commands.
+
+### Confidence calibration and abstention (issue #263)
+
+Every `eg query semantic` JSON row carries three confidence fields:
+
+| Field | Meaning |
+|-------|---------|
+| `score` | Raw cosine similarity (0.0–1.0). |
+| `confidence_band` | `"strong"` if `score >= 0.55`, else `"weak"`. A pure deterministic function of `score`. |
+| `selection_threshold` | The calibrated floor (`0.55`) this row was judged against. |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the floor was set; mirrors drift's `selection_basis`. |
+
+**Derivation.** The floor derives from analysis of `corpus/semantic_relevance_corpus.json`:
+the corpus contains 5 ambiguous queries (`q026`, `q027`, `q029`, `q031`, `q032`)
+with no expected targets, representing the "no confident match" case. The
+existing `semantic_eval.rs` uses `0.5` as the ambiguous-query false-positive
+threshold. The floor is set at `0.55` — `0.05` above the ambiguous threshold —
+providing a conservative margin that separates confident matches from
+ambiguous/negative cases. The value is pinned by
+`corpus/semantic_confidence_fixture.json` and verified by integration tests;
+it cannot drift silently.
+
+**Abstention.** If the best scoped candidate scores below the floor, `eg query
+semantic` abstains with an explicit verdict (exit `0`), rather than presenting
+a weak top hit as an authoritative answer:
+
+```json
+{"no_confident_match":true,"query":"...","best_score":0.42,"total_candidates":150,"selection_threshold":0.55,"selection_basis":"corpus_calibrated_confidence_floor"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `no_confident_match` | Always `true` in the abstention envelope. |
+| `query` | The original query string. |
+| `best_score` | Highest observed score among scoped candidates. |
+| `total_candidates` | Full scoped candidate count **before** `--limit` truncation. |
+| `selection_threshold` | The floor (`0.55`). |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"`. |
+
+Abstention is **distinct** from:
+- **Exit 2 (no semantic index):** the store lacks embeddings; re-run ingest with `--embed`.
+- **Exit 2 (no candidates):** the `--repo`/`--under` scope matched zero records.
+- **Truncation (#121):** `--limit` caps the returned rows; `total_candidates` reports the pre-truncation count.
+
+The abstention verdict is deterministic: five repeated queries produce
+byte-identical confidence fields after canonical ordering (score descending,
+record ID ascending).
 
 ---
 

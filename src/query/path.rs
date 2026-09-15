@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord};
 
 // ---------------------------------------------------------------------------
@@ -115,30 +116,14 @@ pub fn call_path<'a>(
     to_id: &str,
 ) -> Option<CallPathContext<'a>> {
     // ── tombstone / temporal filtering (mirrors transitive_callees) ───────────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // Latest-write-wins liveness (issue #421): over an append-only `--graph`,
+    // a node/edge re-ingested AFTER its own tombstone is live again, matching
+    // the embedded `--data-dir` current-state read. The shared gate reports a
+    // tombstone active only when it is the id's most recent write; ids
+    // carrying a bitemporal/history version stay exempt. See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let by_id: BTreeMap<&str, &GraphRecord> = records
         .iter()
         .filter_map(|r| {
@@ -280,4 +265,86 @@ pub fn call_path<'a>(
         steps: rev,
         path_found: true,
     })
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): over an append-only `--graph`,
+    //! a node re-ingested AFTER its own tombstone is live again — matching the
+    //! embedded current-state read — so `call_path` still finds a witness
+    //! through it; a tombstone with no later re-add still deletes its id.
+    use super::*;
+    use crate::ir::{NodeKind, SourceSpan};
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::syntax_node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+                start_column: None,
+                end_column: None,
+            },
+            name.to_owned(),
+            "rust",
+            format!("fn {name}"),
+        )
+    }
+
+    fn calls(from: &str, to: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            from.to_owned(),
+            to.to_owned(),
+            Some("1.0".to_owned()),
+            "call edge".to_owned(),
+        )
+        .with_resolution(CallResolution::Resolved)
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn path_found_through_node_revived_after_tombstone() {
+        // B is re-ingested AFTER its own tombstone: latest write wins, so the
+        // witness A -> B must still resolve (the raw tombstoned-membership
+        // gate hides B and every relationship through it).
+        let (a, b) = ("codegraph:v5:a", "codegraph:v5:b");
+        let records = vec![
+            sym(a, "a"),
+            sym(b, "b"),
+            calls(a, b),
+            tombstone(b),
+            sym(b, "b"),
+        ];
+        let ctx = call_path(&records, a, b);
+        assert!(
+            ctx.is_some_and(|c| c.path_found),
+            "a node revived after its tombstone must stay on the call path"
+        );
+    }
+
+    #[test]
+    fn no_path_when_target_tombstoned_without_reingest() {
+        // A tombstone with no later re-add still deletes its id: B is gone, so
+        // no witness exists.
+        let (a, b) = ("codegraph:v5:a", "codegraph:v5:b");
+        let records = vec![sym(a, "a"), sym(b, "b"), calls(a, b), tombstone(b)];
+        assert!(
+            call_path(&records, a, b).is_none(),
+            "a tombstone with no later re-ingest keeps its id deleted"
+        );
+    }
 }

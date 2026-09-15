@@ -181,11 +181,7 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::UnsafeSite,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
-        // `IMPORTS` has two shapes: the extractor's containment-shaped
-        // `File —IMPORTS→ Import` ("this file declares this `use`") and the
-        // issue-#444 target edge `File —IMPORTS→ Module|File` ("this file
-        // imports this module").
-        EdgeLabel::Imports => Some(&[NodeKind::Import, NodeKind::Module, NodeKind::File]),
+        EdgeLabel::Imports => Some(&[NodeKind::Import]),
         // The commit-anchor project edges terminate at a `Commit` only: a PR
         // `Task —MERGED_AS→ Commit` (issue #333) and its review-side mirror
         // `Review —REVIEWS_COMMIT→ Commit` (issue #334), matching the daemon's
@@ -1265,6 +1261,7 @@ mod tests {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            call_site_spans: None,
             is_exhaustive: None,
             temporal: None,
             summary: "test edge".to_owned(),
