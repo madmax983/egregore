@@ -854,7 +854,7 @@ fn write_repo_only_graph(path: &Path) {
 #[cfg(all(feature = "embeddings", feature = "embedded-aletheiadb"))]
 fn embed_honors_config_pinned_model() {
     use aletheia_egregore::{
-        adapters::{EmbeddedAletheiaSink, GraphSink},
+        adapters::EmbeddedAletheiaSink,
         embeddings::{
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS, embedding_model_identity, indexed_identities,
         },
@@ -899,7 +899,7 @@ fn embed_honors_config_pinned_model() {
 #[cfg(all(feature = "embeddings", feature = "embedded-aletheiadb"))]
 fn embed_model_flag_overrides_config_pin() {
     use aletheia_egregore::{
-        adapters::{EmbeddedAletheiaSink, GraphSink},
+        adapters::EmbeddedAletheiaSink,
         embeddings::{
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS, embedding_model_identity, indexed_identities,
         },
@@ -946,7 +946,7 @@ fn embed_model_flag_overrides_config_pin() {
 #[cfg(all(feature = "embeddings", feature = "embedded-aletheiadb"))]
 fn embed_uses_default_model_when_nothing_pinned() {
     use aletheia_egregore::{
-        adapters::{EmbeddedAletheiaSink, GraphSink},
+        adapters::EmbeddedAletheiaSink,
         embeddings::{
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS, default_embedding_model_identity,
             indexed_identities,

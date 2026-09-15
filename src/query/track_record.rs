@@ -73,6 +73,7 @@ impl CitableCount {
     }
 
     /// An empty count bucket with the given trust basis.
+    #[must_use]
     pub fn empty(trust_basis: &'static str) -> Self {
         Self {
             count: 0,
@@ -207,10 +208,7 @@ struct AgentAccum {
 
 impl AgentAccum {
     fn into_record(self, agent_id: String) -> AgentTrackRecord {
-        let kind = match self.kinds.iter().next().cloned() {
-            Some(kind) => kind,
-            None => String::new(),
-        };
+        let kind = self.kinds.iter().next().cloned().unwrap_or_default();
         AgentTrackRecord {
             agent_id,
             agent_kind: kind,
@@ -280,6 +278,7 @@ fn resolve_agent(
 /// `repo_id` is an optional repository id: when `Some`, only records owned
 /// by that repository (via [`RepositoryIndex::owner_of`]) participate.
 /// Pass `None` for the unscoped lane.
+#[must_use]
 pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> TrackRecordReport {
     // Last write wins: process records in order. A node/edge with the same
     // id replaces the earlier one; a tombstone removes the entity (but a
@@ -304,12 +303,8 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
     }
 
     let repo_index = RepositoryIndex::build(records);
-    let in_scope = |id: &str| -> bool {
-        match repo_id {
-            None => true,
-            Some(want) => repo_index.owner_of(id) == Some(want),
-        }
-    };
+    let in_scope =
+        |id: &str| -> bool { repo_id.is_none_or(|want| repo_index.owner_of(id) == Some(want)) };
 
     let mut agents: BTreeMap<String, AgentAccum> = BTreeMap::new();
     let mut diagnostics: Vec<TrackRecordDiagnostic> = Vec::new();
@@ -319,9 +314,7 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
     let mut session_agent: HashMap<&str, String> = HashMap::new();
     let mut observations_without_agent: BTreeSet<String> = BTreeSet::new();
 
-    for (id, record) in &nodes {
-        let id: &str = *id;
-        let record: &GraphRecord = *record;
+    for (&id, &record) in &nodes {
         if !in_scope(id) {
             continue;
         }
@@ -383,9 +376,7 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
 
     // --- 2. Candidate support: node links + PROPOSED_BY edges. -------------
     let mut candidate_support: HashMap<&str, BTreeSet<String>> = HashMap::new();
-    for (id, record) in &nodes {
-        let id: &str = *id;
-        let record: &GraphRecord = *record;
+    for (&id, &record) in &nodes {
         if !in_scope(id) {
             continue;
         }
@@ -440,9 +431,7 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
     // candidate id -> (decided_at, record_id, verdict)
     let mut latest_decision: HashMap<&str, (String, String, PromotionVerdict)> = HashMap::new();
 
-    for (id, record) in &nodes {
-        let id: &str = *id;
-        let record: &GraphRecord = *record;
+    for (&id, &record) in &nodes {
         if !in_scope(id) {
             continue;
         }
@@ -454,18 +443,14 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
         else {
             continue;
         };
-        let candidate_id = match user_context.candidate_id.as_deref() {
-            Some(cid) => cid,
-            None => continue,
+        let Some(candidate_id) = user_context.candidate_id.as_deref() else {
+            continue;
         };
         if !in_scope(candidate_id) {
             continue;
         }
         let verdict = PromotionVerdict::from_outcome(user_context.outcome.as_deref());
-        let decided_at = match user_context.decided_at.clone() {
-            Some(decided_at) => decided_at,
-            None => String::new(),
-        };
+        let decided_at = user_context.decided_at.clone().unwrap_or_default();
         let entry = latest_decision
             .entry(candidate_id)
             .or_insert_with(|| (String::new(), String::new(), PromotionVerdict::Unknown));
@@ -491,19 +476,15 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
         if supporting_agents.is_empty() {
             continue;
         }
-        let (verdict, decision_ids) = match latest_decision.get(candidate_id) {
-            // Cite only the terminal decision's ID: superseded decisions
-            // are never cited.
-            Some((_, decision_id, v)) => {
-                let mut ids = BTreeSet::new();
-                ids.insert(decision_id.clone());
-                (*v, ids)
-            }
-            None => {
-                candidates_without_decision.insert((*candidate_id).to_owned());
-                continue;
-            }
+        // Cite only the terminal decision's ID: superseded decisions
+        // are never cited.
+        let Some((_, decision_id, v)) = latest_decision.get(candidate_id) else {
+            candidates_without_decision.insert((*candidate_id).to_owned());
+            continue;
         };
+        let verdict = *v;
+        let mut decision_ids = BTreeSet::new();
+        decision_ids.insert(decision_id.clone());
         if verdict == PromotionVerdict::Unknown {
             continue;
         }
@@ -571,9 +552,7 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
     // Resolve any node to its agent via SESSION_OF chains ending at an
     // AgentSession with a stamped agent_id.
     let mut verifications_without_session: BTreeSet<String> = BTreeSet::new();
-    for (id, record) in &nodes {
-        let id: &str = *id;
-        let record: &GraphRecord = *record;
+    for (&id, &record) in &nodes {
         if !in_scope(id) {
             continue;
         }
@@ -678,10 +657,7 @@ enum PromotionVerdict {
 
 impl PromotionVerdict {
     fn from_outcome(outcome: Option<&str>) -> Self {
-        let normalized = match outcome {
-            Some(outcome) => outcome,
-            None => "",
-        };
+        let normalized = outcome.unwrap_or("");
         match normalized.trim() {
             "approved" => Self::Approved,
             "edited_then_approved" | "edited-approved" | "approved_with_edits" => {

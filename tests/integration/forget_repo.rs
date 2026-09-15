@@ -72,6 +72,8 @@ mod embedded {
             end_byte: end_line * 10,
             start_line,
             end_line,
+            start_column: None,
+            end_column: None,
         }
     }
 

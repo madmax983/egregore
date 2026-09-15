@@ -229,6 +229,21 @@ struct RustExtractor<'graph, 'source> {
     dispatch_trait_env: BTreeMap<String, String>,
 }
 
+/// The callee-side components of a [`CallSiteFact`]: everything the callee
+/// `function` node's kind determines, before the caller identity and span
+/// are attached. Lets [`call_site_fact`](RustExtractor::call_site_fact) stay
+/// small by delegating method-receiver resolution to
+/// [`method_call_callee`](RustExtractor::method_call_callee).
+struct CallCallee {
+    display: String,
+    segments: Vec<String>,
+    call_kind: CallKind,
+    receiver_owner: Option<String>,
+    path_root: CallPathRoot,
+    receiver_type: Option<String>,
+    dispatch_trait: Option<String>,
+}
+
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn new(
         file: &'source SourceFile,
@@ -820,26 +835,18 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if function.kind() == "generic_function" {
             function = function.child_by_field_name("function")?;
         }
-        let (
-            display,
-            segments,
-            call_kind,
-            receiver_owner,
-            path_root,
-            receiver_type,
-            dispatch_trait,
-        ) = match function.kind() {
+        let callee = match function.kind() {
             "identifier" => {
                 let name = self.node_text(function).trim().to_owned();
-                (
-                    name.clone(),
-                    vec![name],
-                    CallKind::Direct,
-                    None,
-                    CallPathRoot::Unqualified,
-                    None,
-                    None,
-                )
+                CallCallee {
+                    display: name.clone(),
+                    segments: vec![name],
+                    call_kind: CallKind::Direct,
+                    receiver_owner: None,
+                    path_root: CallPathRoot::Unqualified,
+                    receiver_type: None,
+                    dispatch_trait: None,
+                }
             }
             "scoped_identifier" => {
                 let display = self.node_text(function).trim().to_owned();
@@ -853,103 +860,114 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
                     _ => CallPathRoot::Unqualified,
                 };
-                (
+                CallCallee {
                     display,
                     segments,
-                    CallKind::Path,
-                    None,
+                    call_kind: CallKind::Path,
+                    receiver_owner: None,
                     path_root,
-                    None,
-                    None,
-                )
-            }
-            "field_expression" => {
-                let field = function.child_by_field_name("field")?;
-                if field.kind() != "field_identifier" {
-                    return None;
+                    receiver_type: None,
+                    dispatch_trait: None,
                 }
-                let name = self.node_text(field).trim().to_owned();
-                let receiver_value = function.child_by_field_name("value");
-                let receiver_is_self = receiver_value.is_some_and(|value| value.kind() == "self");
-                let owner = receiver_is_self
-                    .then(|| {
-                        // A `self.method()` receiver call carries the owner of
-                        // the enclosing `Self` so the SelfMethod branch can
-                        // narrow to it: the impl owner inside an impl block
-                        // (unchanged), else the enclosing trait name inside a
-                        // trait body (issue #390). Inside a trait there is no
-                        // `impl_context`, so before this the owner was None and
-                        // the call collapsed to a plain `Method` that fanned out
-                        // to every same-named trait method. `impl_context` takes
-                        // precedence when both are set (a nested impl inside a
-                        // trait default body). The trait name is the raw
-                        // `trait_context` string, matching the trait-method
-                        // owner segment in `definition_match_segments`.
-                        self.impl_context
-                            .as_ref()
-                            .and_then(|impl_context| {
-                                normalize_impl_owner(&impl_context.method_owner)
-                            })
-                            .or_else(|| self.trait_context.clone())
-                    })
-                    .flatten();
-                let call_kind = if owner.is_some() {
-                    CallKind::SelfMethod
-                } else {
-                    CallKind::Method
-                };
-                // Provable receiver type (issue #441): for a non-`self` receiver
-                // that is a simple `identifier` binding whose type is in this
-                // function's unshadowed type environment, stamp the reduced
-                // nominal type so the resolver can narrow `x.method()` to that
-                // type's own method. A `self` receiver keeps `receiver_owner`
-                // only; a receiver that is not a bare identifier, or whose name
-                // is not a provable binding, gets `None` (today's fan-out).
-                let receiver_type = (!receiver_is_self)
-                    .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
-                    .flatten()
-                    .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
-                // Provable trait-dispatch binding (issue #267): for a
-                // non-`self` receiver that is a simple `identifier` binding
-                // whose ascribed type is provably trait-typed (`&dyn
-                // Trait`, `Box<dyn Trait>`, or a single-bound type
-                // parameter), stamp the trait path as written so the
-                // resolver can expand the call to every known in-crate
-                // implementor method.
-                let dispatch_trait = (!receiver_is_self)
-                    .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
-                    .flatten()
-                    .and_then(|value| {
-                        self.dispatch_trait_env
-                            .get(self.node_text(value).trim())
-                            .cloned()
-                    });
-                (
-                    name.clone(),
-                    vec![name],
-                    call_kind,
-                    owner,
-                    CallPathRoot::Unqualified,
-                    receiver_type,
-                    dispatch_trait,
-                )
             }
+            "field_expression" => self.method_call_callee(function)?,
             _ => return None,
         };
-        if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
+        if callee.segments.is_empty()
+            || callee
+                .segments
+                .iter()
+                .any(|segment| !is_simple_ident(segment))
+        {
             return None;
         }
         Some(CallSiteFact {
             caller_id: caller_id.to_owned(),
             caller_name: caller_name.to_owned(),
-            callee_display: display,
-            callee_segments: segments,
+            callee_display: callee.display,
+            callee_segments: callee.segments,
+            call_kind: callee.call_kind,
+            path_root: callee.path_root,
+            receiver_owner: callee.receiver_owner,
+            receiver_type: callee.receiver_type,
+            dispatch_trait: callee.dispatch_trait,
+            span: span(node),
+        })
+    }
+
+    /// Resolves the callee components of a `field_expression` call
+    /// (`receiver.method()`): the method name plus the receiver-derived
+    /// narrowing facts — the `self`-receiver owner (issue #390), the provable
+    /// receiver type (issue #441), and the provable trait-dispatch binding
+    /// (issue #267). Returns `None` when the field is not a plain method
+    /// identifier.
+    fn method_call_callee(&self, function: Node<'_>) -> Option<CallCallee> {
+        let field = function.child_by_field_name("field")?;
+        if field.kind() != "field_identifier" {
+            return None;
+        }
+        let name = self.node_text(field).trim().to_owned();
+        let receiver_value = function.child_by_field_name("value");
+        let receiver_is_self = receiver_value.is_some_and(|value| value.kind() == "self");
+        let owner = receiver_is_self
+            .then(|| {
+                // A `self.method()` receiver call carries the owner of
+                // the enclosing `Self` so the SelfMethod branch can
+                // narrow to it: the impl owner inside an impl block
+                // (unchanged), else the enclosing trait name inside a
+                // trait body (issue #390). Inside a trait there is no
+                // `impl_context`, so before this the owner was None and
+                // the call collapsed to a plain `Method` that fanned out
+                // to every same-named trait method. `impl_context` takes
+                // precedence when both are set (a nested impl inside a
+                // trait default body). The trait name is the raw
+                // `trait_context` string, matching the trait-method
+                // owner segment in `definition_match_segments`.
+                self.impl_context
+                    .as_ref()
+                    .and_then(|impl_context| normalize_impl_owner(&impl_context.method_owner))
+                    .or_else(|| self.trait_context.clone())
+            })
+            .flatten();
+        let call_kind = if owner.is_some() {
+            CallKind::SelfMethod
+        } else {
+            CallKind::Method
+        };
+        // Provable receiver type (issue #441): for a non-`self` receiver
+        // that is a simple `identifier` binding whose type is in this
+        // function's unshadowed type environment, stamp the reduced
+        // nominal type so the resolver can narrow `x.method()` to that
+        // type's own method. A `self` receiver keeps `receiver_owner`
+        // only; a receiver that is not a bare identifier, or whose name
+        // is not a provable binding, gets `None` (today's fan-out).
+        let receiver_type = (!receiver_is_self)
+            .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+            .flatten()
+            .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
+        // Provable trait-dispatch binding (issue #267): for a
+        // non-`self` receiver that is a simple `identifier` binding
+        // whose ascribed type is provably trait-typed (`&dyn
+        // Trait`, `Box<dyn Trait>`, or a single-bound type
+        // parameter), stamp the trait path as written so the
+        // resolver can expand the call to every known in-crate
+        // implementor method.
+        let dispatch_trait = (!receiver_is_self)
+            .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+            .flatten()
+            .and_then(|value| {
+                self.dispatch_trait_env
+                    .get(self.node_text(value).trim())
+                    .cloned()
+            });
+        Some(CallCallee {
+            display: name.clone(),
+            segments: vec![name],
             call_kind,
-            path_root,
-            receiver_owner,
+            receiver_owner: owner,
+            path_root: CallPathRoot::Unqualified,
             receiver_type,
             dispatch_trait,
-            span: span(node),
         })
     }
 
