@@ -11,7 +11,6 @@ mod capture_tests;
 mod change_impact;
 mod changes;
 mod churn;
-mod config;
 mod context;
 mod coupling;
 mod cycles;
@@ -87,6 +86,10 @@ mod forget_repo;
 mod sessions;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 mod blind_spots;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+mod track_record;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+mod session_retrospective;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -96,7 +99,6 @@ pub(crate) use candidates::*;
 pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
-pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use coupling::*;
 pub(crate) use cycles::*;
@@ -172,6 +174,10 @@ pub(crate) use forget_repo::*;
 pub(crate) use sessions::*;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use blind_spots::*;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use track_record::*;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use session_retrospective::*;
 
 use std::{
     collections::BTreeMap,
@@ -317,18 +323,6 @@ pub(crate) enum Commands {
         /// time. Not part of the handle identity.
         #[arg(long)]
         captured_at: Option<String>,
-    },
-    /// Inspect the checked-in project configuration (issue #261).
-    ///
-    /// `eg config show` prints the effective resolved configuration as JSON:
-    /// the discovered `egregore.toml` (found by walking up from the working
-    /// directory, or `null`), every value, and where each value came from
-    /// (`"config"` or `"default"`). An agent or CI step runs this to verify —
-    /// and cite — exactly what governed a run. See `docs/cli/config.md`.
-    Config {
-        /// Config action.
-        #[command(subcommand)]
-        action: ConfigAction,
     },
     /// Capture a `cargo test` / libtest JSON run as a citable verification-domain
     /// `TestRun` record (issue #165).
@@ -500,10 +494,8 @@ pub(crate) enum Commands {
         /// Repository path to scan.
         repo_path: PathBuf,
         /// Embedded `AletheiaDB` data directory.
-        ///
-        /// Defaults to the `data_dir` pinned in `egregore.toml`, else `.egregore`.
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
         /// Incremental scan cache path.
         /// Defaults to `<data-dir>/codegraph-cache.json`.
         #[arg(long)]
@@ -519,16 +511,6 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
-        /// Embedding model identifier for `--embed`.
-        ///
-        /// Precedence: `--embed-model` \> `[embeddings].model` in `egregore.toml`
-        /// \> built-in default. The resolved model is what the embedder loads
-        /// and what the store's vector-index identity records; writing into an
-        /// index built by a different model is refused rather than blending
-        /// two vector spaces (issue #104).
-        #[cfg(feature = "embeddings")]
-        #[arg(long)]
-        embed_model: Option<String>,
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
@@ -654,15 +636,6 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
-        /// Embedding model identifier for `--embed`.
-        ///
-        /// Precedence: `--embed-model` \> `[embeddings].model` in `egregore.toml`
-        /// \> built-in default. The resolved model is recorded in the store's
-        /// vector-index identity, so `eg query semantic` can prove the query
-        /// embedder shares the index's vector space (issue #261).
-        #[cfg(feature = "embeddings")]
-        #[arg(long)]
-        embed_model: Option<String>,
         /// Bypass the ingest capacity preflight (issue #439). The preflight
         /// refuses fast when a graph is estimated to overflow the configured
         /// `AletheiaDB` string-interner cap (10M since the 0.2.0 upgrade);
@@ -1164,15 +1137,6 @@ pub(crate) enum OutputFormat {
     Json,
     /// Human-readable one-line-per-result form.
     Text,
-}
-
-/// Subcommands for `config` (issue #261).
-#[derive(Debug, Subcommand)]
-pub(crate) enum ConfigAction {
-    /// Print the effective resolved configuration as JSON: the discovered
-    /// `egregore.toml` (or `null` when absent), every value, and where each
-    /// value came from (`"config"` or `"default"`). See `docs/cli/config.md`.
-    Show,
 }
 
 /// Subcommands for `query`.
@@ -3475,6 +3439,71 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+    /// Rank agents by the downstream fate of their observations.
+    ///
+    /// One row per `agent_id` (with `agent_kind`), carrying deterministic
+    /// counts over: observations written; promotion outcomes split by
+    /// terminal verdict (`approved`, `edited_then_approved`, `rejected`,
+    /// `deferred`, `expired`) for candidates whose supporting evidence is
+    /// this agent's observations; observations later superseded
+    /// (`superseded_by`); and linked verification outcomes
+    /// (passed/failed/inconclusive) attributable to the agent's sessions.
+    ///
+    /// Trust is separated structurally: `observations_written` and
+    /// `superseded_observations` aggregate agent-authored claims,
+    /// `promotion_outcomes` aggregates recorded operator decisions, and
+    /// `verification_outcomes` aggregates recorded verification evidence —
+    /// the output never presents an agent's claim as source truth. Every
+    /// nonzero bucket cites resolvable `record_id` handles; an empty store
+    /// (or no qualifying agents) returns an explicit `no_agents` diagnostic
+    /// rather than silence.
+    ///
+    /// Rows sort canonically by `agent_id`; the answer is byte-stable across
+    /// repeated runs and platforms. JSON is the default; `--format text`
+    /// gives a skimmable table. Respects `--repo` scoping like the other
+    /// lanes; requires no network and no `--embed` store.
+    ///
+    /// This slice reports — it never gates, weights, throttles, or disables
+    /// agents, and it computes no learned reputation score: deterministic
+    /// counts over existing edges only.
+    ///
+    /// Documented in `docs/cli/agent-track-record.md`.
+    #[command(visible_alias = "agents")]
+    TrackRecord {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Retrace one agent session's footprint, claims, and verification.
+    ///
+    /// No footprint found is not evidence the run did nothing: a run that
+    /// never wrote a cited edge, a dropped transcript import, or a partially
+    /// ingested store all look the same as an idle session.
+    ///
+    /// Documented in `docs/cli/session-retrospective.md`.
+    Session {
+        /// Session record ID or imported session handle.
+        id_or_handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -4306,22 +4335,13 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
             raw_literals,
-        } => {
-            let args = resolve_scan_args(repo_id_override, raw_literals);
-            scan(&repo_path, &out, &args)
-        }
+        } => scan(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
         Commands::ScanHistory {
             repo_path,
             out,
             repo_id_override,
             raw_literals,
-        } => {
-            let args = resolve_scan_args(repo_id_override, raw_literals);
-            scan_history(&repo_path, &out, &args)
-        }
-        Commands::Config { action } => match action {
-            ConfigAction::Show => config_show(),
-        },
+        } => scan_history(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
         Commands::ScanLogs {
             log_path,
             repo_path,
@@ -4331,21 +4351,16 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             protected_store,
             producer,
             captured_at,
-        } => {
-            // scan-logs takes no raw-literals flag; the config still governs
-            // identity, fails fast when malformed, and warns on scope pins.
-            let args = resolve_scan_args(repo_id_override, false);
-            scan_logs(
-                &log_path,
-                &repo_path,
-                &out,
-                args.repo_id_override.as_deref(),
-                protected_raw_artifacts,
-                protected_store.as_deref(),
-                producer.as_deref(),
-                captured_at.as_deref(),
-            )
-        }
+        } => scan_logs(
+            &log_path,
+            &repo_path,
+            &out,
+            repo_id_override.as_deref(),
+            protected_raw_artifacts,
+            protected_store.as_deref(),
+            producer.as_deref(),
+            captured_at.as_deref(),
+        ),
         Commands::CaptureTests {
             input,
             out,
@@ -4446,8 +4461,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key,
             #[cfg(feature = "embeddings")]
             embed,
-            #[cfg(feature = "embeddings")]
-            embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
         } => ingest(
@@ -4459,8 +4472,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key.as_deref(),
             #[cfg(feature = "embeddings")]
             embed,
-            #[cfg(feature = "embeddings")]
-            embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
         ),
@@ -4645,18 +4656,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
             #[cfg(feature = "embeddings")]
             embed,
-            #[cfg(feature = "embeddings")]
-            embed_model,
             raw_literals,
         } => scan_refresh_cmd(
             &repo_path,
-            &resolve_data_dir(data_dir.as_deref()),
+            &data_dir,
             cache.as_deref(),
             format,
             #[cfg(feature = "embeddings")]
             embed,
-            #[cfg(feature = "embeddings")]
-            embed_model,
             raw_literals,
         ),
         #[cfg(feature = "embedded-aletheiadb")]
@@ -5540,9 +5547,6 @@ pub(crate) struct FailureHistoryResponse<'a> {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
-    // Fail fast on a malformed `egregore.toml` even for lanes that never read
-    // the store (issue #261): a bad config is never silently ignored.
-    let _ = cli_project_config();
     match subcommand {
         QuerySubcommand::Churn {
             graph,
@@ -6069,11 +6073,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 // `(record_id, commit)` pair to its current version.
                 // Superseded prior versions are a transaction-time concern
                 // (issue #66), not part of a plain valid-time point query.
-                // Config fallback (issue #261): explicit `--data-dir` wins; the
-                // config-pinned dir applies only when neither `--graph` nor
-                // `--data-dir` was passed, so `--graph` plus a pinned store never
-                // reads as "both provided".
-                let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
                 let records = match (graph.as_deref(), data_dir.as_deref()) {
                     (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                     (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6460,11 +6459,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6520,11 +6514,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6568,11 +6557,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query path`/`query implementors`). Temporal selectors need the
             // history-inclusive store view; the current-state read suffices
             // otherwise. A JSONL graph is read identically either way.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6645,11 +6629,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6678,11 +6657,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // A temporal pin needs the history-inclusive store view: the
             // embedded store keeps older commit versions only there, so a
             // current-view read would wrongly lose pinned answers.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -6715,11 +6689,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // files; producer-drift documents a read-only guarantee, so an
             // embedded store is read through a throwaway copy. The guard
             // keeps the copy alive for the reads below.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let store_copy = data_dir.as_deref().map(readonly_audit_store).transpose()?;
             let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
             let records = load_query_records(graph.as_deref(), effective_data_dir)?;
@@ -6754,11 +6723,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -6819,11 +6783,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_log_retained_readonly(dir)?,
@@ -6885,11 +6844,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // the embedded log-retention caveat (issue #363). The `--graph` path
             // preserves every ingested line, so it is `false`.
             let embedded_source = data_dir.is_some();
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) if at.is_some() || as_of.is_some() => {
@@ -6956,11 +6910,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads from a
             // throwaway copy, never the live store (same contract as the other
             // read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7008,11 +6957,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7062,11 +7006,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7100,11 +7039,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             // Strictly read-only lane (issue #218): same throwaway-copy
             // `--data-dir` contract as the other read-only lanes.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7140,11 +7074,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7232,11 +7161,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads from
             // a throwaway copy, never the live store (same contract as the
             // other read-only query lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 // Sidecar-index fast path (issue #447): a file's spans are a
                 // `ByPath` closure. `--repo`/`--at` need global topology / the
@@ -7295,11 +7219,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             };
             // Strictly read-only lookup: `--data-dir` reads from a throwaway
             // copy, never the live store (same contract as `query at`).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 // Sidecar-index fast path (issue #447): a file's spans are a
                 // `ByPath` closure. `--repo`/`--at`/`--as-of` need global
@@ -7362,11 +7281,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // throwaway copy, never the live store. A temporal pin needs the
             // history-inclusive store view so older commit versions are present
             // to snapshot.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7474,11 +7388,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // untouched. --graph is a plain file read. A temporal pin needs the
             // history-inclusive store view; the current-state read suffices
             // otherwise. (Mirrors `query implementors`, issue #133.)
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7519,11 +7428,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // re-persists its on-disk index files, so `--data-dir` reads a
             // throwaway copy of the store — the original stays byte-for-byte
             // untouched. `--graph` is a plain file read. No temporal selectors.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7569,11 +7473,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // the history-inclusive store view; the current-state read suffices
             // otherwise. `--graph` is a plain file read (the CONSTRUCTS edges are
             // Edge records, not a single-kind closure, so no sidecar fast path).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
@@ -7667,11 +7566,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 .expect("bounded by the range check above");
             // Strictly read-only lane: `--data-dir` reads a throwaway copy so
             // the live store stays byte-for-byte untouched.
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7700,11 +7594,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // engine in place re-persists its on-disk index files, so
             // `--data-dir` reads from a throwaway copy, never the live store
             // (same contract as the other read-only lanes).
-            // Config fallback (issue #261): explicit `--data-dir` wins; the
-            // config-pinned dir applies only when neither `--graph` nor
-            // `--data-dir` was passed, so `--graph` plus a pinned store never
-            // reads as "both provided".
-            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -7722,6 +7611,38 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 kind.as_query(),
                 format,
             )
+        }
+        // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TrackRecord {
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #262): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_track_record_cmd(&records, selected.as_deref(), format)
+        }
+        QuerySubcommand::Session {
+            id_or_handle,
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_session_cmd(&records, &id_or_handle, format)
         }
     }
 }
@@ -8103,7 +8024,6 @@ pub(crate) fn exit_ambiguous_repository(groups: &std::collections::BTreeSet<Opti
 #[cfg(feature = "embeddings")]
 pub(crate) fn generate_embeddings(
     records: &[GraphRecord],
-    model_name: &str,
 ) -> Result<(
     crate::embeddings::EmbeddingVectorMap,
     usize,
@@ -8111,22 +8031,19 @@ pub(crate) fn generate_embeddings(
 )> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
-        EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings, embedding_candidates,
-        embedding_model_identity,
+        DEFAULT_EMBEDDING_MODEL_NAME, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
+        default_embedding_model_identity, embedding_candidates,
     };
 
     let candidates = embedding_candidates(records);
     if candidates.is_empty() {
         // Zero candidates still creates a queryable (empty) vector index, so it
         // still needs an identity: the dimension is the model's declared one,
-        // since the model was never loaded to report a measured dimension. The
-        // identity records the RESOLVED model name (issue #261), not the
-        // built-in default, so a config-pinned model is described honestly even
-        // when nothing was embedded.
+        // since the model was never loaded to report a measured dimension.
         return Ok((
             EmbeddingVectorMap::new(),
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
-            embedding_model_identity(model_name, DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+            default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
         ));
     }
 
@@ -8137,7 +8054,7 @@ pub(crate) fn generate_embeddings(
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
-        .model_id(Some(model_name))
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
@@ -8167,13 +8084,11 @@ pub(crate) fn generate_embeddings(
 
     // The identity records the MEASURED dimension the model actually produced,
     // not the declared constant, so a model whose real dimension drifts from the
-    // constant is still described honestly — and the RESOLVED model name (issue
-    // #261), so a config-pinned or `--embed-model` model is never misdescribed
-    // as the built-in default.
+    // constant is still described honestly.
     Ok((
         map,
         dimensions,
-        embedding_model_identity(model_name, dimensions),
+        default_embedding_model_identity(dimensions),
     ))
 }
 

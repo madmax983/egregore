@@ -120,15 +120,8 @@ pub(crate) fn ingest(
     session_id: &str,
     idempotency_key: Option<&str>,
     #[cfg(feature = "embeddings")] embed: bool,
-    #[cfg(feature = "embeddings")] embed_model: Option<String>,
     #[cfg(feature = "embedded-aletheiadb")] force: bool,
 ) -> Result<()> {
-    // Resolve the data directory: explicit `--data-dir` > `egregore.toml` >
-    // `.egregore` (issue #261). Discovery fails fast on a malformed config
-    // before the graph is read, so a bad config never yields a half-ingested
-    // store.
-    let data_dir = resolve_data_dir(data_dir);
-
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
 
@@ -149,6 +142,7 @@ pub(crate) fn ingest(
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
+            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
             // Capacity preflight (issue #439): refuse fast BEFORE opening the
             // store when a graph is estimated to overflow the configured
             // string-interner cap, rather than writing for a long time and
@@ -168,13 +162,7 @@ pub(crate) fn ingest(
             }
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
-                // Resolve the embedding model (issue #261): `--embed-model` >
-                // `[embeddings].model` > built-in default. The resolved name is
-                // what the embedder loads AND what the vector-index identity
-                // records, so a config-pinned model is honored and described
-                // honestly instead of refused.
-                let (embed_model, _) = resolve_embed_model(embed_model);
-                let (vectors, dimensions, model) = generate_embeddings(&records, &embed_model)?;
+                let (vectors, dimensions, model) = generate_embeddings(&records)?;
                 let sink =
                     EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
                         .map_err(|error| embedded_write_open_error(&data_dir, error))?;
@@ -235,6 +223,7 @@ pub(crate) fn ingest(
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Daemon => {
+            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
             let idempotency_key =
                 idempotency_key.context("--idempotency-key is required for --adapter daemon")?;
             let client = DaemonClient::from_data_dir(&data_dir)

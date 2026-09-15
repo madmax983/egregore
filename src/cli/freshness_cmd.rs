@@ -81,12 +81,7 @@ pub(crate) fn freshness_cmd(
     // (and vice versa for `--data-dir` + `graph.jsonl`). Mirroring `scan`'s
     // store-artifact exclusions keeps a just-written store from reading as
     // `stale_dirty` before the user gitignores or deletes the intermediate output.
-    // Also exclude the config-pinned data dir (issue #261): the store now loads
-    // through the config fallback below, so a pinned store inside the repo tree
-    // must not read as untracked files.
-    let config_dir = config_data_dir();
-    let probe_artifacts: [Option<&Path>; 3] = [graph, data_dir, config_dir.as_deref()];
-    let exclusions = store_exclusions_including_egregore(repo_path, &probe_artifacts);
+    let exclusions = store_exclusions_including_egregore(repo_path, &[graph, data_dir]);
     let (current_head, current_dirty) =
         identity::working_tree_snapshot_excluding(repo_path, &exclusions);
 
@@ -220,13 +215,7 @@ pub(crate) fn query_freshness_code_inner(
     // companion store (PR #186 follow-up II1): the documented workflow leaves an
     // untracked `.egregore` data-dir beside the graph, which must not stamp query
     // rows `stale_dirty` when the graph itself was scanned from a clean tree.
-    // Also exclude the config-pinned data dir (issue #261): a store named
-    // anything other than `.egregore*` inside the repo tree would otherwise
-    // read as untracked files and mislabel a fresh answer stale-dirty.
-    let config_dir = config_data_dir();
-    let mut artifacts: Vec<Option<&Path>> = artifacts.to_vec();
-    artifacts.push(config_dir.as_deref());
-    let exclusions = store_exclusions_including_egregore(repo_path, &artifacts);
+    let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
     // Any explicit hint (a resolved `--repo` scope or context owner) is
     // authoritative: the verdict must be owned by the selected repository, even

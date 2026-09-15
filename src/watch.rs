@@ -94,12 +94,7 @@ fn ingest_batch(data_dir: &Path, records: &[crate::ir::GraphRecord], embed: bool
 
     #[cfg(feature = "embeddings")]
     let mut sink = if embed {
-        // Resolve the embedding model (issue #261): the watch loop has no
-        // `--embed-model` flag, so the config pin (or built-in default) governs.
-        // The resolved name is what the embedder loads AND what the identity
-        // records.
-        let (embed_model, _) = crate::cli::resolve_embed_model(None);
-        let (vectors, dimensions, model) = crate::cli::generate_embeddings(&records, &embed_model)?;
+        let (vectors, dimensions, model) = crate::cli::generate_embeddings(&records)?;
         let sink = EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
             .context("failed to open embedded store with embeddings")?;
         // Refuse before writing when the index was built by a different model

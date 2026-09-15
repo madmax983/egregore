@@ -86,8 +86,6 @@ pub mod memory_recall_eval;
 pub mod parser;
 /// Local setup preflight report for the `eg doctor` command (issue #75).
 pub mod preflight;
-/// Checked-in per-repo project configuration — `egregore.toml` (issue #261).
-pub mod project_config;
 /// Protected raw-artifact capture and retrieval (issue #60).
 pub mod protected;
 /// Agent-facing graph query helpers.
@@ -221,7 +219,6 @@ pub fn scan_repository_with_override(
         repo_id_override,
         &[],
         Some(&generation),
-        None,
     )
 }
 
@@ -249,7 +246,6 @@ pub fn scan_repository_with_exclusions(
         repo_id_override,
         snapshot_exclusions,
         Some(&generation),
-        None,
     )
 }
 
@@ -266,47 +262,8 @@ pub fn scan_repository_at_with_override(
 ) -> Result<Graph> {
     // Explicit-time entry (fixed-timestamp callers such as tests and audit):
     // derive `coverage_generation` from `transaction_time` for deterministic,
-    // byte-identical output across re-runs with the same override (issue #406),
-    // and stamp `producer_started_at` with the pinned time so no wall-clock
-    // instant leaks into a time-pinned scan (issue #261).
-    scan_repository_at_with_override_inner(
-        repo_path,
-        transaction_time,
-        repo_id_override,
-        &[],
-        None,
-        Some(transaction_time),
-    )
-}
-
-/// Like [`scan_repository_at_with_override`] but excludes repo-relative paths
-/// from the dirty probe when stamping the snapshot.
-///
-/// This is the entry point the `eg scan` CLI uses when `egregore.toml` pins
-/// `scan.transaction_time` (issue #261): the pinned instant governs the
-/// transaction time, the coverage-generation stamp, and `producer_started_at`,
-/// so two runs sharing the checked-in config produce byte-for-byte identical
-/// graph JSONL. With no pin the CLI keeps using
-/// [`scan_repository_with_exclusions`] (wall-clock), which is unchanged.
-///
-/// # Errors
-///
-/// Returns an error when the repository path is missing, is not a directory, or
-/// source discovery cannot read the filesystem.
-pub fn scan_repository_at_with_exclusions(
-    repo_path: impl AsRef<Path>,
-    transaction_time: &str,
-    repo_id_override: Option<&str>,
-    snapshot_exclusions: &[String],
-) -> Result<Graph> {
-    scan_repository_at_with_override_inner(
-        repo_path,
-        transaction_time,
-        repo_id_override,
-        snapshot_exclusions,
-        None,
-        Some(transaction_time),
-    )
+    // byte-identical output across re-runs with the same override (issue #406).
+    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[], None)
 }
 
 fn scan_repository_at_with_override_inner(
@@ -315,7 +272,6 @@ fn scan_repository_at_with_override_inner(
     repo_id_override: Option<&str>,
     snapshot_exclusions: &[String],
     coverage_generation: Option<&str>,
-    producer_started_at: Option<&str>,
 ) -> Result<Graph> {
     LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -433,15 +389,7 @@ fn scan_repository_at_with_override_inner(
     }
 
     let languages = languages_in_graph(&graph);
-    // A pinned transaction time also pins `producer_started_at` (issue #261):
-    // an explicit-time scan is a deterministic operation, so stamping
-    // wall-clock here would leak a per-run instant into the JSONL. Wall-clock
-    // scans (no pin) keep the historical `PROCESS_STARTED_AT` behavior.
-    let mut producer = code_graph_producer(&languages);
-    if let Some(pinned) = producer_started_at {
-        pinned.clone_into(&mut producer.producer_started_at);
-    }
-    Ok(graph.stamp_producer(&producer))
+    Ok(graph.stamp_producer(&code_graph_producer(&languages)))
 }
 
 /// Wall-clock time captured at the start of the first scan in this process.
