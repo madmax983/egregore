@@ -257,7 +257,9 @@ pub fn load_config_file(path: &Path) -> Result<ProjectConfig, ConfigLoadError> {
         path,
     )?;
 
-    let config_dir = path.parent().map_or(Path::new("."), |parent| parent);
+    let config_dir = path
+        .parent()
+        .map_or_else(|| Path::new("."), std::convert::identity);
     let data_dir = get_string(table, "data_dir", "", path)?.map(|raw| {
         let raw_path = PathBuf::from(raw);
         if raw_path.is_absolute() {

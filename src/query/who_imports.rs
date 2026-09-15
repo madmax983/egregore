@@ -45,10 +45,10 @@
 //! Liveness follows the shared latest-write-wins [`Liveness`] gate so `--graph`
 //! and `--data-dir` agree on tombstoned / revived Import records.
 
+use super::RepositoryIndex;
 use super::liveness::Liveness;
 use crate::ir::{GraphRecord, NodeKind, SourceSpan};
-
-use super::RepositoryIndex;
+use crate::languages::cross_file::parse_import_segments;
 
 /// Why a `who-imports` query path was rejected.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -138,71 +138,6 @@ pub fn parse_query_path(raw: &str) -> Result<Vec<String>, WhoImportsError> {
         }
     }
     Ok(segments.into_iter().map(str::to_owned).collect())
-}
-
-/// Strips an optional leading Rust visibility + `use` keyword prefix from an
-/// Import node's raw `name`, anchored at the very start.
-///
-/// The Rust extractor's `import_name` only trims a leading BARE `use`, so a
-/// public re-export keeps its visibility on the Import node `name`:
-/// `pub use crate::internal::Widget;` mints the literal name
-/// `pub use crate::internal::Widget` (issue #449 Codex finding). Left as-is, the
-/// first segment split on `::` becomes `pub use crate`, so every `crate::…`
-/// re-export site is missed. This helper drops the keyword prefix before the
-/// split: an optional `pub` visibility token (including a `pub(crate)` /
-/// `pub(super)` / `pub(self)` / `pub(in path)` restriction) followed by the
-/// `use` keyword, or a bare leading `use `. Only the anchored keyword prefix is
-/// consumed — `pub` and `use` are reserved words and can never be module
-/// segments, and a segment that merely starts with the substring `use` (e.g.
-/// `used`) is not stripped — so this never over-strips a real path.
-fn strip_use_prefix(name: &str) -> &str {
-    let trimmed = name.trim_start();
-    // Optionally consume a leading `pub` visibility token, including a
-    // `pub(...)` restriction. A bare `pub` counts only when followed by
-    // whitespace or a `(` — otherwise it is part of a longer token and left be.
-    let after_vis = trimmed
-        .strip_prefix("pub")
-        .map_or(trimmed, |rest| match rest.chars().next() {
-            // Skip the balanced `(...)` restriction (visibility restrictions do
-            // not nest, so the first `)` closes it).
-            Some('(') => rest.find(')').map_or(rest, |idx| &rest[idx + 1..]),
-            Some(c) if c.is_whitespace() => rest,
-            _ => trimmed,
-        })
-        .trim_start();
-    // Strip only when the `use` keyword is actually present (and is a whole
-    // keyword, not the prefix of a longer identifier); otherwise the name is
-    // already a bare path — return it unchanged.
-    match after_vis.strip_prefix("use") {
-        Some(rest) if rest.chars().next().is_none_or(char::is_whitespace) => rest.trim_start(),
-        _ => name,
-    }
-}
-
-/// Reduces an Import node's raw `name` path text to its module-path segment
-/// list.
-///
-/// A group import `a::b::{C, D}` reduces to the common module prefix `a::b`; a
-/// glob `a::b::*` reduces to `a::b`; a trailing ` as <alias>` rename is
-/// stripped. A leading `pub`/visibility + `use` (or bare `use`) keyword prefix
-/// left on a re-export node's `name` by the extractor is stripped first (see
-/// [`strip_use_prefix`]). Empty segments (from a trailing `::`) and `*` are
-/// dropped.
-#[must_use]
-pub fn parse_import_segments(name: &str) -> Vec<String> {
-    // Drop any leading `[pub[(...)]] use` keyword prefix a re-export node kept.
-    let name = strip_use_prefix(name);
-    // Group import: everything before the first `{` is the common module
-    // prefix; the braced leaves (and any leaf renames inside them) are dropped.
-    let head = name.find('{').map_or(name, |idx| &name[..idx]);
-    // Non-group rename: strip a trailing ` as <alias>` (a group's leaf renames
-    // already went with the braces above).
-    let head = head.find(" as ").map_or(head, |idx| &head[..idx]);
-    head.split("::")
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "*")
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Applies the `--crate` unification: rewrites a leading `crate` segment to the
@@ -657,5 +592,88 @@ mod tests {
         let index = RepositoryIndex::build(&recs);
         let err = who_imports(&recs, "a::::b", None, &index, None).unwrap_err();
         assert_eq!(err.code(), "malformed_module_path");
+    }
+
+    // ── --repo scoping ───────────────────────────────────────────────────
+
+    /// Two repositories in one store, each importing `foo::bar`. `--repo`
+    /// must restrict the importer set to exactly the selected repository
+    /// (issue #444: "honoring --repo").
+    #[test]
+    fn repo_scope_restricts_to_one_repository() {
+        use crate::ir::EdgeLabel;
+
+        let mut g = Graph::new();
+        let repo_a = "codegraph:v1:repo-a";
+        let repo_b = "codegraph:v1:repo-b";
+        let mut import_ids = Vec::new();
+        for (repo_id, basename, file_path, import_name) in [
+            (repo_a, "alpha", "src/a.rs", "foo::bar::A"),
+            (repo_b, "beta", "src/b.rs", "foo::bar::B"),
+        ] {
+            g.push(GraphRecord::node(
+                repo_id.to_owned(),
+                NodeKind::Repository,
+                None,
+                None,
+                Some(basename.to_owned()),
+                format!("repository {basename}"),
+            ));
+            let file_id = stable_id(&["node", "file", repo_id, file_path]);
+            g.push(GraphRecord::node(
+                file_id.clone(),
+                NodeKind::File,
+                Some(file_path.to_owned()),
+                None,
+                Some(file_path.to_owned()),
+                format!("file {file_path}"),
+            ));
+            g.push(GraphRecord::edge(
+                EdgeLabel::Contains,
+                repo_id.to_owned(),
+                file_id.clone(),
+                None,
+                format!("{repo_id} contains {file_path}"),
+            ));
+            let import_id = stable_id(&["node", "import", repo_id, file_path, import_name]);
+            g.push(GraphRecord::syntax_node(
+                import_id.clone(),
+                NodeKind::Import,
+                file_path.to_owned(),
+                span(1),
+                import_name.to_owned(),
+                "rust",
+                format!("Rust import {import_name}"),
+            ));
+            // The extractor's containment-shaped edge attributes the import
+            // declaration to its file (and hence its repository).
+            g.push(GraphRecord::edge(
+                EdgeLabel::Imports,
+                file_id,
+                import_id.clone(),
+                None,
+                format!("{file_path} imports {import_name}"),
+            ));
+            import_ids.push(import_id);
+        }
+        let recs = g.into_records();
+        let index = RepositoryIndex::build(&recs);
+
+        // Sanity: each Import node is owned by its own repository.
+        assert_eq!(index.owner_of(&import_ids[0]), Some(repo_a));
+        assert_eq!(index.owner_of(&import_ids[1]), Some(repo_b));
+
+        let scoped =
+            who_imports(&recs, "foo::bar", None, &index, Some(repo_a)).expect("valid query");
+        assert_eq!(
+            scoped.rows.len(),
+            1,
+            "--repo must restrict importers to the selected repository"
+        );
+        assert_eq!(scoped.rows[0].record_id, import_ids[0]);
+        assert_eq!(scoped.rows[0].repo_relative_path, "src/a.rs");
+
+        let unscoped = who_imports(&recs, "foo::bar", None, &index, None).expect("valid query");
+        assert_eq!(unscoped.rows.len(), 2, "no --repo keeps both repositories");
     }
 }

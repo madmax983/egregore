@@ -395,6 +395,8 @@ fn context_from_seeds<'a>(
             _ => None,
         })
         .collect();
+    // Liveness view for BFS relay-node checks.
+    let liveness = crate::query::liveness::Liveness::new(records);
     let mut source_facts = source_facts;
 
     // Snapshot seed IDs (symbol IDs + co-located file IDs) before the main
@@ -571,14 +573,7 @@ fn context_from_seeds<'a>(
                         // kinds (e.g. ToolCall) which bridge classifiable sections but
                         // have no output section of their own. Tombstoned and missing
                         // (by_id miss) nodes still must not enter the frontier.
-                        if was_classified
-                            || is_bfs_relay_node(
-                                id,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                             next_frontier.push(id);
                         }
                     }
@@ -630,13 +625,7 @@ fn context_from_seeds<'a>(
                             &mut verification_evidence,
                         );
                         visited.insert(node_id.as_str());
-                        if was_classified
-                            || is_bfs_relay_node(
-                                node_id.as_str(),
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
+                        if was_classified || is_bfs_relay_node(node_id.as_str(), &by_id, &liveness)
                         {
                             next_frontier.push(node_id.as_str());
                         }
@@ -868,9 +857,7 @@ fn context_from_seeds<'a>(
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                    if was_classified
-                        || is_bfs_relay_node(id, &by_id, &tombstoned_ids, &has_any_temporal_version)
-                    {
+                    if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                         next_extra.push(id);
                     }
                 }
@@ -1205,6 +1192,17 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                         target_kind,
                         Some(NodeKind::Symbol | NodeKind::Module | NodeKind::Import)
                     ) {
+                        continue;
+                    }
+                    // An `IMPORTS` edge is followed only in its containment
+                    // shape (`File —IMPORTS→ Import`): the issue-#444
+                    // module-target edge (`File —IMPORTS→ Module|File`) is a
+                    // dependency edge into ANOTHER file's tree, and following
+                    // it would leak the imported module's symbols into this
+                    // file's context.
+                    if matches!(label, EdgeLabel::Imports)
+                        && !matches!(target_kind, Some(NodeKind::Import))
+                    {
                         continue;
                     }
                     if let Some(t) = id_ref(target.as_str())

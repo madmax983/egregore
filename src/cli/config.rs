@@ -33,13 +33,14 @@ static CLI_CONFIG: OnceLock<Option<LoadedConfig>> = OnceLock::new();
 pub(crate) fn cli_project_config() -> Option<LoadedConfig> {
     CLI_CONFIG
         .get_or_init(|| {
-            let cwd = std::env::current_dir().map_or_else(|_| PathBuf::from("."), |dir| dir);
+            let cwd =
+                std::env::current_dir().map_or_else(|_| PathBuf::from("."), std::convert::identity);
             match crate::project_config::discover_and_load(&cwd) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     let diagnostic = serde_json::to_string(&error.diagnostic()).map_or_else(
                         |_| r#"{"code":"config_invalid"}"#.to_owned(),
-                        |rendered| rendered,
+                        std::convert::identity,
                     );
                     eprintln!("{diagnostic}");
                     std::process::exit(1);
@@ -84,7 +85,10 @@ fn resolve_query_data_dir_with(
 pub(crate) fn resolve_data_dir(flag: Option<&Path>) -> PathBuf {
     resolve_opt(flag.map(Path::to_path_buf), config_data_dir())
         .0
-        .map_or_else(|| crate::project_config::default_data_dir(), |dir| dir)
+        .map_or_else(
+            crate::project_config::default_data_dir,
+            std::convert::identity,
+        )
 }
 
 /// Scan inputs after resolving explicit CLI flags against the checked-in config.
@@ -169,7 +173,10 @@ pub(crate) fn config_show() -> Result<()> {
 
     let (data_dir, data_dir_source) =
         resolve_opt(None::<PathBuf>, config.and_then(|c| c.data_dir.clone()));
-    let data_dir = data_dir.map_or_else(|| crate::project_config::default_data_dir(), |dir| dir);
+    let data_dir = data_dir.map_or_else(
+        crate::project_config::default_data_dir,
+        std::convert::identity,
+    );
     let (repo_id_override, repo_id_source) = resolve_opt(
         None::<String>,
         config.and_then(|c| c.repo_id_override.clone()),

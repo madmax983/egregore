@@ -341,10 +341,10 @@ pub fn task_evidence_context<'a>(
     // (`resolve_task_ids`) already gates task resolution with this same shared
     // helper, so a Task re-ingested AFTER its own tombstone resolves live there;
     // the direct anchor-Task gate below must agree, or a handle resolves and then
-    // produces an empty/no_match context — an incoherence. Only the DIRECT
-    // anchor-Task gate is converted here; the shared BFS-relay path
-    // (`is_bfs_relay_node`) is deliberately deferred to issue #469. See
-    // `super::liveness`.
+    // produces an empty/no_match context — an incoherence. The shared BFS-relay
+    // path (`is_bfs_relay_node`) takes the same `Liveness` view (issue #469), so
+    // a revived relay bridges the BFS exactly when the resolver treats it live.
+    // See `super::liveness`.
     let liveness = super::liveness::Liveness::new(records);
 
     let present_ids: BTreeSet<&str> = records.iter().map(GraphRecord::id).collect();
@@ -618,14 +618,7 @@ pub fn task_evidence_context<'a>(
                             &mut verification_evidence,
                             &mut reviews,
                         );
-                        if was_classified
-                            || is_bfs_relay_node(
-                                id,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(id, &by_id, &liveness) {
                             next_frontier.push(id);
                         }
                     }
@@ -832,7 +825,7 @@ pub fn task_evidence_context<'a>(
 #[cfg(test)]
 mod liveness_tests {
     use super::*;
-    use crate::ir::PROJECT_SCHEMA_VERSION;
+    use crate::ir::{AGENT_MEMORY_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION};
 
     fn ext_link(id: &str, url: &str) -> GraphRecord {
         let mut n = GraphRecord::node(
@@ -1056,6 +1049,101 @@ mod liveness_tests {
         assert!(
             ctx.is_no_match(),
             "a tombstone with no re-add yields an empty context"
+        );
+    }
+
+    fn memory_node(id: &str, kind: NodeKind) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("{} {id}", kind.as_str()),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+    }
+
+    fn memory_tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("agent_memory:v{AGENT_MEMORY_SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    /// Shared fixture: a Task observed by an Observation, with a ToolCall relay
+    /// bridging the observation to a CommandRun via
+    /// `ExplainsChange`/`ProducedEvidence`. `revive` controls whether the
+    /// ToolCall is re-ingested after its tombstone.
+    fn relay_fixture(revive: bool) -> (Vec<GraphRecord>, &'static str, &'static str) {
+        let task_id = "project:v1:task-relay";
+        let obs_id = "agent_memory:v1:obs-relay";
+        let tool_id = "agent_memory:v1:tool-relay";
+        let run_id = "agent_memory:v1:run-relay";
+        let mut records = vec![
+            bare_task(task_id),
+            memory_node(obs_id, NodeKind::Observation),
+            GraphRecord::edge(
+                EdgeLabel::ReferencesTask,
+                obs_id.to_owned(),
+                task_id.to_owned(),
+                None,
+                "observation references task".to_owned(),
+            ),
+            memory_node(tool_id, NodeKind::ToolCall),
+            GraphRecord::edge(
+                EdgeLabel::ExplainsChange,
+                obs_id.to_owned(),
+                tool_id.to_owned(),
+                None,
+                "observation explains tool call".to_owned(),
+            ),
+            memory_tombstone(tool_id),
+        ];
+        if revive {
+            // Re-ingested AFTER the tombstone: latest write wins, so the relay
+            // is live again — matching the coalesced `--data-dir` read.
+            records.push(memory_node(tool_id, NodeKind::ToolCall));
+        }
+        records.push(memory_node(run_id, NodeKind::CommandRun));
+        records.push(GraphRecord::edge(
+            EdgeLabel::ProducedEvidence,
+            tool_id.to_owned(),
+            run_id.to_owned(),
+            None,
+            "tool call produced run".to_owned(),
+        ));
+        (records, task_id, run_id)
+    }
+
+    #[test]
+    fn revived_toolcall_relays_bfs_to_command_run() {
+        // Divergence repro (issue #469): the shared `is_bfs_relay_node` gate
+        // still treats a tombstone as permanently active, so a ToolCall
+        // re-ingested AFTER its own tombstone cannot bridge the BFS — while the
+        // coalesced `--data-dir` read treats it as live. The two transports
+        // diverge: `--graph` drops the CommandRun the BFS would reach through
+        // the revived relay.
+        let (records, task_id, run_id) = relay_fixture(true);
+        let ctx = task_evidence_context(&records, task_id);
+        assert!(
+            ctx.verification_evidence.iter().any(|r| r.id() == run_id),
+            "a ToolCall revived after its tombstone must still relay the BFS to its CommandRun"
+        );
+    }
+
+    #[test]
+    fn tombstoned_toolcall_without_reingest_does_not_relay() {
+        // Negative control: a tombstone with no later re-ingest still deletes
+        // the relay — the conversion must not turn every tombstoned relay live.
+        let (records, task_id, run_id) = relay_fixture(false);
+        let ctx = task_evidence_context(&records, task_id);
+        assert!(
+            !ctx.verification_evidence.iter().any(|r| r.id() == run_id),
+            "a tombstoned ToolCall with no re-ingest must not relay the BFS"
         );
     }
 }

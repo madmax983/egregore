@@ -167,21 +167,50 @@ impl RepositoryIndex {
         // owns a node for the exact same current state (mirrors the same
         // `deleted`/`is_latest_edge_version` gate `Adjacency::build` in
         // `query::sessions` already applies to its own edge classes).
+        //
+        // Node kind by record ID, so the walk can tell the two `IMPORTS`
+        // shapes apart. A node's kind never changes across versions; the first
+        // write wins.
+        let mut node_kind: BTreeMap<&str, NodeKind> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Node { id, kind, .. } = record {
+                node_kind.entry(id.as_str()).or_insert(*kind);
+            }
+        }
         let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (position, record) in records.iter().enumerate() {
-            if let GraphRecord::Edge {
+            let GraphRecord::Edge {
                 id,
-                label: EdgeLabel::Contains | EdgeLabel::Defines | EdgeLabel::Imports,
+                label,
                 source,
                 target,
                 ..
             } = record
-            {
-                if liveness.deleted(id.as_str()) || !liveness.is_latest_edge_version(id, position) {
-                    continue;
-                }
-                adjacency.entry(source.as_str()).or_default().push(target);
+            else {
+                continue;
+            };
+            // Ownership follows containment topology only. An `IMPORTS` edge
+            // is containment in its extractor shape (`File —IMPORTS→ Import`,
+            // the import declaration owned by its file); the issue-#444
+            // target edge (`File —IMPORTS→ Module|File`) is a dependency edge
+            // into another file's tree — following it would reattribute the
+            // imported module (and everything below it) to the importing
+            // repository. An unresolvable target kind reads as non-containment
+            // (fail closed).
+            let is_containment = match label {
+                EdgeLabel::Contains | EdgeLabel::Defines => true,
+                EdgeLabel::Imports => node_kind
+                    .get(target.as_str())
+                    .is_some_and(|kind| *kind == NodeKind::Import),
+                _ => false,
+            };
+            if !is_containment {
+                continue;
             }
+            if liveness.deleted(id.as_str()) || !liveness.is_latest_edge_version(id, position) {
+                continue;
+            }
+            adjacency.entry(source.as_str()).or_default().push(target);
         }
 
         let mut owner: BTreeMap<String, String> = BTreeMap::new();
@@ -623,5 +652,76 @@ mod tests {
         let index = RepositoryIndex::build(&[sig]);
 
         assert_eq!(index.owner_of(&sig_id), None);
+    }
+
+    fn code_node(id: &str, kind: NodeKind, path: Option<&str>, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            path.map(str::to_owned),
+            None,
+            Some(name.to_owned()),
+            format!("{kind:?} {name}"),
+        )
+    }
+
+    fn code_edge(label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            label,
+            source.to_owned(),
+            target.to_owned(),
+            None,
+            format!("{label:?} {source} -> {target}"),
+        )
+    }
+
+    #[test]
+    fn import_target_edge_does_not_reattribute_module_to_importing_repo() {
+        // Issue #444: a `File —IMPORTS→ Module` target edge is a dependency
+        // edge, not containment. The ownership walk must not follow it: the
+        // imported module stays owned by its own repository even when the
+        // importing repository sorts LAST (the order whose DFS would otherwise
+        // claim the module last and win the overwrite).
+        let repo_target = "codegraph:v1:repo-alpha";
+        let repo_importer = "codegraph:v1:repo-zebra";
+        let file_target = "codegraph:v1:file-alpha";
+        let file_importer = "codegraph:v1:file-zebra";
+        let module = "codegraph:v1:module-alpha";
+        let import_decl = "codegraph:v1:import-zebra";
+        let records = vec![
+            repo_node(repo_target, "alpha"),
+            repo_node(repo_importer, "zebra"),
+            code_node(file_target, NodeKind::File, Some("src/lib.rs"), "lib.rs"),
+            code_node(file_importer, NodeKind::File, Some("src/use.rs"), "use.rs"),
+            code_node(module, NodeKind::Module, Some("src/lib.rs"), "inner"),
+            code_node(
+                import_decl,
+                NodeKind::Import,
+                Some("src/use.rs"),
+                "crate::inner",
+            ),
+            code_edge(EdgeLabel::Contains, repo_target, file_target),
+            code_edge(EdgeLabel::Contains, repo_importer, file_importer),
+            code_edge(EdgeLabel::Defines, file_target, module),
+            // The extractor's containment shape: the import declaration is
+            // owned by its file, so this edge IS followed.
+            code_edge(EdgeLabel::Imports, file_importer, import_decl),
+            // The issue-#444 target shape: a dependency edge into another
+            // file's tree, NOT followed.
+            code_edge(EdgeLabel::Imports, file_importer, module),
+        ];
+        let index = RepositoryIndex::build(&records);
+
+        assert_eq!(
+            index.owner_of(module),
+            Some(repo_target),
+            "the imported module must stay owned by its own repository"
+        );
+        assert_eq!(index.owner_of(file_importer), Some(repo_importer));
+        assert_eq!(
+            index.owner_of(import_decl),
+            Some(repo_importer),
+            "the containment-shaped IMPORTS edge still attributes the import declaration"
+        );
     }
 }

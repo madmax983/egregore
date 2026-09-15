@@ -763,6 +763,11 @@ pub fn changes_context<'a>(
         }
     }
 
+    // Latest-write-wins liveness for the shared BFS relay gate (issue #469).
+    // Over an append-only `--graph` a relay node re-ingested AFTER its own
+    // tombstone is live again, matching the coalesced `--data-dir` read.
+    let liveness = super::liveness::Liveness::new(records);
+
     // Commits specify parents via temporal.git_parent_commits or ParentOf edges.
     // When a repository scope is active, only that repository's commit nodes
     // contribute to the topology so a same-SHA commit owned by another repo
@@ -1383,14 +1388,7 @@ pub fn changes_context<'a>(
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        if was_classified
-                            || is_bfs_relay_node(
-                                target,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(target, &by_id, &liveness) {
                             next_frontier.push(*target);
                         }
                     }
@@ -1413,14 +1411,7 @@ pub fn changes_context<'a>(
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        if was_classified
-                            || is_bfs_relay_node(
-                                source,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(source, &by_id, &liveness) {
                             next_frontier.push(*source);
                         }
                     }
@@ -1457,12 +1448,7 @@ pub fn changes_context<'a>(
                                         &mut verification_evidence,
                                     );
                                     if was_classified
-                                        || is_bfs_relay_node(
-                                            target_id.as_str(),
-                                            &by_id,
-                                            &tombstoned_ids,
-                                            &has_any_temporal_version,
-                                        )
+                                        || is_bfs_relay_node(target_id.as_str(), &by_id, &liveness)
                                     {
                                         next_frontier.push(target_id.as_str());
                                     }
@@ -1513,14 +1499,7 @@ pub fn changes_context<'a>(
                         // File/Symbol via its own evidence_links; expand it so its
                         // forward PRODUCED_EVIDENCE edges still reach the
                         // CommandRun/TestRun it produced.
-                        if was_classified
-                            || is_bfs_relay_node(
-                                source,
-                                &by_id,
-                                &tombstoned_ids,
-                                &has_any_temporal_version,
-                            )
-                        {
+                        if was_classified || is_bfs_relay_node(source, &by_id, &liveness) {
                             next_frontier.push(*source);
                         }
                     }
@@ -1669,6 +1648,7 @@ pub fn changes_context<'a>(
             &evidence_links_to,
             &tombstoned_ids,
             &has_any_temporal_version,
+            &liveness,
             &range_commit_shas,
         )
     };
@@ -1799,6 +1779,8 @@ fn direct_evidence_link_in_range(link: &EvidenceLink, range_commit_shas: &BTreeS
 // Internal evidence-traversal helper: every argument is a borrowed slice of the
 // caller's traversal context (indexes plus the queried range), so threading them
 // individually is clearer than introducing a context struct used in one place.
+// `liveness` drives the shared BFS relay gate (issue #469): a relay node
+// re-ingested after its own tombstone is live again under latest-write-wins.
 #[allow(clippy::too_many_arguments)]
 fn is_linked_to_evidence<'a>(
     seed_id: &'a str,
@@ -1808,6 +1790,7 @@ fn is_linked_to_evidence<'a>(
     evidence_links_to: &BTreeMap<&'a str, Vec<&'a str>>,
     tombstoned_ids: &BTreeSet<&'a str>,
     has_any_temporal_version: &BTreeSet<&'a str>,
+    liveness: &super::liveness::Liveness<'a>,
     range_commit_shas: &BTreeSet<&'a str>,
 ) -> bool {
     let mut visited = BTreeSet::new();
@@ -1836,9 +1819,7 @@ fn is_linked_to_evidence<'a>(
     // Repository must not be traversed through here, otherwise this helper could
     // mark a change explained by an Observation that the output traversal would
     // never reach (and therefore never emit).
-    let can_relay = |node_id: &str| -> bool {
-        is_bfs_relay_node(node_id, by_id, tombstoned_ids, has_any_temporal_version)
-    };
+    let can_relay = |node_id: &str| -> bool { is_bfs_relay_node(node_id, by_id, liveness) };
 
     for _hop in 0..3 {
         let mut next_frontier = Vec::new();
@@ -1936,3 +1917,164 @@ fn is_linked_to_evidence<'a>(
 // reuses existing agent-memory, verification, artifact, project, redaction, and
 // evidence-link contracts; it introduces no new graph domain, node kind, or edge
 // vocabulary (AC10).
+
+#[cfg(test)]
+mod relay_liveness_tests {
+    //! Divergence repros for the shared `is_bfs_relay_node` tombstone gate
+    //! (issue #469): a ToolCall re-ingested AFTER its own tombstone must relay
+    //! the BFS again (latest-write-wins, matching the coalesced `--data-dir`
+    //! read), while a tombstone with no re-ingest still deletes the relay.
+
+    use super::*;
+    use crate::ir::TemporalMetadata;
+
+    const BASE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEAD_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const PATH: &str = "src/lib.rs";
+
+    fn temporal(sha: &str, parents: &[&str]) -> TemporalMetadata {
+        TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        }
+    }
+
+    fn commit_node(sha: &str, parents: &[&str]) -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v5:commit:{sha}"),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(temporal(sha, parents))
+    }
+
+    fn file_node() -> GraphRecord {
+        GraphRecord::node(
+            "codegraph:v5:file:src/lib.rs".to_owned(),
+            NodeKind::File,
+            Some(PATH.to_owned()),
+            None,
+            Some(PATH.to_owned()),
+            "File src/lib.rs".to_owned(),
+        )
+        .with_temporal(temporal(HEAD_SHA, &[BASE_SHA]))
+    }
+
+    fn memory_node(id: &str, kind: NodeKind) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("{} {id}", kind.as_str()),
+        )
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb:{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    /// Fixture: a File changed at HEAD, a ToolCall relay with a `TOUCHED_FILE`
+    /// edge to the file and an `EXPLAINS_CHANGE` edge from an Observation.
+    /// `revive` controls whether the ToolCall is re-ingested after its
+    /// tombstone. The tombstone summary deliberately avoids the changed path so
+    /// the tombstone section itself does not seed the relay id into the BFS.
+    fn fixture(revive: bool) -> Vec<GraphRecord> {
+        let tool_id = "codegraph:v5:tool:relay";
+        let obs_id = "codegraph:v5:obs:relay";
+        let mut records = vec![
+            commit_node(BASE_SHA, &[]),
+            commit_node(HEAD_SHA, &[BASE_SHA]),
+            file_node(),
+            memory_node(tool_id, NodeKind::ToolCall),
+            GraphRecord::edge(
+                EdgeLabel::TouchedFile,
+                tool_id.to_owned(),
+                "codegraph:v5:file:src/lib.rs".to_owned(),
+                None,
+                "tool touched file".to_owned(),
+            ),
+            tombstone(tool_id),
+        ];
+        if revive {
+            records.push(memory_node(tool_id, NodeKind::ToolCall));
+        }
+        records.push(memory_node(obs_id, NodeKind::Observation));
+        records.push(GraphRecord::edge(
+            EdgeLabel::ExplainsChange,
+            obs_id.to_owned(),
+            tool_id.to_owned(),
+            None,
+            "observation explains tool call".to_owned(),
+        ));
+        records
+    }
+
+    #[test]
+    fn revived_toolcall_relays_changes_bfs_to_observation() {
+        // Divergence repro (issue #469): over `--graph` the revived ToolCall is
+        // tombstone-gated out of the BFS relay, so the Observation explaining
+        // the change is never reached — while `--data-dir` (embedded
+        // latest-write-wins) treats the relay as live and surfaces it.
+        let records = fixture(true);
+        let ctx = changes_context(&records, &BASE_SHA[..7], &HEAD_SHA[..7], None)
+            .expect("changes_context");
+        assert!(
+            ctx.observations
+                .iter()
+                .any(|o| o.record_id == "codegraph:v5:obs:relay"),
+            "a ToolCall revived after its tombstone must relay the changes BFS to its Observation"
+        );
+    }
+
+    #[test]
+    fn revived_toolcall_marks_change_explained() {
+        // The `is_linked_to_evidence` helper shares the same relay gate: with
+        // the revived relay the changed file must not be reported unexplained.
+        let records = fixture(true);
+        let ctx = changes_context(&records, &BASE_SHA[..7], &HEAD_SHA[..7], None)
+            .expect("changes_context");
+        assert!(
+            !ctx.unexplained
+                .iter()
+                .any(|u| u.record_id == "codegraph:v5:file:src/lib.rs"),
+            "a change explained through a revived relay must not be unexplained"
+        );
+    }
+
+    #[test]
+    fn tombstoned_toolcall_without_reingest_leaves_change_unexplained() {
+        // Negative control: a tombstone with no later re-ingest still deletes
+        // the relay — the Observation stays unreachable and the file stays
+        // unexplained.
+        let records = fixture(false);
+        let ctx = changes_context(&records, &BASE_SHA[..7], &HEAD_SHA[..7], None)
+            .expect("changes_context");
+        assert!(
+            !ctx.observations
+                .iter()
+                .any(|o| o.record_id == "codegraph:v5:obs:relay"),
+            "a tombstoned ToolCall with no re-ingest must not relay the changes BFS"
+        );
+        assert!(
+            ctx.unexplained
+                .iter()
+                .any(|u| u.record_id == "codegraph:v5:file:src/lib.rs"),
+            "a change whose only evidence crosses a dead relay stays unexplained"
+        );
+    }
+}

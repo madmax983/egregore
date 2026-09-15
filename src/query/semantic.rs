@@ -259,16 +259,17 @@ pub(super) const fn is_forward_only_label(label: EdgeLabel) -> bool {
 ///   `ToolCall`; its `PRODUCED_EVIDENCE` forward edges then reach `CommandRun`/`TestRun`.
 ///
 /// Relay expansion is only allowed for nodes that are present in `by_id` and
-/// not tombstoned (current-state). Temporal relay nodes with the same stable ID
-/// as a current-state tombstone are exempt — the tombstone reflects only the
+/// not deleted under latest-write-wins liveness (issue #469): a relay node
+/// re-ingested AFTER its own tombstone is live again, matching the coalesced
+/// `--data-dir` read. Temporal relay nodes with the same stable ID as a
+/// current-state tombstone are exempt — the tombstone reflects only the
 /// current state; the historical relay must still bridge its edges.
 pub(super) fn is_bfs_relay_node(
     record_id: &str,
     by_id: &std::collections::BTreeMap<&str, &GraphRecord>,
-    tombstoned_ids: &BTreeSet<&str>,
-    has_any_temporal_version: &BTreeSet<&str>,
+    liveness: &Liveness,
 ) -> bool {
-    if tombstoned_ids.contains(record_id) && !has_any_temporal_version.contains(record_id) {
+    if liveness.deleted(record_id) {
         return false;
     }
     let Some(rec) = by_id.get(record_id) else {
@@ -340,8 +341,8 @@ mod liveness_parity_tests {
                 end_byte: 10,
                 start_line: 1,
                 end_line: 2,
-                start_column: None,
-                end_column: None,
+                start_column: Some(0),
+                end_column: Some(10),
             }),
             Some(name.to_owned()),
             format!("symbol {name}"),

@@ -187,9 +187,10 @@ use serde::Serialize;
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     evidence::{
-        ArtifactRequest, CommandEvidenceRequest, EvidenceProvenance, ObservationRequest,
-        VerificationRequest, build_artifact_records, build_command_evidence_records,
-        build_observation_records, build_verification_records,
+        ArtifactRequest, CommandEvidenceRequest, EvidenceProvenance, FailureRequest,
+        ObservationRequest, VerificationRequest, build_artifact_records,
+        build_command_evidence_records, build_failure_records, build_observation_records,
+        build_verification_records,
     },
     freshness::{self, Freshness},
     identity,
@@ -3766,6 +3767,57 @@ pub(crate) enum WriteKind {
         /// Stable ID of a `CommandRun` record that produced this result.
         #[arg(long)]
         linked_command_evidence_id: Option<String>,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
+    /// Write a typed live-authored `Failure` record in the agent-memory domain.
+    ///
+    /// Records a failed attempt as a citable node: provenance (`agent_id`,
+    /// `agent_kind`, `session_id`, `observed_at`, `source_handle`) plus a
+    /// reserved failure kind and at least one resolvable target
+    /// (`--failed-on` for codegraph/artifact record IDs, `--references-task`
+    /// for project task record IDs). Missing required fields fail with a
+    /// machine-readable JSON envelope on stderr
+    /// (`{"code":"missing_field","field":"<name>"}`) that never echoes
+    /// the failure text.
+    Failure {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind (`codex`, `claude-code`, `vantage`, `rust-swe-agent`,
+        /// `human`, `other`); required.
+        #[arg(long, default_value = "")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash; required.
+        #[arg(long, default_value = "")]
+        source_handle: String,
+        /// Failure kind: `command_failure`, `patch_invalid`,
+        /// `assumption_rejected`, or `workflow_blocked`; required.
+        #[arg(long, default_value = "")]
+        failure_kind: String,
+        /// Failure description; required. Redacted and bounded to a 500-byte
+        /// excerpt before storage; never echoed in error output.
+        #[arg(long, default_value = "")]
+        text: String,
+        /// Shell exit code; only valid for `command_failure`/`patch_invalid`.
+        #[arg(long)]
+        exit_code: Option<i64>,
+        /// Canonical codegraph/artifact record IDs the attempt failed on
+        /// (`FAILED_ON` links; repeatable). At least one of `--failed-on` /
+        /// `--references-task` is required.
+        #[arg(long, num_args = 0..)]
+        failed_on: Vec<String>,
+        /// Canonical project task record IDs this failure relates to
+        /// (`REFERENCES_TASK` links; repeatable).
+        #[arg(long, num_args = 0..)]
+        references_task: Vec<String>,
         /// Output JSONL path for the produced records.
         #[arg(long, required = true)]
         out: PathBuf,

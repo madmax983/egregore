@@ -263,6 +263,22 @@ fn scan_repository_history_inner(
         ) {
             graph.push(record.with_temporal(commit.temporal()));
         }
+        // Inbound IMPORTS edges to imported Module/File targets (issue #444)
+        // for this commit's tree: each resolvable Rust `use` mints
+        // `File —IMPORTS→ Module|File`, stamped with the commit's temporal
+        // provenance like the CALLS/IMPLEMENTS passes above. `attribution` is
+        // this commit's per-commit index, built above. Fail-closed:
+        // unresolvable imports mint no edge.
+        let import_target_edges: Vec<GraphRecord> =
+            crate::languages::cross_file::cross_file_import_target_edges(
+                &repository_id,
+                &graph.records()[commit_records_start..],
+                &facts_by_file,
+                &attribution,
+            );
+        for record in import_target_edges {
+            graph.push(record.with_temporal(commit.temporal()));
+        }
         // Same-file resolution labeling (issue #134) over this commit's slice.
         crate::languages::cross_file::label_same_file_call_resolutions(
             &mut graph.records_mut()[commit_records_start..],

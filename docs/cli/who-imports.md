@@ -1,14 +1,19 @@
 # eg query who-imports
 
-List the files that import a module path — "who depends on this module?" — as
-a precise, citable importer inventory over the `Import` nodes the language
-extractors already mint (issue #444).
+List the files that import a module path — "who depends on this module?". The
+scan pipelines additionally mint inbound `IMPORTS` edges from each importing
+file to the resolved imported Module/File target (issue #444, second half),
+so the same importer relationship is traversable as graph edges — e.g. via
+`change-impact`'s `referencing_files` or a direct inbound-`IMPORTS` walk —
+without `jq` over the raw JSONL. This lane itself keeps matching the `Import`
+nodes the language extractors mint, which also covers imports the scan-time
+pass could not resolve to a module.
 
 ## Synopsis
 
 ```text
-eg query who-imports <MODULE-PATH> --graph <PATH>   [--crate <NAME>] [--repo <SELECTOR>] [--format json|text]
-eg query who-imports <MODULE-PATH> --data-dir <DIR> [--crate <NAME>] [--repo <SELECTOR>] [--format json|text]
+eg query who-imports <MODULE-PATH> --graph <PATH>   [--crate <NAME>] [--repo <SELECTOR>] [--at-head | --all-history] [--format json|text]
+eg query who-imports <MODULE-PATH> --data-dir <DIR> [--crate <NAME>] [--repo <SELECTOR>] [--at-head | --all-history] [--format json|text]
 ```
 
 This is a read-only lookup: it never re-parses source and never scans comment
@@ -30,6 +35,8 @@ is exercised at runtime.
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Read from a throwaway copy — the store is never mutated. |
 | `--crate <NAME>` | no | Unify a leading `crate::` with this crate name (see [crate-unification boundary](#crate-unification-boundary)). |
 | `--repo <SELECTOR>` | no | Restrict the importer set to one repository in a multi-repo store (see [query.md](query.md#repository-scope---repo-issue-67)). |
+| `--at-head` | no | Corpus selector (issue #427): head-anchor the current-state view to each repository's stamped HEAD, excluding imports removed at HEAD. The default over a `scan-history` store carrying a `source_snapshot`; mutually exclusive with `--all-history`. |
+| `--all-history` | no | Corpus selector (issue #427): read the union of all commit snapshots, so an import present only in an earlier commit still appears. Mutually exclusive with `--at-head`. |
 | `--format` | no | `json` (default) or `text`. |
 
 ## Semantics
@@ -152,13 +159,18 @@ eg query who-imports serde::Serialize --graph graph.jsonl
 
 ## Out of scope (this slice)
 
-- **No new schema.** This is a read-only query lane over existing `Import`
-  nodes; it adds no inbound `IMPORTS` edge, no node kind, and bumps no schema
-  or cache version.
-- **No crate-name inference.** `crate::` ↔ `<crate>::` unification is available
-  only via the explicit `--crate` flag (see the
-  [crate-unification boundary](#crate-unification-boundary)); relative `self` /
-  `super` prefixes are matched literally.
+- **No new schema.** `IMPORTS` edges already existed; the second half of issue
+  #444 adds the *target* shape (`File —IMPORTS→ Module|File`, "this file
+  imports this module") alongside the extractor's containment shape
+  (`File —IMPORTS→ Import`, "this file declares this `use`"). Edge IDs are
+  stable (`edge/IMPORTS/source/target`) and the pass is deterministic, so no
+  schema or cache version bump was needed.
+- **No crate-name guessing.** `crate::` ↔ `<crate_name>::` unification resolves
+  only from owning-crate facts (auxiliary-target name, manifest-stamped
+  attribution, workspace directory name — see
+  [crate-unification boundary](#crate-unification-boundary)); when no fact covers a record, the
+  forms stay distinct, and `--crate` overrides. Relative `self` / `super`
+  prefixes are matched literally.
 - **No `--at` / `--as-of` temporal pin.** A single-commit view is not offered.
   Corpus scope is instead controlled by `--at-head` / `--all-history`: over a
   `scan-history` graph the lane now defaults to the **HEAD-anchored** corpus and

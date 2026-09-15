@@ -45,7 +45,10 @@ backed up on the old version and restored on the new one. In-place open of a
 drained directory is the only migration path.
 
 Going forward this cannot recur: 0.2.0 writes WAL segments that carry labels as
-strings, so a hard-killed 0.2.0 writer replays correctly.
+strings, so a hard-killed 0.2.0 writer replays correctly. The `.albk` backup
+format introduced in 0.2.0 is evaluated in
+[`docs/cli/store-backup.md`](store-backup.md) — including the export-vs-backup
+distinction that must be documented before any backup/restore command ships.
 
 ## String-interner headroom
 
