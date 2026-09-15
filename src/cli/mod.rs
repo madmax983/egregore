@@ -87,6 +87,8 @@ mod forget_repo;
 mod sessions;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 mod blind_spots;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+mod track_record;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -172,6 +174,8 @@ pub(crate) use forget_repo::*;
 pub(crate) use sessions::*;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use blind_spots::*;
+// Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use track_record::*;
 
 use std::{
     collections::BTreeMap,
@@ -3475,6 +3479,51 @@ pub(crate) enum QuerySubcommand {
         /// Which code-target populations to evaluate.
         #[arg(long, default_value = "both")]
         kind: BlindSpotKindArg,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+    /// Rank agents by the downstream fate of their observations.
+    ///
+    /// One row per `agent_id` (with `agent_kind`), carrying deterministic
+    /// counts over: observations written; promotion outcomes split by
+    /// terminal verdict (`approved`, `edited_then_approved`, `rejected`,
+    /// `deferred`, `expired`) for candidates whose supporting evidence is
+    /// this agent's observations; observations later superseded
+    /// (`superseded_by`); and linked verification outcomes
+    /// (passed/failed/inconclusive) attributable to the agent's sessions.
+    ///
+    /// Trust is separated structurally: `observations_written` and
+    /// `superseded_observations` aggregate agent-authored claims,
+    /// `promotion_outcomes` aggregates recorded operator decisions, and
+    /// `verification_outcomes` aggregates recorded verification evidence —
+    /// the output never presents an agent's claim as source truth. Every
+    /// nonzero bucket cites resolvable `record_id` handles; an empty store
+    /// (or no qualifying agents) returns an explicit `no_agents` diagnostic
+    /// rather than silence.
+    ///
+    /// Rows sort canonically by `agent_id`; the answer is byte-stable across
+    /// repeated runs and platforms. JSON is the default; `--format text`
+    /// gives a skimmable table. Respects `--repo` scoping like the other
+    /// lanes; requires no network and no `--embed` store.
+    ///
+    /// This slice reports — it never gates, weights, throttles, or disables
+    /// agents, and it computes no learned reputation score: deterministic
+    /// counts over existing edges only.
+    ///
+    /// Documented in `docs/cli/agent-track-record.md`.
+    #[command(visible_alias = "agents")]
+    TrackRecord {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7777,6 +7826,34 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 kind.as_query(),
                 format,
             )
+        }
+        // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TrackRecord {
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #262): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_track_record_cmd(&records, selected.as_deref(), format)
         }
     }
 }

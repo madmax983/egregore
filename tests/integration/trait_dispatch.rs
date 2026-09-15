@@ -369,7 +369,7 @@ fn transitive_callees_enumerates_the_dispatch_boundary() {
         "the boundary must carry the typed reason"
     );
     assert!(
-        unresolved[0]["target_id"]
+        unresolved[0]["target_record_id"]
             .as_str()
             .is_some_and(|id| id == dispatch_marker(&f.records)["id"].as_str().unwrap_or("")),
         "the boundary must cite the marker node"

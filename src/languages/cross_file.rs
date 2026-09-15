@@ -1570,6 +1570,111 @@ fn join_segments(dir: &[String], suffix: &str) -> Option<String> {
     Some(segments.join("/"))
 }
 
+/// Per-body set of simple callee names with a trait-dispatch call site
+/// (issue #267). The per-file textual pass suppresses its own CALLS edge for
+/// these names (the repo-wide pass owns dispatch pairs now, same-file
+/// included), so the cross-file pass must emit the same-file pairs it would
+/// otherwise skip — for the dispatch sites AND for any static site in the same
+/// body that the textual pass no longer covers. Rebuilt from facts alone so
+/// history replay and the incremental cache agree with the extractor's
+/// suppression.
+fn dispatch_suppressed_names(facts: &FileFacts) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut suppressed: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for call in &facts.call_sites {
+        if call.dispatch_trait.is_some()
+            && let Some(simple_name) = call.callee_segments.last()
+        {
+            suppressed
+                .entry(call.caller_id.as_str())
+                .or_default()
+                .insert(simple_name.as_str());
+        }
+    }
+    suppressed
+}
+
+/// Emits the deduplicated cross-file `CALLS` edge records, attaching
+/// resolved call-site spans only to provably single-target pairs
+/// (issue #462; the #233 fabrication-guard discipline).
+fn emit_call_edge_records(
+    records: &mut Vec<GraphRecord>,
+    edges: BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
+) {
+    for ((source, target), (resolution, summary, spans)) in edges {
+        let confidence = match resolution {
+            CallResolution::Resolved => Some("1.0".to_owned()),
+            CallResolution::Ambiguous
+            | CallResolution::Unresolved
+            | CallResolution::UnresolvedDispatch => None,
+        };
+        let mut record = GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
+            .with_resolution(resolution);
+        // Only a provably single-target pair keeps its call-site spans; an
+        // ambiguous pair drops them even when a resolved site contributed
+        // (issue #462, the #233 fabrication-guard discipline).
+        if resolution == CallResolution::Resolved && !spans.is_empty() {
+            record = record.with_call_site_spans(spans);
+        }
+        records.push(record);
+    }
+}
+
+/// Emits the unresolved-call and unresolved-dispatch `Diagnostic` marker nodes
+/// plus their caller edges (issues #233, #267).
+fn emit_unresolved_records(
+    repository_id: &str,
+    records: &mut Vec<GraphRecord>,
+    diagnostics: &BTreeMap<(String, String), SourceSpan>,
+    dispatch_diagnostics: &BTreeMap<(String, String, String), SourceSpan>,
+    diagnostic_edges: BTreeMap<(String, String, String), String>,
+    dispatch_diagnostic_edges: BTreeMap<(String, String, String, String), String>,
+) {
+    for ((path, display), span) in diagnostics {
+        records.push(unresolved_call_diagnostic(
+            repository_id,
+            path,
+            display,
+            *span,
+        ));
+    }
+    for ((path, trait_path, method), span) in dispatch_diagnostics {
+        records.push(unresolved_dispatch_diagnostic(
+            repository_id,
+            path,
+            trait_path,
+            method,
+            *span,
+        ));
+    }
+    for ((path, display, caller_id), caller_name) in diagnostic_edges {
+        let target = unresolved_call_diagnostic_id(repository_id, &path, &display);
+        records.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                caller_id,
+                target,
+                None,
+                format!("{caller_name} calls {display} (cross-file, unresolved)"),
+            )
+            .with_resolution(CallResolution::Unresolved),
+        );
+    }
+    for ((path, trait_path, method, caller_id), caller_name) in dispatch_diagnostic_edges {
+        let target = unresolved_dispatch_diagnostic_id(repository_id, &path, &trait_path, &method);
+        let display = format!("{trait_path}::{method}");
+        records.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                caller_id,
+                target,
+                None,
+                format!("{caller_name} calls {display} (cross-file, unresolved_dispatch)"),
+            )
+            .with_resolution(CallResolution::UnresolvedDispatch),
+        );
+    }
+}
+
 /// Computes the cross-file call records for one scanned tree.
 ///
 /// Returned records are `Diagnostic` nodes for unresolved calls followed by
@@ -1607,19 +1712,31 @@ pub fn cross_file_call_records(
     };
     let index = DefinitionIndex::build(facts_by_file, remap.clone());
 
-    // (source, target) -> strongest resolution + summary, deduplicating
-    // repeated call sites between the same pair.
-    let mut edges: BTreeMap<(String, String), (CallResolution, String)> = BTreeMap::new();
+    // (source, target) -> (strongest resolution, summary, resolved call-site
+    // spans), deduplicating repeated call sites between the same pair. Spans
+    // are retained only from `Resolved` call sites and attached only when the
+    // pair's final resolution is `Resolved` (issue #462; the #233
+    // fabrication-guard discipline).
+    let mut edges: BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)> =
+        BTreeMap::new();
     // (file, callee display) -> first-seen span, for diagnostic nodes.
     let mut diagnostics: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
     // (file, callee display, caller ID) -> caller name, for unresolved edges.
     let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    // (file, dispatch trait path, method) -> first-seen span, for the typed
+    // issue #267 dispatch markers.
+    let mut dispatch_diagnostics: BTreeMap<(String, String, String), SourceSpan> = BTreeMap::new();
+    // (file, dispatch trait path, method, caller ID) -> caller name, for the
+    // typed dispatch-marker edges.
+    let mut dispatch_diagnostic_edges: BTreeMap<(String, String, String, String), String> =
+        BTreeMap::new();
 
     for (path, facts) in facts_by_file {
         let caller_crate_root = remap
             .get(path)
             .cloned()
             .unwrap_or_else(|| crate_root_id(path));
+        let dispatch_suppressed = dispatch_suppressed_names(facts);
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
@@ -1635,15 +1752,34 @@ pub fn cross_file_call_records(
                 continue;
             }
             let candidates = index.candidates(call, simple_name, &caller_crate_root);
+            let is_dispatch = call.dispatch_trait.is_some();
+            // Same-file pairs are emitted by the per-file textual pass for
+            // ordinary names; for dispatch-suppressed names that pass stays
+            // silent, so this pass emits them — dispatch sites always, and
+            // static sites in a dispatch-suppressed body too.
+            let emit_same_file = is_dispatch
+                || dispatch_suppressed
+                    .get(call.caller_id.as_str())
+                    .is_some_and(|names| names.contains(simple_name.as_str()));
             match candidates.len() {
                 0 => {
-                    record_unresolved(
-                        path,
-                        call,
-                        simple_name,
-                        &mut diagnostics,
-                        &mut diagnostic_edges,
-                    );
+                    if let Some(trait_path) = &call.dispatch_trait {
+                        record_unresolved_dispatch(
+                            path,
+                            call,
+                            trait_path,
+                            &mut dispatch_diagnostics,
+                            &mut dispatch_diagnostic_edges,
+                        );
+                    } else {
+                        record_unresolved(
+                            path,
+                            call,
+                            simple_name,
+                            &mut diagnostics,
+                            &mut diagnostic_edges,
+                        );
+                    }
                 }
                 1 => {
                     record_candidate_edge(
@@ -1652,6 +1788,7 @@ pub fn cross_file_call_records(
                         candidates[0],
                         CallResolution::Resolved,
                         1,
+                        emit_same_file,
                         &mut edges,
                     );
                 }
@@ -1663,6 +1800,7 @@ pub fn cross_file_call_records(
                             candidate,
                             CallResolution::Ambiguous,
                             n,
+                            emit_same_file,
                             &mut edges,
                         );
                     }
@@ -1672,39 +1810,15 @@ pub fn cross_file_call_records(
     }
 
     let mut records = Vec::new();
-    for ((path, display), span) in &diagnostics {
-        records.push(unresolved_call_diagnostic(
-            repository_id,
-            path,
-            display,
-            *span,
-        ));
-    }
-    for ((source, target), (resolution, summary)) in edges {
-        let confidence = match resolution {
-            CallResolution::Resolved => Some("1.0".to_owned()),
-            CallResolution::Ambiguous
-            | CallResolution::Unresolved
-            | CallResolution::UnresolvedDispatch => None,
-        };
-        records.push(
-            GraphRecord::edge(EdgeLabel::Calls, source, target, confidence, summary)
-                .with_resolution(resolution),
-        );
-    }
-    for ((path, display, caller_id), caller_name) in diagnostic_edges {
-        let target = unresolved_call_diagnostic_id(repository_id, &path, &display);
-        records.push(
-            GraphRecord::edge(
-                EdgeLabel::Calls,
-                caller_id,
-                target,
-                None,
-                format!("{caller_name} calls {display} (cross-file, unresolved)"),
-            )
-            .with_resolution(CallResolution::Unresolved),
-        );
-    }
+    emit_call_edge_records(&mut records, edges);
+    emit_unresolved_records(
+        repository_id,
+        &mut records,
+        &diagnostics,
+        &dispatch_diagnostics,
+        diagnostic_edges,
+        dispatch_diagnostic_edges,
+    );
     records.extend(cross_file_construct_records(repository_id, facts_by_file));
     records.extend(cross_file_route_records(repository_id, facts_by_file));
     records
@@ -2498,7 +2612,9 @@ fn normalize_absolute_trait_path(target: &str, module_names: &[String]) -> Optio
 /// repo-wide pass. Per-file `CALLS` edges with no corresponding call site
 /// (e.g. calls inside macro token trees, constructor-style matches) keep no
 /// resolution field — absence means "outside the resolution contract", never
-/// "resolved".
+/// "resolved". A pair labeled `resolved` also keeps the deduplicated spans of
+/// its `Resolved` call sites on the edge (`call_site_spans`, issue #462);
+/// `ambiguous` pairs keep none, per the #233 fabrication-guard discipline.
 ///
 /// The pass is deterministic: pair statuses come from `BTreeMap` iteration
 /// and repeated call sites for one pair keep the strongest status.
@@ -2517,6 +2633,7 @@ pub fn label_same_file_call_resolutions(
             target,
             confidence,
             resolution,
+            call_site_spans,
             ..
         } = record
         else {
@@ -2525,10 +2642,16 @@ pub fn label_same_file_call_resolutions(
         if resolution.is_some() {
             continue;
         }
-        let Some(status) = resolutions.get(&(source.clone(), target.clone())) else {
+        let Some((status, spans)) = resolutions.get(&(source.clone(), target.clone())) else {
             continue;
         };
         *resolution = Some(*status);
+        // A `Resolved` pair keeps its deduplicated call-site spans; an
+        // ambiguous pair drops them (issue #462, the #233 fabrication-guard
+        // discipline).
+        if *status == CallResolution::Resolved && !spans.is_empty() {
+            *call_site_spans = Some(spans.clone());
+        }
         if *status == CallResolution::Ambiguous {
             *confidence = None;
         }
@@ -2542,9 +2665,13 @@ pub fn label_same_file_call_resolutions(
 /// matches definitions in other files is `ambiguous`), but only pairs whose
 /// candidate lives in the caller's file are returned — cross-file pairs are
 /// emitted with their status by [`cross_file_call_records`].
+///
+/// The returned spans are the deduplicated call-site spans of the pair's
+/// `Resolved` call sites only (issue #462); ambiguous sites contribute none,
+/// per the #233 fabrication-guard discipline.
 fn same_file_call_resolutions(
     facts_by_file: &BTreeMap<String, FileFacts>,
-) -> BTreeMap<(String, String), CallResolution> {
+) -> BTreeMap<(String, String), (CallResolution, Vec<SourceSpan>)> {
     // Same aux-helper crate-root remap as the cross-file CALLS pass
     // (issue #475): a helper's call sites and definitions partition under the
     // including entry crate, so the repo-wide candidate count behind each
@@ -2585,10 +2712,17 @@ fn same_file_call_resolutions(
                     }
                     let entry = resolutions
                         .entry((call.caller_id.clone(), definition.id.clone()))
-                        .or_insert(status);
+                        .or_insert((status, Vec::new()));
                     // Prefer the strongest status when several call sites hit one pair.
-                    if status < *entry {
-                        *entry = status;
+                    if status < entry.0 {
+                        entry.0 = status;
+                    }
+                    // Only `Resolved` call sites contribute spans; ambiguous
+                    // sites are dropped even when the pair later resolves via
+                    // another site (issue #462, the #233 fabrication-guard
+                    // discipline).
+                    if status == CallResolution::Resolved && !entry.1.contains(&call.span) {
+                        entry.1.push(call.span);
                     }
                 }
                 continue;
@@ -2605,10 +2739,16 @@ fn same_file_call_resolutions(
                 }
                 let entry = resolutions
                     .entry((call.caller_id.clone(), candidate.id.clone()))
-                    .or_insert(status);
+                    .or_insert((status, Vec::new()));
                 // Prefer the strongest status when several call sites hit one pair.
-                if status < *entry {
-                    *entry = status;
+                if status < entry.0 {
+                    entry.0 = status;
+                }
+                // Only `Resolved` call sites contribute spans; ambiguous sites
+                // are dropped even when the pair later resolves via another
+                // site (issue #462, the #233 fabrication-guard discipline).
+                if status == CallResolution::Resolved && !entry.1.contains(&call.span) {
+                    entry.1.push(call.span);
                 }
             }
         }
@@ -2623,7 +2763,7 @@ fn record_block_local_edge(
     definition: &BlockLocalDefinitionFact,
     resolution: CallResolution,
     candidate_count: usize,
-    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
 ) {
     // A block-local def lives in the caller's own file by construction (the
     // scope gate only matches caller ids from the enclosing scope), so the
@@ -2651,10 +2791,17 @@ fn record_block_local_edge(
     let key = (call.caller_id.clone(), definition.id.clone());
     let entry = edges
         .entry(key)
-        .or_insert_with(|| (resolution, summary.clone()));
+        .or_insert_with(|| (resolution, summary.clone(), Vec::new()));
     // Prefer the strongest status when several call sites hit one pair.
     if resolution < entry.0 {
-        *entry = (resolution, summary);
+        entry.0 = resolution;
+        entry.1 = summary;
+    }
+    // Only `Resolved` call sites contribute spans; ambiguous sites are
+    // dropped even when the pair later resolves via another site (issue #462,
+    // the #233 fabrication-guard discipline).
+    if resolution == CallResolution::Resolved && !entry.2.contains(&call.span) {
+        entry.2.push(call.span);
     }
 }
 
@@ -2666,7 +2813,7 @@ fn record_block_local_edge(
 fn record_block_local_call(
     call: &CallSiteFact,
     block_locals: &[&BlockLocalDefinitionFact],
-    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
 ) -> bool {
     if block_locals.is_empty() {
         return false;
@@ -2688,11 +2835,22 @@ fn record_candidate_edge(
     candidate: &DefinitionFact,
     resolution: CallResolution,
     candidate_count: usize,
-    edges: &mut BTreeMap<(String, String), (CallResolution, String)>,
+    // Emit same-file (caller, candidate) pairs. `false` for ordinary names:
+    // the per-file textual pass already covers those and re-emitting would
+    // duplicate stable edge IDs. `true` for trait-dispatch call sites (issue
+    // #267 — dispatch pairs are repo-wide owned, same-file included) and for
+    // static sites in a dispatch-suppressed body (whose textual edge the
+    // per-file pass suppressed).
+    allow_same_file: bool,
+    edges: &mut BTreeMap<(String, String), (CallResolution, String, Vec<SourceSpan>)>,
 ) {
     // Same-file targets are already covered by the per-file reference pass;
-    // emitting them again would duplicate stable edge IDs.
-    if candidate.repo_relative_path == caller_path || candidate.id == call.caller_id {
+    // emitting them again would duplicate stable edge IDs. A self-call
+    // (candidate IS the caller) never emits: it is not a call between symbols.
+    if !allow_same_file && candidate.repo_relative_path == caller_path {
+        return;
+    }
+    if candidate.id == call.caller_id {
         return;
     }
     let summary = match resolution {
@@ -2712,10 +2870,17 @@ fn record_candidate_edge(
     let key = (call.caller_id.clone(), candidate.id.clone());
     let entry = edges
         .entry(key)
-        .or_insert_with(|| (resolution, summary.clone()));
+        .or_insert_with(|| (resolution, summary.clone(), Vec::new()));
     // Prefer the strongest status when several call sites hit one pair.
     if resolution < entry.0 {
-        *entry = (resolution, summary);
+        entry.0 = resolution;
+        entry.1 = summary;
+    }
+    // Only `Resolved` call sites contribute spans; ambiguous sites are
+    // dropped even when the pair later resolves via another site (issue #462,
+    // the #233 fabrication-guard discipline).
+    if resolution == CallResolution::Resolved && !entry.2.contains(&call.span) {
+        entry.2.push(call.span);
     }
 }
 
@@ -2759,6 +2924,79 @@ fn unresolved_call_diagnostic_id(repository_id: &str, path: &str, display: &str)
         "unresolved-call",
         display,
     ])
+}
+
+/// Records a trait-dispatch call site (issue #267) whose target set could not
+/// be reduced to a concrete in-crate symbol — the dispatch trait is not a
+/// unique local trait, or no in-crate type implements it. Unlike
+/// [`record_unresolved`], this ALWAYS mints the typed marker: a missing
+/// dispatch target is exactly the boundary the issue must enumerate, never a
+/// dropped miss. The marker is keyed by (file, trait path as written, method)
+/// so repeated sites share one node; each caller's edge cites its own span.
+fn record_unresolved_dispatch(
+    caller_path: &str,
+    call: &CallSiteFact,
+    trait_path: &str,
+    dispatch_diagnostics: &mut BTreeMap<(String, String, String), SourceSpan>,
+    dispatch_diagnostic_edges: &mut BTreeMap<(String, String, String, String), String>,
+) {
+    let method = call.callee_segments.last().cloned().unwrap_or_default();
+    dispatch_diagnostics
+        .entry((
+            caller_path.to_owned(),
+            trait_path.to_owned(),
+            method.clone(),
+        ))
+        .or_insert(call.span);
+    dispatch_diagnostic_edges
+        .entry((
+            caller_path.to_owned(),
+            trait_path.to_owned(),
+            method,
+            call.caller_id.clone(),
+        ))
+        .or_insert_with(|| call.caller_name.clone());
+}
+
+fn unresolved_dispatch_diagnostic_id(
+    repository_id: &str,
+    path: &str,
+    trait_path: &str,
+    method: &str,
+) -> String {
+    stable_id(&[
+        "node",
+        "diagnostic",
+        repository_id,
+        path,
+        "unresolved-dispatch",
+        trait_path,
+        method,
+    ])
+}
+
+/// The typed dispatch-boundary marker (issue #267): a `Diagnostic` node named
+/// `unresolved_dispatch: Trait::method` carrying the call-site span, targeted
+/// by a `resolution: "unresolved_dispatch"` CALLS edge. The trait path is the
+/// as-written form the extractor stamped, so the marker cites exactly what the
+/// source said.
+fn unresolved_dispatch_diagnostic(
+    repository_id: &str,
+    path: &str,
+    trait_path: &str,
+    method: &str,
+    span: SourceSpan,
+) -> GraphRecord {
+    let display = format!("{trait_path}::{method}");
+    GraphRecord::syntax_node(
+        unresolved_dispatch_diagnostic_id(repository_id, path, trait_path, method),
+        NodeKind::Diagnostic,
+        path.to_owned(),
+        span,
+        format!("unresolved_dispatch: {display}"),
+        "rust",
+        format!("unresolved trait-dispatch target {display} (no in-crate implementor method)"),
+    )
 }
 
 fn unresolved_call_diagnostic(
@@ -3028,6 +3266,102 @@ impl<'facts> DefinitionIndex<'facts> {
         }
     }
 
+    /// Resolves a provable trait-dispatch path (issue #267) to the
+    /// crate-root-relative qualified name of the UNIQUE LOCAL trait it names
+    /// within `crate_root`, or `None` when it is not such a unique local trait.
+    ///
+    /// The dispatch trait is reduced to its trailing simple segment and matched
+    /// against this crate root's impl-target index by that leaf, mirroring
+    /// [`resolve_receiver_type_owner`](Self::resolve_receiver_type_owner).
+    /// Resolution succeeds ONLY when exactly one distinct impl-target
+    /// qualified name in the root carries that leaf AND it is a trait
+    /// impl-target kind. An external trait, a non-trait type, or a leaf shared
+    /// by two local traits resolves to `None` (the call site mints a typed
+    /// `unresolved_dispatch` marker instead of guessing — prefer a MISSING
+    /// dispatch target over a WRONG one).
+    fn resolve_dispatch_trait(&self, crate_root: &str, trait_path: &str) -> Option<String> {
+        let leaf = trait_path.rsplit("::").next()?.trim();
+        if leaf.is_empty() {
+            return None;
+        }
+        let mut matched: Option<&str> = None;
+        for ((root, qualified), facts) in &self.impl_index.by_qualified {
+            if *root != crate_root {
+                continue;
+            }
+            let def_leaf = qualified.rsplit("::").next().unwrap_or(qualified);
+            if def_leaf != leaf {
+                continue;
+            }
+            if !facts.iter().any(|fact| fact.symbol_kind == "trait") {
+                continue;
+            }
+            if matched.is_some() {
+                // Two distinct local traits share the leaf: ambiguous, refuse.
+                return None;
+            }
+            matched = Some(qualified);
+        }
+        matched.map(str::to_owned)
+    }
+
+    /// Returns the in-crate implementor methods for a trait-dispatch call site
+    /// (issue #267): every callable `method` definition in the caller's crate
+    /// root whose owner segment is a type provably implementing the dispatch
+    /// trait, and whose simple name is `simple_name`.
+    ///
+    /// The implementor set comes from the [`ImplTraitRelationFact`] reverse
+    /// join (`implemented`: `(crate_root, impl_type) -> {trait qualified
+    /// names}`), keyed by the RESOLVED trait qualified name — never by the
+    /// method name alone, so an unrelated trait (or inherent method) that
+    /// merely shares the method name can never enter the set. A trait method
+    /// DECLARATION (kind `"function"` + `is_trait_method`) is not a callable
+    /// implementor and is excluded; only concrete `impl Trait for T` methods
+    /// (kind `"method"`) link.
+    ///
+    /// Modeling note: an inherent method and a trait-impl method of the SAME
+    /// type share the same `match_segments` tail (`[owner, name]`), exactly as
+    /// in the existing [`narrow_methods_to_owner`](Self::narrow_methods_to_owner)
+    /// static-call path — when a type defines both, the dispatch set admits
+    /// both symbols (the multi-target `Ambiguous` labeling records that the
+    /// set, not one edge, is the answer). Distinguishing them would need a new
+    /// serialized fact; the AC's phantom-edge bar is unrelated traits, which
+    /// the implementor join already excludes.
+    fn dispatch_candidates(
+        &self,
+        trait_path: &str,
+        simple_name: &str,
+        caller_crate_root: &str,
+    ) -> Vec<&'facts DefinitionFact> {
+        let Some(pool) = self.by_simple_name.get(simple_name) else {
+            return Vec::new();
+        };
+        let Some(trait_qualified) = self.resolve_dispatch_trait(caller_crate_root, trait_path)
+        else {
+            return Vec::new();
+        };
+        let mut implementors: BTreeSet<&str> = BTreeSet::new();
+        for ((root, impl_type), traits) in &self.implemented {
+            if root == caller_crate_root && traits.contains(&trait_qualified) {
+                implementors.insert(impl_type.as_str());
+            }
+        }
+        if implementors.is_empty() {
+            return Vec::new();
+        }
+        pool.iter()
+            .copied()
+            .filter(|definition| {
+                definition.symbol_kind == "method"
+                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
+                    && definition.match_segments.len() >= 2
+                    && implementors.contains(
+                        definition.match_segments[definition.match_segments.len() - 2].as_str(),
+                    )
+            })
+            .collect()
+    }
+
     /// Narrows a receiver-call method pool to a proven owner type's own methods
     /// (issue #441 shares this with the #420 `SelfMethod` self-dispatch path so
     /// the two can never desync). Given the owner's simple-leaf name and the
@@ -3157,6 +3491,16 @@ impl<'facts> DefinitionIndex<'facts> {
                 .filter(|definition| is_free_function(definition))
                 .collect(),
             CallKind::Method => {
+                // Trait-dispatch resolution (issue #267): a call whose receiver
+                // is syntactically PROVABLE as trait-typed (`&dyn Trait` or a
+                // `T: Trait` bound, stamped by the extractor) dispatches ONLY
+                // to the trait's in-crate implementor methods — never the broad
+                // same-name pool. This arm runs first: a dispatch site's
+                // candidate set is defined by its trait identity, and the
+                // receiver-type narrowing below is for CONCRETE receivers.
+                if let Some(trait_path) = &call.dispatch_trait {
+                    return self.dispatch_candidates(trait_path, simple_name, caller_crate_root);
+                }
                 // A receiver call `x.read()` can dispatch to an inherent impl
                 // method OR a trait method (issue #390). Trait methods keep kind
                 // `"function"`, so widen the pool by the marker.
@@ -4201,6 +4545,206 @@ mod tests {
             "two call sites for one pair must collapse to a single edge"
         );
         assert_eq!(records.len(), 1);
+    }
+
+    // ── Call-site span retention on edges (issue #462) ───────────────────
+
+    #[test]
+    fn resolved_cross_file_edge_retains_deduplicated_call_site_spans() {
+        let helper = definition("helper", "function", "src/a.rs", &["a", "helper"]);
+        let span_a = span_at(10, 16, 2, 2);
+        let span_b = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            ("src/a.rs", vec![helper], vec![]),
+            (
+                "src/b.rs",
+                vec![],
+                vec![
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                    call_at(
+                        "caller",
+                        "a::helper",
+                        &["a", "helper"],
+                        CallKind::Path,
+                        None,
+                        span_b,
+                    ),
+                    // A repeated call site at an already-seen span must not
+                    // duplicate the span on the edge.
+                    call_at(
+                        "caller",
+                        "helper",
+                        &["helper"],
+                        CallKind::Direct,
+                        None,
+                        span_a,
+                    ),
+                ],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        assert_eq!(records.len(), 1, "sites must still collapse to one edge");
+        let edge = &records[0];
+        assert_eq!(edge.resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            edge.call_site_spans(),
+            Some([span_a, span_b].as_slice()),
+            "a resolved edge must retain every distinct call-site span, in scan order"
+        );
+    }
+
+    #[test]
+    fn ambiguous_cross_file_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+            (
+                "src/c.rs",
+                vec![],
+                vec![call_at(
+                    "caller",
+                    "dupe",
+                    &["dupe"],
+                    CallKind::Direct,
+                    None,
+                    span_at(3, 7, 1, 1),
+                )],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let edges: Vec<&GraphRecord> = records
+            .iter()
+            .filter(|record| matches!(record, GraphRecord::Edge { .. }))
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "an ambiguous call must fan out to both candidates"
+        );
+        for edge in edges {
+            assert_eq!(edge.resolution(), Some(CallResolution::Ambiguous));
+            assert_eq!(
+                edge.call_site_spans(),
+                None,
+                "an ambiguous edge must not retain call-site spans (fabrication guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn same_file_resolved_edge_retains_call_site_spans() {
+        let span_a = span_at(10, 16, 2, 2);
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "helper",
+                "function",
+                "src/a.rs",
+                &["a", "helper"],
+            )],
+            vec![call_at(
+                "caller",
+                "helper",
+                &["helper"],
+                CallKind::Direct,
+                None,
+                span_a,
+            )],
+        )]);
+        let mut records = vec![per_file_calls_edge("caller", "helper")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([span_a].as_slice()),
+            "a resolved same-file edge must retain its call-site span"
+        );
+    }
+
+    #[test]
+    fn same_file_ambiguous_edge_carries_no_call_site_spans() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![call("caller", "dupe", &["dupe"], CallKind::Direct, None)],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Ambiguous));
+        assert_eq!(
+            records[0].call_site_spans(),
+            None,
+            "an ambiguous same-file edge must not retain call-site spans (fabrication guard)"
+        );
+    }
+
+    #[test]
+    fn same_file_mixed_pair_keeps_only_resolved_site_spans() {
+        // One pair, two call sites: a path-qualified site that resolves
+        // uniquely and a bare site that is ambiguous. The pair labels
+        // `resolved` (strongest wins) but only the resolved site's span may
+        // be retained — the ambiguous site's span is dropped, never promoted.
+        let resolved_span = span_at(10, 16, 2, 2);
+        let ambiguous_span = span_at(40, 46, 5, 5);
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![
+                    call_at(
+                        "caller",
+                        "a::dupe",
+                        &["a", "dupe"],
+                        CallKind::Path,
+                        None,
+                        resolved_span,
+                    ),
+                    call_at(
+                        "caller",
+                        "dupe",
+                        &["dupe"],
+                        CallKind::Direct,
+                        None,
+                        ambiguous_span,
+                    ),
+                ],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert_eq!(
+            records[0].call_site_spans(),
+            Some([resolved_span].as_slice()),
+            "only resolved call sites may contribute spans to a resolved edge"
+        );
     }
 
     // --- Cross-file IMPLEMENTS resolution (issue #344) ---------------------
@@ -5686,5 +6230,227 @@ mod tests {
             summary.contains("src/consumer.rs") && summary.contains("src/b.rs"),
             "summary must name importer and target, got {summary:?}"
         );
+    }
+
+    // ── Trait-dispatch resolution (issue #267) ────────────────────────────
+
+    /// Fixture for trait-dispatch resolution (issue #267): trait `Renderable`
+    /// implemented by `Circle` and `Square`, an unrelated inherent method that
+    /// merely shares the method name (`Speaker::render`), a trait with no
+    /// in-crate implementors (`Orphan`), and four dispatch shapes plus a static
+    /// control call.
+    fn dispatch_fixture() -> BTreeMap<String, FileFacts> {
+        workspace_facts(&[
+            ("crate_a/src/lib.rs", "pub mod shapes;\npub mod draw;\n"),
+            (
+                "crate_a/src/shapes.rs",
+                "pub trait Renderable { fn render(&self); }\n                 pub struct Circle;\n                 impl Renderable for Circle { fn render(&self) {} }\n                 pub struct Square;\n                 impl Renderable for Square { fn render(&self) {} }\n                 pub struct Speaker;\n                 impl Speaker { pub fn render(&self) {} }\n                 pub trait Orphan { fn orphan_render(&self); }\n",
+            ),
+            (
+                "crate_a/src/draw.rs",
+                "use crate::shapes::{Circle, Orphan, Renderable, Speaker};\n                 pub fn draw_static(c: &Circle) { c.render(); }\n                 pub fn draw_dyn(item: &dyn Renderable) { item.render(); }\n                 pub fn draw_generic<T: Renderable>(t: &T) { t.render(); }\n                 pub fn draw_where<T>(t: T) where T: Renderable { t.render(); }\n                 pub fn draw_orphan(o: &dyn Orphan) { o.orphan_render(); }\n                 pub fn draw_speaker(s: &Speaker) { s.render(); }\n",
+            ),
+        ])
+    }
+
+    /// Repo-relative paths of definitions reached by `ambiguous` CALLS edges,
+    /// alongside their resolution — mirrors `resolved_definition_hits`.
+    fn ambiguous_definition_hits(
+        records: &[GraphRecord],
+        facts: &BTreeMap<String, FileFacts>,
+    ) -> Vec<(String, String)> {
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        let mut hits: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.resolution() == Some(CallResolution::Ambiguous))
+            .filter_map(|r| match r {
+                GraphRecord::Edge { target, .. } => by_id
+                    .get(target.as_str())
+                    .map(|d| (d.repo_relative_path.clone(), d.simple_name.clone())),
+                _ => None,
+            })
+            .collect();
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    fn unresolved_dispatch_markers(records: &[GraphRecord]) -> Vec<String> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: crate::ir::NodeKind::Diagnostic,
+                    name: Some(name),
+                    ..
+                } if name.starts_with("unresolved_dispatch:") => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dyn_dispatch_links_every_in_crate_implementor() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let hits = ambiguous_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/shapes.rs".to_owned(), "render".to_owned())),
+            "dyn dispatch must reach an implementor's render: {hits:?}"
+        );
+        // Both implementors must be reachable from the dispatch call site —
+        // find the dispatch caller's outgoing ambiguous edges precisely.
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        let draw_dyn_id = facts["crate_a/src/draw.rs"]
+            .definitions
+            .iter()
+            .find(|d| d.simple_name == "draw_dyn")
+            .expect("draw_dyn defined")
+            .id
+            .clone();
+        let targets: Vec<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Edge {
+                    source,
+                    target,
+                    label: crate::ir::EdgeLabel::Calls,
+                    ..
+                } if source == &draw_dyn_id
+                    && r.resolution() == Some(CallResolution::Ambiguous) =>
+                {
+                    by_id
+                        .get(target.as_str())
+                        .map(|d| format!("{}::{}", d.repo_relative_path, d.simple_name))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets.len(),
+            2,
+            "draw_dyn must link exactly the two implementor methods: {targets:?}"
+        );
+        assert!(
+            targets.iter().all(|t| t == "crate_a/src/shapes.rs::render"),
+            "dispatch targets must be the implementor renders: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn generic_bound_dispatch_links_every_in_crate_implementor() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        for caller in ["draw_generic", "draw_where"] {
+            let caller_id = facts["crate_a/src/draw.rs"]
+                .definitions
+                .iter()
+                .find(|d| d.simple_name == caller)
+                .unwrap_or_else(|| panic!("{caller} defined"))
+                .id
+                .clone();
+            let targets: Vec<&DefinitionFact> = records
+                .iter()
+                .filter_map(|r| match r {
+                    GraphRecord::Edge { source, target, .. }
+                        if source == &caller_id
+                            && r.resolution() == Some(CallResolution::Ambiguous) =>
+                    {
+                        by_id.get(target.as_str()).copied()
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                2,
+                "{caller} must link exactly the two implementor methods"
+            );
+            assert!(
+                targets
+                    .iter()
+                    .all(|d| d.repo_relative_path == "crate_a/src/shapes.rs"
+                        && d.simple_name == "render"),
+                "{caller} targets must be the implementor renders"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_never_links_unrelated_same_named_methods() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        // Speaker::render is an inherent method that merely shares the name;
+        // no dispatch edge may target it.
+        let speaker_render = facts["crate_a/src/shapes.rs"]
+            .definitions
+            .iter()
+            .find(|d| d.simple_name == "render" && d.qualified_name.contains("Speaker"))
+            .map(|d| d.id.clone());
+        if let Some(speaker_id) = speaker_render {
+            let phantom = records.iter().any(|r| match r {
+                GraphRecord::Edge { target, .. } => {
+                    target == &speaker_id && r.resolution() == Some(CallResolution::Ambiguous)
+                }
+                _ => false,
+            });
+            assert!(
+                !phantom,
+                "dispatch must never link the unrelated same-named Speaker::render"
+            );
+        }
+        let _ = by_id;
+    }
+
+    #[test]
+    fn static_call_is_unchanged_by_dispatch() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/shapes.rs".to_owned(), "render".to_owned())),
+            "static call must still resolve: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn unimplementable_dispatch_mints_a_typed_marker() {
+        let facts = dispatch_fixture();
+        let records = cross_file_call_records("repo", &facts);
+        let markers = unresolved_dispatch_markers(&records);
+        assert_eq!(
+            markers.len(),
+            1,
+            "exactly one unresolved_dispatch marker is expected: {markers:?}"
+        );
+        assert!(
+            markers[0].contains("Orphan") && markers[0].contains("orphan_render"),
+            "marker must carry the trait+method handle: {:?}",
+            markers[0]
+        );
+        // The dispatch edge must carry the TYPED resolution, not `unresolved`.
+        let typed = records.iter().any(|r| {
+            r.resolution() == Some(CallResolution::UnresolvedDispatch)
+                && matches!(r, GraphRecord::Edge { .. })
+        });
+        assert!(typed, "dispatch edge must be unresolved_dispatch-typed");
     }
 }
