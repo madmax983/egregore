@@ -1423,6 +1423,19 @@ pub struct PackManifest {
     /// hand-edited pack strip this field to dodge the bind).
     #[serde(default)]
     pub section_requirements_binding_hash: String,
+    /// BLAKE3 binding hash tying `catalog_pin` + `control_id` to the pack's
+    /// section `(class, requirement)` pairs (issue #355 follow-up, "derive on
+    /// read"). Recomputed by `verify_pack`'s Integrity from the pack's own
+    /// carried data and compared, so a hand-edited `control_id` or
+    /// `catalog_pin` (selectively relabeling the pack to another control or
+    /// catalog) with a stale hash fails Integrity. `#[serde(default)]` keeps a
+    /// pre-bind pack parseable; such a pack carries an empty hash and FAILS
+    /// Integrity against the non-empty recompute, as intended — its
+    /// catalog/control claim is unbound (fail-closed, like
+    /// `section_requirements_binding_hash`; a legacy pass would let a
+    /// hand-edited pack strip this field to dodge the bind).
+    #[serde(default)]
+    pub control_catalog_binding_hash: String,
     /// The verbatim always-present disclaimer.
     pub disclaimer: String,
 }
@@ -3096,6 +3109,53 @@ fn hash_section_requirements(sections: &[EvidenceSection]) -> String {
     blake3::hash(serialized.as_bytes()).to_string()
 }
 
+/// Canonical BLAKE3 binding hash tying the pack's catalog pin and anchoring
+/// control to its section `(class, requirement)` pairs (issue #355 follow-up:
+/// `catalog_pin` re-derivation, "derive on read"). Computed at assemble into
+/// `PackManifest::control_catalog_binding_hash` and recomputed by
+/// `verify_pack`'s Integrity from the pack's OWN carried data — the pin's
+/// identity fields, `manifest.control_id`, and the bound section pairs — so an
+/// offline verify never needs the external catalog. A hand-edited `control_id`
+/// or `catalog_pin` field (selectively relabeling the pack to a different
+/// control or catalog) with a stale hash fails Integrity. Pairs are sorted by
+/// class so the hash is independent of section order; a domain tag keeps the
+/// hash distinct from any other bind. Uses the same `serde_json::to_string`
+/// canonicalization as `hash_section_requirements`, so byte-stability holds
+/// across runs.
+///
+/// Honest residual: the pin's `catalog_hash` remains an opaque echo — an
+/// offline verify cannot recompute the catalog's own hash without the catalog,
+/// so a full-recompute attacker who consistently rewrites the pin AND this
+/// binding hash achieves a self-consistent (but relabeled) pack. What the bind
+/// guarantees is no SELECTIVE relabel: `control_id`/`catalog_pin` cannot drift
+/// from the sections the verdicts were recomputed over, and no verdict can be
+/// upgraded beyond what the carried rows support.
+fn hash_control_catalog_binding(
+    pin: &CatalogPin,
+    control_id: &str,
+    sections: &[EvidenceSection],
+) -> String {
+    let mut pairs: Vec<(&str, &str)> = sections
+        .iter()
+        .map(|s| (s.class.as_str(), s.requirement.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    let payload = (
+        "control_catalog_binding_v1",
+        pin.catalog_id.as_str(),
+        (
+            pin.catalog_schema_version.domain.as_str(),
+            pin.catalog_schema_version.kind.as_str(),
+            pin.catalog_schema_version.version,
+        ),
+        pin.catalog_hash.as_str(),
+        control_id,
+        pairs,
+    );
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
 /// Recompute review-coverage applicability from the pack's own section
 /// requirements (issue #355 GAP D) — NEVER read
 /// `pack.verdicts.review_coverage.applicable` to gate a check; it is
@@ -4494,11 +4554,12 @@ pub fn assemble_pack(
 
     diagnostics.sort_by_key(diagnostic_sort_key);
 
+    let catalog_pin = pin(catalog);
     let manifest = PackManifest {
         control_id: control.control_id.clone(),
         control_title: control.title.clone(),
         window: window.clone(),
-        catalog_pin: pin(catalog),
+        catalog_pin: catalog_pin.clone(),
         egregore_version: egregore_version.to_owned(),
         captured_at: captured_at.map(str::to_owned),
         included_record_counts,
@@ -4507,6 +4568,11 @@ pub fn assemble_pack(
         min_review_coverage: Some(min_review_coverage),
         min_review_coverage_binding_hash: Some(hash_min_review_coverage(min_review_coverage)),
         section_requirements_binding_hash: hash_section_requirements(&sections),
+        control_catalog_binding_hash: hash_control_catalog_binding(
+            &catalog_pin,
+            control.control_id.as_str(),
+            &sections,
+        ),
         disclaimer: PACK_DISCLAIMER.to_owned(),
     };
 
@@ -5018,6 +5084,10 @@ fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
         "manifest.section_requirements_binding_hash".to_owned(),
         m.section_requirements_binding_hash.as_str(),
     ));
+    out.push((
+        "manifest.control_catalog_binding_hash".to_owned(),
+        m.control_catalog_binding_hash.as_str(),
+    ));
     out.push(("manifest.disclaimer".to_owned(), m.disclaimer.as_str()));
 
     for (i, s) in pack.sections.iter().enumerate() {
@@ -5213,6 +5283,24 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         integrity_passed = false;
         "section_requirements_binding_hash does not bind the manifest sections' \
          (class, requirement) pairs (section requirements tampered or unbound)"
+            .clone_into(&mut integrity_detail);
+    }
+    // Control/catalog binding (issue #355 follow-up: `catalog_pin` re-derivation,
+    // "derive on read"), recomputed from the pack's OWN carried data — no
+    // external catalog needed. Fail closed like `section_requirements_binding_hash`:
+    // a relabeled `control_id` or swapped `catalog_pin` with a stale hash is a
+    // selective-relabel forgery, and a pre-bind pack (empty stored hash) fails
+    // against the non-empty recompute, as intended.
+    if hash_control_catalog_binding(
+        &pack.manifest.catalog_pin,
+        &pack.manifest.control_id,
+        &pack.sections,
+    ) != pack.manifest.control_catalog_binding_hash
+    {
+        integrity_passed = false;
+        "control_catalog_binding_hash does not bind the manifest control_id and \
+         catalog pin to the sections' (class, requirement) pairs (control or \
+         catalog relabeled, or binding absent)"
             .clone_into(&mut integrity_detail);
     }
     // Review-coverage applicability recomputed from the pack's own BOUND section
@@ -6280,11 +6368,12 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             }
         }
     }
-    // TODO(#355): `catalog_pin` re-derivation (binding `manifest.control_id` /
-    // the control's class requirements back to the catalog the pin names) is
-    // deliberately out of scope: the pack does not carry the catalog, so an
-    // offline verify cannot recompute the pin. `review_coverage.applicable`
-    // recomputation (GAP D) is done — it keys on the bound section requirements.
+    // Issue #355 follow-up ("derive on read"): `catalog_pin` re-derivation is
+    // DONE — `manifest.control_catalog_binding_hash` binds `manifest.control_id`
+    // and the catalog pin's identity fields to the bound section
+    // `(class, requirement)` pairs, recomputed by `verify_pack` from the
+    // pack's own carried data (no external catalog needed). `review_coverage`
+    // recomputation (GAP D) keys on the bound section requirements.
     let integrity = VerificationVerdict {
         passed: integrity_passed,
         detail: integrity_detail,
@@ -11309,6 +11398,89 @@ mod pack338_tests {
             report.integrity.detail
         );
         assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): `manifest.control_id` is bound
+    /// to the catalog pin and the section requirements by
+    /// `manifest.control_catalog_binding_hash` — relabeling the pack to a
+    /// different control with a stale binding hash must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_control_id_relabelled_with_stale_binding_hash() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.control_id, "CC8.1");
+        pack.manifest.control_id = "CC7.2".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a relabeled control_id with a stale binding hash must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): `manifest.catalog_pin` is bound
+    /// to the control and the section requirements — swapping the pin to name
+    /// a different catalog with a stale binding hash must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_catalog_pin_swapped_with_stale_binding_hash() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.catalog_pin.catalog_id, "soc2-v1");
+        pack.manifest.catalog_pin.catalog_id = "other-catalog".to_owned();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a swapped catalog_pin with a stale binding hash must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): a pre-bind pack (no
+    /// `control_catalog_binding_hash`) is unbound and must FAIL Integrity
+    /// closed — like `section_requirements_binding_hash`, an absent bind is a
+    /// failure, never a legacy pass (otherwise stripping the field would dodge
+    /// the control/catalog bind).
+    #[test]
+    fn verify_fails_when_control_catalog_binding_hash_absent() {
+        let mut pack = assemble_cc81();
+        assert!(!pack.manifest.control_catalog_binding_hash.is_empty());
+        pack.manifest.control_catalog_binding_hash = String::new();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a pack with no control_catalog_binding_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 follow-up ("derive on read"): honest residual — a
+    /// full-recompute attacker who relabels the control AND recomputes the
+    /// binding hash achieves a self-consistent pack, which still verifies.
+    /// The bind guarantees no SELECTIVE relabel, not unforgeability against a
+    /// total rewrite; the pin's `catalog_hash` remains an opaque echo an
+    /// offline verify cannot recompute.
+    #[test]
+    fn verify_passes_when_control_catalog_binding_recomputed_after_relabel() {
+        let mut pack = assemble_cc81();
+        pack.manifest.control_id = "CC7.2".to_owned();
+        pack.manifest.control_catalog_binding_hash = hash_control_catalog_binding(
+            &pack.manifest.catalog_pin,
+            pack.manifest.control_id.as_str(),
+            &pack.sections,
+        );
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "a consistently recomputed binding hash must pass Integrity: {}",
+            report.integrity.detail
+        );
     }
 
     /// Issue #355 GAP D: an honestly-assembled `not_applicable` pack (a control
