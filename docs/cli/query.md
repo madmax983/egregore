@@ -36,7 +36,6 @@ eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--in
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
-eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
@@ -114,12 +113,6 @@ Evidence-backed audit subcommands have their own pages:
   domains, ranked riskiest-first by inbound structural reference count —
   the inverse question: which code does the graph know nothing about
   ([blind-spots.md](blind-spots.md), issue #265).
-- `eg query track-record` (alias `eg query agents`) — **per-agent track
-  record** over the downstream fate of agent-authored observations:
-  observations written, promotion outcomes by terminal verdict,
-  superseded observations, and linked verification outcomes — deterministic,
-  trust-separated, every nonzero bucket citing resolvable handles
-  ([agent-track-record.md](agent-track-record.md), issue #262).
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).

@@ -325,6 +325,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Daemon query verb set (v1):** [docs/schema/daemon-query.md](docs/schema/daemon-query.md)
 - **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)
 - **Evidence bundle CLI reference:** [docs/cli/bundle.md](docs/cli/bundle.md)
+- **Project configuration (`egregore.toml`) CLI reference:** [docs/cli/config.md](docs/cli/config.md)
 - Implementation plans: [docs/plans/](docs/plans/)
 
 ## Development

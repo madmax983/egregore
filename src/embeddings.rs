@@ -519,6 +519,32 @@ pub const SEMANTIC_INDEX_UNREADABLE_REMEDY: &str = "re-ingest the graph into a F
 /// is its own distinct verdict (AC4).
 const COMPARED_IDENTITY_FIELDS: [&str; 4] = ["provider", "name", "version", "content_hash"];
 
+/// Builds the embedding-model identity for the model the CLI's embedder was
+/// built from (issue #261).
+///
+/// The resolved model name — CLI `--embed-model` \> `[embeddings].model` \>
+/// built-in default — travels with the same provider, version, and
+/// content-hash constants the default embedder corresponds to.
+///
+/// Shared by the semantic-drift records and the vector-index identity node so
+/// the two can never describe the "same" model differently. The dimension is
+/// the measured one the model actually produced (or the declared default when
+/// the model was never loaded, e.g. a zero-candidate graph).
+#[must_use]
+pub fn embedding_model_identity(name: &str, dim: usize) -> EmbeddingModel {
+    EmbeddingModel {
+        provider: DEFAULT_EMBEDDING_MODEL_PROVIDER.to_owned(),
+        name: name.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Saturating conversion: `try_from` only fails when `dim` exceeds
+        // `u32::MAX`, and then the identity records the saturated maximum.
+        dim: u32::try_from(dim)
+            .ok()
+            .map_or(u32::MAX, std::convert::identity),
+        content_hash: DEFAULT_EMBEDDING_MODEL_CONTENT_HASH.to_owned(),
+    }
+}
+
 /// Builds the embedding-model identity the CLI's default embedder corresponds
 /// to, from the same compile-time constants [`crate::cli`] builds the embedder
 /// from.
@@ -527,13 +553,7 @@ const COMPARED_IDENTITY_FIELDS: [&str; 4] = ["provider", "name", "version", "con
 /// the two can never describe the "same" model differently.
 #[must_use]
 pub fn default_embedding_model_identity(dim: usize) -> EmbeddingModel {
-    EmbeddingModel {
-        provider: DEFAULT_EMBEDDING_MODEL_PROVIDER.to_owned(),
-        name: DEFAULT_EMBEDDING_MODEL_NAME.to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        dim: u32::try_from(dim).unwrap_or(u32::MAX),
-        content_hash: DEFAULT_EMBEDDING_MODEL_CONTENT_HASH.to_owned(),
-    }
+    embedding_model_identity(DEFAULT_EMBEDDING_MODEL_NAME, dim)
 }
 
 /// Stable record ID of a store's vector-index identity node (issue #104).

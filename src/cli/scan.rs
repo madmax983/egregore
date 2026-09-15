@@ -1,23 +1,46 @@
 use super::*;
 
-pub(crate) fn scan(
-    repo_path: &Path,
-    out: &Path,
-    repo_id_override: Option<&str>,
-    raw_literals: bool,
-) -> Result<()> {
+/// Scan a repository and write graph JSONL, resolving flags against the
+/// checked-in `egregore.toml` (issue #261).
+///
+/// A config-pinned `scan.transaction_time` governs the whole scan instant —
+/// transaction time, coverage-generation stamp, and `producer_started_at` — so
+/// two runs sharing the checked-in config produce byte-for-byte identical
+/// graph JSONL. With no pin the historical wall-clock path runs, unchanged.
+pub(crate) fn scan(repo_path: &Path, out: &Path, args: &ResolvedScanArgs) -> Result<()> {
+    warn_on_unconsumed_scope_pins();
     // Exclude the graph output and any in-tree egregore store from the dirty probe
     // (PR #186 E/FF1): a pre-existing graph.jsonl or .egregore data-dir from a
     // previous workflow must not stamp `dirty = true` on the new scan output.
     let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
-    let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
+    let graph = args
+        .transaction_time
+        .as_deref()
+        .map_or_else(
+            || {
+                scan_repository_with_exclusions(
+                    repo_path,
+                    args.repo_id_override.as_deref(),
+                    &exclusions,
+                )
+            },
+            |pinned| {
+                crate::scan_repository_at_with_exclusions(
+                    repo_path,
+                    pinned,
+                    args.repo_id_override.as_deref(),
+                    &exclusions,
+                )
+            },
+        )
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
-    let repo_identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    let repo_identity =
+        identity::compute_repository_identity(repo_path, args.repo_id_override.as_deref());
     let (repository_id, _) = crate::repository_record_from_identity(&repo_identity);
 
     let mut records = graph.into_records();
-    crate::redaction::redact_code_graph(&mut records, raw_literals, &repository_id);
+    crate::redaction::redact_code_graph(&mut records, args.raw_literals, &repository_id);
     let graph = Graph::from_records(records);
 
     print_scan_coverage(&graph);
@@ -73,12 +96,8 @@ fn print_scan_coverage(graph: &Graph) {
     );
 }
 
-pub(crate) fn scan_history(
-    repo_path: &Path,
-    out: &Path,
-    repo_id_override: Option<&str>,
-    raw_literals: bool,
-) -> Result<()> {
+pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs) -> Result<()> {
+    warn_on_unconsumed_scope_pins();
     // AC5: Verify git is available in PATH.
     let git_available = std::process::Command::new("git")
         .arg("--version")
@@ -139,14 +158,15 @@ pub(crate) fn scan_history(
     // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
     // companion store cannot affect it, and no dirty-probe exclusions are needed
     // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
-    let graph = scan_repository_history_with_override(repo_path, repo_id_override)
+    let graph = scan_repository_history_with_override(repo_path, args.repo_id_override.as_deref())
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
 
-    let repo_identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    let repo_identity =
+        identity::compute_repository_identity(repo_path, args.repo_id_override.as_deref());
     let (repository_id, _) = crate::repository_record_from_identity(&repo_identity);
 
     let mut records = graph.into_records();
-    crate::redaction::redact_code_graph(&mut records, raw_literals, &repository_id);
+    crate::redaction::redact_code_graph(&mut records, args.raw_literals, &repository_id);
     let graph = Graph::from_records(records);
 
     let jsonl = graph
@@ -215,8 +235,22 @@ pub(crate) fn scan_refresh_cmd(
     cache: Option<&Path>,
     format: OutputFormat,
     #[cfg(feature = "embeddings")] embed: bool,
+    #[cfg(feature = "embeddings")] embed_model: Option<String>,
     raw_literals: bool,
 ) -> Result<()> {
+    // Resolve the checked-in config (issue #261): fail fast on a malformed
+    // file, warn on scope pins the refresh does not consume, and let the
+    // config pin the redaction behavior and repository identity. The data dir
+    // itself was already resolved (flag > config > default) by the dispatcher.
+    warn_on_unconsumed_scope_pins();
+    let loaded = cli_project_config();
+    let config = loaded.as_ref().map(|loaded| &loaded.config);
+    let (raw_literals, _) = crate::project_config::resolve_flag(
+        raw_literals,
+        config.and_then(|c| c.redaction.raw_literals),
+    );
+    let repo_id_override = config.and_then(|c| c.repo_id_override.as_deref());
+
     // AC9: The embedded store must already exist before we can refresh it.
     if !data_dir.exists() {
         eprintln!(
@@ -243,7 +277,8 @@ pub(crate) fn scan_refresh_cmd(
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
         {
-            let current_identity = crate::identity::compute_repository_identity(repo_path, None);
+            let current_identity =
+                crate::identity::compute_repository_identity(repo_path, repo_id_override);
             if current_identity.id != cached_repo_id {
                 eprintln!(
                     r#"{{"code":"repository_identity_mismatch","cached_id":"{}","current_id":"{}","message":"cache at {} was built for a different repository; delete it and re-run from `eg scan`"}}"#,
@@ -277,7 +312,13 @@ pub(crate) fn scan_refresh_cmd(
     // Open the embedded store and ingest the incremental graph.
     #[cfg(feature = "embeddings")]
     let mut sink = if embed {
-        let (vectors, dimensions, model) = generate_embeddings(&records)?;
+        // Resolve the embedding model (issue #261): `--embed-model` >
+        // `[embeddings].model` > built-in default. The resolved name is what
+        // the embedder loads AND what the refreshed identity records; the
+        // write-time conflict refusal below still prevents blending two
+        // vector spaces when the resolved model differs from the index's.
+        let (embed_model, _) = resolve_embed_model(embed_model);
+        let (vectors, dimensions, model) = generate_embeddings(&records, &embed_model)?;
         let sink = EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
         // Refuse before writing anything when the index was built by a different
@@ -334,7 +375,7 @@ pub(crate) fn scan_refresh_cmd(
     // scan of a dirty tree behaves. The snapshot was just computed from the
     // current tree, so classifying it against itself yields the same verdict a
     // follow-up freshness check would, without re-probing Git.
-    let refresh_identity = identity::compute_repository_identity(repo_path, None);
+    let refresh_identity = identity::compute_repository_identity(repo_path, repo_id_override);
     let freshness_after_refresh = freshness::stored_snapshot(&records, &refresh_identity.id)
         .map_or(Freshness::Unknown, |snapshot| {
             freshness::classify(Some(snapshot), &snapshot.head, snapshot.dirty)
