@@ -107,6 +107,8 @@ pub mod schema_constraints;
 pub mod schema_version;
 /// SCIP code-intelligence export (issue #233).
 pub mod scip;
+/// Calibrated confidence floor and abstention for semantic search (issue #263).
+pub mod semantic_confidence;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
 /// Transitive memory supersession and contradiction resolution (issue #92).

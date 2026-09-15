@@ -385,15 +385,7 @@ pub fn unreferenced_symbols<'a>(
         if !UNREFERENCED_REFERENCE_LABELS.contains(label) {
             continue;
         }
-        // Issue #267: an `unresolved_dispatch` boundary edge targets the typed
-        // Diagnostic marker, not a symbol — handled exactly like an ordinary
-        // unresolved call.
-        if *label == EdgeLabel::Calls
-            && matches!(
-                *resolution,
-                Some(CallResolution::Unresolved | CallResolution::UnresolvedDispatch)
-            )
-        {
+        if *label == EdgeLabel::Calls && *resolution == Some(CallResolution::Unresolved) {
             // The target is a Diagnostic marker, not a symbol: the callee has
             // no in-repo definition the graph could see. The edge is
             // attributed through its SOURCE symbol (a caller in the

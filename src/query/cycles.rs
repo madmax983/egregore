@@ -87,9 +87,6 @@ pub struct DependencyCycleCounts {
     /// `CALLS` edges labeled `ambiguous`, excluded from cycle detection.
     pub calls_ambiguous_excluded: usize,
     /// `CALLS` edges labeled `unresolved`, excluded from cycle detection.
-    /// Issue #267 `unresolved_dispatch` boundary edges are tallied here too:
-    /// they target a Diagnostic marker, never a symbol, and are excluded
-    /// exactly like ordinary unresolved calls.
     pub calls_unresolved_excluded: usize,
     /// Cross-file `CALLS` edges carrying no resolution label (older or
     /// third-party stores predating issues #152/#134), excluded from cycle
@@ -399,10 +396,7 @@ pub fn dependency_cycles<'a>(
                 result.counts.calls_ambiguous_excluded += 1;
                 continue;
             }
-            // Issue #267: a trait-dispatch boundary edge targets a Diagnostic
-            // marker, never a symbol — it cannot close a cycle. Excluded and
-            // tallied exactly like an ordinary unresolved call.
-            Some(CallResolution::Unresolved | CallResolution::UnresolvedDispatch) => {
+            Some(CallResolution::Unresolved) => {
                 result.counts.calls_unresolved_excluded += 1;
                 continue;
             }

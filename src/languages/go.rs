@@ -1,6 +1,6 @@
 //! Go Tree-sitter extraction.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use tree_sitter::{Node, Parser};
 
@@ -374,12 +374,7 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
     }
 
     fn emit_reference_edges(&mut self) {
-        emit_reference_edges(
-            self.graph,
-            &self.definitions,
-            &self.symbol_bodies,
-            &BTreeSet::new(),
-        );
+        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
     /// Resolves deferred `Implements` edges for embedded types now that every

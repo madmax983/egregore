@@ -182,36 +182,6 @@ pub(crate) fn write_evidence(kind: WriteKind) -> Result<()> {
                 build_verification_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
             write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
         }
-        WriteKind::Failure {
-            agent_id,
-            agent_kind,
-            session_id,
-            observed_at,
-            source_handle,
-            failure_kind,
-            text,
-            exit_code,
-            failed_on,
-            references_task,
-            out,
-        } => {
-            let req = FailureRequest {
-                provenance: EvidenceProvenance {
-                    agent_id,
-                    agent_kind,
-                    session_id,
-                    observed_at,
-                    source_handle: Some(source_handle),
-                },
-                failure_kind,
-                text,
-                exit_code,
-                failed_on,
-                references_task,
-            };
-            let outcome = build_failure_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
-            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
-        }
     }
 }
 
