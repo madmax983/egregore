@@ -1207,6 +1207,17 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                     ) {
                         continue;
                     }
+                    // An `IMPORTS` edge is followed only in its containment
+                    // shape (`File —IMPORTS→ Import`): the issue-#444
+                    // module-target edge (`File —IMPORTS→ Module|File`) is a
+                    // dependency edge into ANOTHER file's tree, and following
+                    // it would leak the imported module's symbols into this
+                    // file's context.
+                    if matches!(label, EdgeLabel::Imports)
+                        && !matches!(target_kind, Some(NodeKind::Import))
+                    {
+                        continue;
+                    }
                     if let Some(t) = id_ref(target.as_str())
                         && !source_facts.contains(t)
                     {

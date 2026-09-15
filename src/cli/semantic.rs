@@ -140,7 +140,7 @@ pub(crate) fn scope_and_rank_semantic_matches(
     matches: &mut Vec<SemanticMatch>,
     under: Option<&str>,
     limit: usize,
-) -> usize {
+) {
     if let Some(prefix) = under {
         matches.retain(|m| {
             m.repo_relative_path
@@ -153,12 +153,7 @@ pub(crate) fn scope_and_rank_semantic_matches(
             .total_cmp(&a.score)
             .then_with(|| a.record_id.cmp(&b.record_id))
     });
-    // Return the scoped candidate count BEFORE truncation (issue #263): the
-    // abstention verdict reports `total_candidates` over the full pool, not
-    // the `--limit` window.
-    let total_candidates = matches.len();
     matches.truncate(limit);
-    total_candidates
 }
 
 /// Which empty-result outcome `eg query semantic` reports when the final match
@@ -356,42 +351,10 @@ pub(crate) fn query_semantic(
 
     // Subsystem scoping (issue #198) is applied to the full candidate pool BEFORE
     // the top-N cap (AC4); the same helper also imposes canonical ordering (AC7).
-    // It returns the scoped candidate count before truncation (issue #263).
-    let total_candidates = scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
+    scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
 
     if matches.is_empty() {
         report_empty_semantic_result(under_prefix, index_has_hits, false);
-    }
-
-    // Calibrated confidence floor (issue #263): if the best scoped candidate
-    // scores below the floor, abstain with an explicit verdict instead of
-    // presenting a weak top hit as an authoritative answer. This is a
-    // successful, deliberate answer (exit 0), distinct from the exit-2
-    // no-match path above (no semantic index, or scope matched zero).
-    // `matches` is non-empty here and canonically ordered, so the first row
-    // holds the highest score of the full scoped pool (truncation keeps the
-    // top).
-    let best_score = matches[0].score;
-    if crate::semantic_confidence::should_abstain(best_score) {
-        let verdict = crate::semantic_confidence::SemanticAbstention::new(
-            query,
-            best_score,
-            total_candidates,
-        );
-        match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string(&verdict)?);
-            }
-            OutputFormat::Text => {
-                println!(
-                    "no_confident_match: no candidate cleared the confidence floor {} (best score {:.4}, {} candidates)",
-                    crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
-                    best_score,
-                    total_candidates,
-                );
-            }
-        }
-        return Ok(());
     }
 
     for m in &matches {
@@ -913,36 +876,6 @@ pub(crate) fn query_semantic_via_daemon(
         std::process::exit(2);
     }
 
-    // Calibrated confidence floor (issue #263), applied client-side: confidence
-    // is a pure function of score, so the daemon's rows can be enriched without
-    // a daemon protocol change. The rows are canonically ordered by the daemon
-    // (score descending), so the first row holds the best score.
-    // The f64->f32 cast is safe: scores are cosine similarities in [0,1], and
-    // the precision loss is negligible for a threshold comparison.
-    #[allow(clippy::cast_possible_truncation)]
-    let best_score = records[0]
-        .get("score")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0) as f32;
-    if crate::semantic_confidence::should_abstain(best_score) {
-        let verdict =
-            crate::semantic_confidence::SemanticAbstention::new(query, best_score, records.len());
-        match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string(&verdict)?);
-            }
-            OutputFormat::Text => {
-                println!(
-                    "no_confident_match: no candidate cleared the confidence floor {} (best score {:.4}, {} candidates)",
-                    crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
-                    best_score,
-                    records.len(),
-                );
-            }
-        }
-        return Ok(());
-    }
-
     for rec in &records {
         print_daemon_semantic_record(rec, format)?;
     }
@@ -957,46 +890,13 @@ pub(crate) fn print_daemon_semantic_record(
     rec: &serde_json::Value,
     format: OutputFormat,
 ) -> Result<()> {
-    // Issue #263: enrich daemon rows client-side with the calibrated
-    // confidence fields. Confidence is a pure function of score, so no daemon
-    // protocol change is needed.
-    // The f64->f32 cast is safe: scores are cosine similarities in [0,1], and
-    // the precision loss is negligible for a threshold comparison.
-    let mut enriched = rec.clone();
-    if let Some(obj) = enriched.as_object_mut() {
-        #[allow(clippy::cast_possible_truncation)]
-        let score = obj
-            .get("score")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0) as f32;
-        obj.insert(
-            "confidence_band".to_string(),
-            serde_json::Value::String(
-                crate::semantic_confidence::ConfidenceBand::of(score)
-                    .as_str()
-                    .to_string(),
-            ),
-        );
-        obj.insert(
-            "selection_threshold".to_string(),
-            serde_json::Value::from(crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR),
-        );
-        obj.insert(
-            "selection_basis".to_string(),
-            serde_json::Value::String(
-                crate::semantic_confidence::SEMANTIC_SELECTION_BASIS.to_string(),
-            ),
-        );
-    }
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string(&enriched)?),
+        OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
         OutputFormat::Text => {
-            let record_id = enriched["record_id"].as_str().unwrap_or("(unknown)");
-            let score = enriched["score"].as_f64().unwrap_or(0.0);
-            let path = enriched["repo_relative_path"]
-                .as_str()
-                .unwrap_or("(unknown)");
-            let line = enriched["span"]["start_line"].as_u64();
+            let record_id = rec["record_id"].as_str().unwrap_or("(unknown)");
+            let score = rec["score"].as_f64().unwrap_or(0.0);
+            let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");
+            let line = rec["span"]["start_line"].as_u64();
             let location = line.map_or_else(
                 || path.to_owned(),
                 |start_line| format!("{path}:{start_line}"),
@@ -1385,9 +1285,6 @@ mod semantic_contract {
             span: Some(full_span()),
             repository_id: Some("codegraph:v1:repo"),
             repository: Some("acme/widget"),
-            confidence_band: "strong",
-            selection_threshold: 0.55,
-            selection_basis: "corpus_calibrated_confidence_floor",
         };
         let json =
             serde_json::to_value(&result).expect("SemanticResult must serialize to JSON value");
@@ -1437,9 +1334,6 @@ mod semantic_contract {
             span: None,
             repository_id: None,
             repository: None,
-            confidence_band: "weak",
-            selection_threshold: 0.55,
-            selection_basis: "corpus_calibrated_confidence_floor",
         };
         let json = serde_json::to_value(&result).expect("serialize");
 

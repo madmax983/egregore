@@ -91,8 +91,6 @@ mod query_symbols;
 mod query_undocumented;
 mod query_unreferenced;
 mod query_unsafe_sites;
-// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-mod query_blind_spots;
 mod query_unwrap_expect;
 mod query_verification_coverage;
 mod query_verification_freshness;
@@ -114,7 +112,6 @@ mod scan_logs;
 mod schema_constraints;
 mod schema_versioning;
 mod scip_export;
-mod semantic_confidence;
 mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_index_identity;

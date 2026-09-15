@@ -472,6 +472,11 @@ fn scan_repository_incremental_at_inner(
         .filter(|(_, cached_file)| !cached_file.facts.is_empty())
         .map(|(path, cached_file)| (path.clone(), cached_file.facts.clone()))
         .collect();
+    // Declared Cargo manifests, harvested BEFORE the cross-file passes: the
+    // import-target pass resolves absolute `<crate_name>::…` imports against
+    // owning-package names. Harvesting is a pure function of the repo root.
+    let manifest_facts = crate::manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate::crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
     let mut cross_file_records = cross_file_call_records(&repository_id, &facts_by_file);
     // Repo-wide cross-file trait resolution (issue #344): recomputed from the
     // same `facts_by_file` as the CALLS pass, so a change on either side of an
@@ -482,6 +487,20 @@ fn scan_repository_incremental_at_inner(
         &repository_id,
         &facts_by_file,
     ));
+    // Inbound IMPORTS edges to imported Module/File targets (issue #444):
+    // recomputed from the same assembled graph as the CALLS pass, so an
+    // import added, removed, or retargeted re-derives its edge here. Folded
+    // into the same stream and ID set so stale edges are tombstoned on
+    // removal exactly like cross-file CALLS edges. Fail-closed: unresolvable
+    // imports mint no edge.
+    cross_file_records.extend(
+        crate::languages::cross_file::cross_file_import_target_edges(
+            &repository_id,
+            graph.records(),
+            &facts_by_file,
+            &attribution,
+        ),
+    );
     let cross_file_ids: BTreeSet<String> = cross_file_records
         .iter()
         .map(|record| record.id().to_owned())
@@ -553,8 +572,8 @@ fn scan_repository_incremental_at_inner(
     // renamed, added, or deleted. Recomputing here — the same "never cached,
     // always recomputed" class as `label_same_file_call_resolutions` — is what
     // keeps a refresh and a full scan of the same tree in exact agreement.
-    let manifest_facts = crate::manifest_deps::scan_manifest_package_facts(repo_root)?;
-    let attribution = crate::crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    // The index was built above for the import-target pass; only the stamping
+    // runs here.
     crate::crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135), previously emitted only by the

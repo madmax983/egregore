@@ -84,8 +84,6 @@ mod who_constructs;
 mod forget_repo;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 mod sessions;
-// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-mod blind_spots;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -168,8 +166,6 @@ pub(crate) use who_constructs::*;
 pub(crate) use forget_repo::*;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use sessions::*;
-// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-pub(crate) use blind_spots::*;
 
 use std::{
     collections::BTreeMap,
@@ -3393,44 +3389,6 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
-    // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-    /// List code targets (symbols and/or files) with zero cross-domain
-    /// evidence edges into the agent-memory, verification, or project
-    /// domains, ranked riskiest-first by inbound structural reference count.
-    ///
-    /// A target is a blind spot when no live, current-state edge with one of
-    /// the documented evidence classes (`OBSERVES`, `MENTIONS_SYMBOL`,
-    /// `TOUCHED_FILE`, `FAILED_ON`, `TOUCHES_FILE`) targets it from a node in
-    /// the agent-memory, verification, or project domains — i.e. no linked
-    /// observation, verification record, or task. Evidence does not inherit
-    /// between a file and its symbols.
-    ///
-    /// Every row is a triage lead, never a verdict: absence of recorded
-    /// evidence is not evidence the code is unimportant, untested, or
-    /// unsafe. An empty blind-spot set is an explicit machine-readable
-    /// success: exit 0, `ok:true`, an empty `blind_spots` array, and a
-    /// `no_blind_spots` diagnostic — distinct from the `no_targets`
-    /// diagnostic of a target-free store and from a store-absent error
-    /// (exit 1).
-    ///
-    /// Documented in `docs/cli/blind-spots.md`.
-    BlindSpots {
-        /// Graph JSONL path (mutually exclusive with --data-dir).
-        #[arg(long)]
-        graph: Option<PathBuf>,
-        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Restrict the evaluated targets to one repository in a multi-repo store.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Which code-target populations to evaluate.
-        #[arg(long, default_value = "both")]
-        kind: BlindSpotKindArg,
-        /// Output format.
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
-    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -4875,13 +4833,6 @@ pub(crate) struct SemanticResult<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
-    /// Confidence band for this row (issue #263): `strong` when
-    /// `score >= SEMANTIC_CONFIDENCE_FLOOR`, else `weak`.
-    confidence_band: &'static str,
-    /// The calibrated floor this row was judged against (issue #263).
-    selection_threshold: f32,
-    /// How the floor was set (issue #263); mirrors drift's `selection_basis`.
-    selection_basis: &'static str,
 }
 
 #[cfg(feature = "embeddings")]
@@ -4896,9 +4847,6 @@ impl<'a> SemanticResult<'a> {
             span: m.span,
             repository_id,
             repository: repository_id.and_then(|id| index.display_of(id)),
-            confidence_band: crate::semantic_confidence::ConfidenceBand::of(m.score).as_str(),
-            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
-            selection_basis: crate::semantic_confidence::SEMANTIC_SELECTION_BASIS,
         }
     }
 }
@@ -7508,36 +7456,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let repository_id = resolve_repo_scope(&index, Some(repo.as_str()))
                 .expect("a required selector always resolves or exits");
             query_sessions_cmd(&records, &index, &repository_id, limit, format)
-        }
-        // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-        QuerySubcommand::BlindSpots {
-            graph,
-            data_dir,
-            repo,
-            kind,
-            format,
-        } => {
-            // Strictly read-only lane (issue #265): opening the embedded
-            // engine in place re-persists its on-disk index files, so
-            // `--data-dir` reads from a throwaway copy, never the live store
-            // (same contract as the other read-only lanes).
-            let records = match (graph.as_deref(), data_dir.as_deref()) {
-                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
-                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
-                (Some(_), Some(_)) => {
-                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
-                }
-                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
-            };
-            let index = query::RepositoryIndex::build(&records);
-            let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_blind_spots_cmd(
-                &records,
-                &index,
-                selected.as_deref(),
-                kind.as_query(),
-                format,
-            )
         }
     }
 }

@@ -62,8 +62,6 @@ mod who_constructs;
 mod sessions;
 // Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
 mod trust;
-// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-mod blind_spots;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -116,8 +114,6 @@ pub use who_constructs::*;
 pub use sessions::*;
 // Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
 pub use trust::{TrustClass, TrustIndex};
-// Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
-pub use blind_spots::*;
 // The verification-outcome rule is shared with `crate::criteria_coverage` and
 // the daemon write path, but it is not public API: re-exported crate-internally
 // so the shared rule cannot fork, without widening `egregore::query`.
