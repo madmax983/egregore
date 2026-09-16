@@ -19,6 +19,7 @@ mod daemon;
 mod debt_markers;
 mod decide;
 mod deltas;
+mod dep_usage;
 mod deps;
 mod doctor;
 mod drift;
@@ -180,6 +181,8 @@ pub(crate) use blind_spots::*;
 pub(crate) use track_record::*;
 // Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use session_retrospective::*;
+// Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use dep_usage::*;
 
 use std::{
     collections::BTreeMap,
@@ -3548,6 +3551,63 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+    /// Find every usage site of an external dependency symbol before upgrade.
+    ///
+    /// Answers "where is `tokio::spawn` actually called?" from the
+    /// AST-derived unresolved `CALLS` edges, resolving each written callee
+    /// against the file's `use` declarations — so
+    /// `use a::b::c as d; d(...)` reports under `a::b::c`. The query path may
+    /// be fully or partially qualified (`tokio::spawn`, `aletheiadb`);
+    /// matching is segment-aware, so `tokio::spaw` never matches. Comments and
+    /// string literals can never produce rows: every row is backed by a parsed
+    /// call site. Paths inside the repository's own crate namespace are
+    /// reported with `external: false` and a hint toward
+    /// `eg query transitive-callers`.
+    ///
+    /// Exit codes:
+    ///   0 — at least one usage site found.
+    ///   1 — malformed path, or an unsupported corpus/temporal combination
+    ///       (machine-readable JSON on stderr).
+    ///   2 — well-formed path with zero usage sites (`no_match`).
+    ///
+    /// Documented in `docs/cli/query.md`.
+    Uses {
+        /// The dependency symbol path to find (fully or partially qualified,
+        /// `::`-separated, e.g. `tokio::spawn` or `aletheiadb`).
+        path: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the usage sites to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve usage sites at this commit (full SHA or unique
+        /// prefix). Mutually exclusive with --as-of and the corpus flags.
+        #[arg(long)]
+        at: Option<String>,
+        /// Resolve usage sites as of this RFC 3339 instant. Mutually
+        /// exclusive with --at and the corpus flags.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding sites removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history / --at / --as-of.
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a site present only in an earlier commit still appears. Mutually
+        /// exclusive with --at-head / --at / --as-of.
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7718,6 +7778,51 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             query_who_constructs_cmd(
                 &records,
                 &handle,
+                &index,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        // Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::Uses {
+            path,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane: `--data-dir` reads a throwaway copy so the
+            // live store stays byte-for-byte untouched. Temporal selectors need
+            // the history-inclusive store view; the current-state read suffices
+            // otherwise. `--graph` is a plain file read. Config fallback
+            // (issue #261): explicit `--data-dir` wins; the config-pinned dir
+            // applies only when neither `--graph` nor `--data-dir` was passed,
+            // so `--graph` plus a pinned store never reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_dep_usage_cmd(
+                &records,
+                &path,
                 &index,
                 selected.as_deref(),
                 at.as_deref(),

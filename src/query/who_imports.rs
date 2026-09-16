@@ -208,7 +208,11 @@ fn aux_target_name(repo_relative_path: &str) -> Option<String> {
 /// cited manifest encloses the record's path counts) → the #440
 /// workspace-prefix-derived name (for graphs whose records predate
 /// attribution). Never guessed beyond these facts.
-fn owning_crate_name(record: &GraphRecord, repo_relative_path: &str) -> Option<String> {
+///
+/// Shared with the `dep_usage` lane (issue #258), which needs the same
+/// owning-crate fact for its external/internal classification.
+#[must_use]
+pub fn owning_crate_name(record: &GraphRecord, repo_relative_path: &str) -> Option<String> {
     if let Some(target) = aux_target_name(repo_relative_path) {
         return Some(target);
     }
@@ -222,7 +226,10 @@ fn owning_crate_name(record: &GraphRecord, repo_relative_path: &str) -> Option<S
 }
 
 /// Returns `true` when `query` is a segment-aware prefix of `import`.
-fn is_segment_prefix(query: &[&str], import: &[&str]) -> bool {
+///
+/// Shared with the `dep_usage` lane (issue #258).
+#[must_use]
+pub fn is_segment_prefix(query: &[&str], import: &[&str]) -> bool {
     query.len() <= import.len() && import[..query.len()] == *query
 }
 

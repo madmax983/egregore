@@ -82,6 +82,7 @@ mod query_churn;
 mod query_cli;
 mod query_cycles;
 mod query_debt_markers;
+mod query_dep_usage;
 mod query_implementors;
 mod query_lifeline;
 mod query_locate;

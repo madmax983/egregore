@@ -1906,3 +1906,65 @@ edge labels, paths, spans, counts, and basis strings escape), and byte-identical
 across runs. A witness path proves a live evidence-edge chain connects two
 records; it is not proof the cited code still matches current source. See
 `docs/cli/evidence-path.md`.
+
+## eg query uses
+
+Find **every usage site of an external dependency symbol before upgrade**
+(issue #258): given a fully or partially qualified path such as
+`tokio::spawn` or `aletheiadb`, return each call site the repo-wide resolver
+could *not* bind to an in-repo definition — i.e. each place the dependency
+symbol is actually called. Answers *"if I bump this crate, what breaks?"*
+without hand-reading every file.
+
+```sh
+eg query uses tokio::spawn --graph graph.jsonl                 # exit 0 on ≥ 1 site
+eg query uses aletheiadb --data-dir .egregore --format text    # partial path, human-readable
+eg query uses tokio::spawn --graph graph.jsonl --repo my-repo  # one repo in a multi-repo store
+eg query uses tokio::spawn --data-dir .egregore --at <sha>     # pin a commit
+eg query uses tokio::spawn --data-dir .egregore --as-of <ts>   # pin an instant
+```
+
+The lane reads two AST-derived relations only: `CALLS` edges whose
+`resolution` is `unresolved`, and each file's `IMPORTS` edges. Every written
+callee is resolved against the file's `use` declarations, so the lane is
+**alias-aware**: `use a::b::c as d; d(...)` reports under `a::b::c`, and a bare
+`spawn` imported via `use tokio::spawn;` reports under `tokio::spawn`.
+Matching is **segment-aware**: `aletheiadb` matches `aletheiadb::Store::open`
+but `tokio::spaw` never matches `tokio::spawn`. An ambiguous alias (two
+imports binding the same name in one file) resolves to nothing — resolution
+stays conservative rather than guessing.
+
+Because every row is backed by a parsed call site, **comments and string
+literals can never produce rows**: a `// tokio::spawn` comment or a
+`"aletheiadb::Store"` string is invisible to this lane by construction.
+
+Each JSON row carries `record_id`, `schema_version`, `repo_relative_path`,
+`span` (the first site for that written callee in the file — repeated callers
+of the same callee collapse to one row), `callee` (as written), `import_path`
+(the alias-resolved path), `external` (the external-vs-internal boolean), and
+`trust`. Rows whose path falls inside the repository's own crate namespace
+(`crate::…`, or a `use` path rooted at the repo's own crate) are reported with
+`external: false` and a `hint` pointing at `eg query transitive-callers` —
+a resolved-in-repo symbol's callers are that lane's job, not this one's.
+Out of scope by design: resolved internal `CALLS` edges, `UnresolvedDispatch`
+trait markers, and `MENTIONS` (no general extractor relation exists under that
+label, issue #442).
+
+Exit codes: `0` when at least one usage site is found; `2` for a
+well-formed path with zero sites (`no_match`) or a temporal pin against a
+graph with no commits (`empty_history`, exactly like `who-constructs`); `1`
+for a malformed path (`malformed_path`) or an unsupported corpus/temporal
+combination. Supports `--repo`, `--at`, `--as-of`,
+`--at-head` / `--all-history` (the issue #427 corpus selectors, mirroring
+`who-constructs`), and `--format json|text`. Output is deterministic:
+`(repo_relative_path, span start, callee, import_path)`.
+
+**Boring-substitute comparison.** `rg 'tokio::spawn'` finds the text but also
+every comment, string literal, and doc mention — and misses every
+`use tokio::spawn; … spawn(...)` alias site, which is usually the majority.
+rust-analyzer "find references" needs a fully-resolved workspace and gives up
+exactly where this lane starts (unresolved external paths). Sourcegraph code
+search is text search with the same alias blindness. `cargo outdated` /
+`cargo-geiger` tell you a dependency *is* stale, not *where* it is used.
+`eg query uses` is the narrow tool for the pre-upgrade question: the complete,
+alias-resolved, false-positive-free usage list, as JSON your agent can act on.
