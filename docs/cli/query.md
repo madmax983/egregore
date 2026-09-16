@@ -37,6 +37,7 @@ eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
 eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query session <ID>     --graph <PATH>   [--format json|text]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
@@ -123,6 +124,12 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+- `eg query session` — **retrace one agent session's** deterministic footprint
+  (files/symbols touched), agent-authored claims (observations, failures),
+  produced artifacts, and linked verification evidence, with a
+  `verification_status` derived only from verification-domain evidence — never
+  from agent prose. No footprint found is not evidence the run did nothing
+  ([session-retrospective.md](session-retrospective.md), issue #259).
 - `eg query producer-drift` — **producer-identity drift** between stored
   records and the running binary: which records a re-extraction with the
   installed grammar/extractor versions could change, grouped by producer

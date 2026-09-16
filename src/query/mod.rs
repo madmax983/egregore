@@ -66,6 +66,8 @@ mod trust;
 mod blind_spots;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
 mod track_record;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+mod session_retrospective;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -122,6 +124,8 @@ pub use trust::{TrustClass, TrustIndex};
 pub use blind_spots::*;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
 pub use track_record::*;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+pub use session_retrospective::*;
 // The verification-outcome rule is shared with `crate::criteria_coverage` and
 // the daemon write path, but it is not public API: re-exported crate-internally
 // so the shared rule cannot fork, without widening `egregore::query`.

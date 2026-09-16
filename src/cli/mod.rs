@@ -89,6 +89,8 @@ mod sessions;
 mod blind_spots;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
 mod track_record;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+mod session_retrospective;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -176,6 +178,8 @@ pub(crate) use sessions::*;
 pub(crate) use blind_spots::*;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use track_record::*;
+// Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use session_retrospective::*;
 
 use std::{
     collections::BTreeMap,
@@ -3524,6 +3528,26 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Retrace one agent session's footprint, claims, and verification.
+    ///
+    /// No footprint found is not evidence the run did nothing: a run that
+    /// never wrote a cited edge, a dropped transcript import, or a partially
+    /// ingested store all look the same as an idle session.
+    ///
+    /// Documented in `docs/cli/session-retrospective.md`.
+    Session {
+        /// Session record ID or imported session handle.
+        id_or_handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7854,6 +7878,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_track_record_cmd(&records, selected.as_deref(), format)
+        }
+        QuerySubcommand::Session {
+            id_or_handle,
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_session_cmd(&records, &id_or_handle, format)
         }
     }
 }
