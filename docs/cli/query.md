@@ -64,6 +64,10 @@ Evidence-backed audit subcommands have their own pages:
   ([recall-supersession.md](recall-supersession.md), issue #92).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
+- `eg query failure-hotspots` — **code targets ranked by repeated
+  agent-failure density** across all imported runs, the store-wide complement
+  to `eg query failures` ([failure-hotspots.md](failure-hotspots.md), issue
+  #254).
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
@@ -1968,3 +1972,44 @@ search is text search with the same alias blindness. `cargo outdated` /
 `cargo-geiger` tell you a dependency *is* stale, not *where* it is used.
 `eg query uses` is the narrow tool for the pre-upgrade question: the complete,
 alias-resolved, false-positive-free usage list, as JSON your agent can act on.
+
+## eg query failure-hotspots
+
+Rank **code targets by repeated agent-failure density** (issue #254): the
+store-wide complement to `eg query failures`. Where the per-handle lane
+answers "did anyone fail HERE?", this lane answers the operator's question
+*before* dispatching the next agent — *"which code targets burned the most
+agent attempts?"* — with no caller-supplied handle.
+
+```sh
+eg query failure-hotspots --graph graph.jsonl                  # exit 0 on ≥ 1 failure record
+eg query failure-hotspots --data-dir .egregore --limit 5       # top 5, truncation signaled
+eg query failure-hotspots --graph graph.jsonl --since 2026-09-01T00:00:00Z  # last week
+```
+
+Every live agent-authored `Failure` record resolves to its code
+(`Symbol`/`File`) targets through the failure-link relations, and targets are
+ranked by **distinct failing-run count** (`session_id` provenance; a failure
+with none counts as its own run), with **total failure count** as the
+documented tie-break and `target_record_id` as the final tie-break for
+byte-identical rankings across repeated runs. Each row carries a citable
+handle — the target `record_id` + `repo_relative_path`/span — and the list of
+contributing `Failure` `record_id`s with their run/session handles, so no row
+is a bare count with no evidence. Failures that resolve to no code target are
+reported in an explicit `unresolved` section (`task_only` / `no_code_target`),
+never silently dropped.
+
+Exit codes: `0` when at least one live `Failure` record is in scope; `2` for a
+store with zero live failures (`no_match`); `1` for an invalid `--limit` or a
+malformed `--as-of`/`--since` instant. `--limit N` caps rows and the header
+signals truncation (`truncated`, `total_hotspots` vs `returned_hotspots`).
+`--as-of`/`--since` scope the aggregation to failures observed within the
+window (undated failures are excluded when a selector is active). Supports
+`--format json|text`. Tombstoned failures are excluded entirely.
+
+**Boring-substitute comparison.** The per-handle lanes (`eg query failures`)
+require a suspect; `git log -S` / churn hotspots (issue #128) and CodeScene
+rank by *source change frequency* — a stable file that silently defeats every
+agent shows up in neither. Issue trackers know task status, not
+code-target-level agent attempts. Nothing else aggregates per-run failures
+into a ranked, evidence-cited map of where agents keep drowning.

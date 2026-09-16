@@ -1182,7 +1182,14 @@ fn push_attempt_link_diagnostics(
 
 /// Returns the live code/task record IDs a node links to outbound, via graph
 /// edges or denormalized evidence links with a target-linking relation.
-fn outbound_code_task_targets<'a>(
+///
+/// Shared with the store-wide failure-hotspots lane (issue #254) so it
+/// resolves each `Failure` to its code targets with the same edge +
+/// evidence-link semantics.
+// Kept `pub(crate)`: the `pub use` glob in mod.rs re-exports this at its
+// original crate-internal visibility; `pub` would widen it to the public API.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn outbound_code_task_targets<'a>(
     node: &'a GraphRecord,
     edges_from: &BTreeMap<&'a str, Vec<(&'a EdgeLabel, &'a str)>>,
     present: &impl Fn(&str) -> Option<&'a GraphRecord>,

@@ -30,6 +30,7 @@ mod evidence_freshness;
 mod evidence_path;
 mod export;
 mod failure_history;
+mod failure_hotspots;
 mod file_at_point;
 mod forget;
 mod freshness_cmd;
@@ -119,6 +120,7 @@ pub(crate) use evidence_freshness::*;
 pub(crate) use evidence_path::*;
 pub(crate) use export::*;
 pub(crate) use failure_history::*;
+pub(crate) use failure_hotspots::*;
 pub(crate) use file_at_point::*;
 pub(crate) use forget::*;
 pub(crate) use freshness_cmd::*;
@@ -1721,6 +1723,54 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+    },
+    /// Rank code targets by repeated agent-failure density (issue #254).
+    ///
+    /// The store-wide complement to `eg query failures <HANDLE>`: instead of
+    /// requiring a caller-supplied target, this lane aggregates every live
+    /// agent-authored `Failure` record and ranks the code targets
+    /// (`Symbol`/`File`) they resolve to by **distinct failing-run count**
+    /// (total failure count is the documented tie-break) — the "here's where
+    /// agents keep drowning" map, for the operator deciding where to send
+    /// the next agent (or where a context fix is needed).
+    ///
+    /// Each row cites its evidence: the target record ID + repo-relative
+    /// path/span, and every contributing `Failure` record ID with its
+    /// run/session handle. Failures that resolve to no code target are
+    /// reported in an explicit `unresolved` section, never silently dropped.
+    /// Ordering is deterministic and byte-stable across repeated runs on an
+    /// unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — at least one live `Failure` record in scope (ranked rows may be
+    ///       empty when every failure is `unresolved`).
+    ///   1 — invalid `--limit`, or a malformed `--as-of`/`--since` instant
+    ///       (machine-readable JSON on stderr).
+    ///   2 — zero live `Failure` records in scope (`no_match`).
+    ///
+    /// Documented in `docs/cli/failure-hotspots.md` and `docs/cli/query.md`.
+    FailureHotspots {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Cap the number of ranked hotspots returned. The answer signals
+        /// whether the list was truncated.
+        #[arg(long, default_value_t = query::FAILURE_HOTSPOTS_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Aggregate only failures observed at or before this RFC 3339
+        /// instant. May be combined with --since for a window.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Aggregate only failures observed at or after this RFC 3339
+        /// instant. May be combined with --as-of for a window.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Flag agent observations whose cited code has drifted since recording (issue #85).
     ///
@@ -6576,6 +6626,34 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at_head,
                 all_history,
             )
+        }
+        QuerySubcommand::FailureHotspots {
+            graph,
+            data_dir,
+            limit,
+            as_of,
+            since,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::FAILURE_HOTSPOTS_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::FAILURE_HOTSPOTS_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::FAILURE_HOTSPOTS_MAX_LIMIT,
+                        query::FAILURE_HOTSPOTS_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_failure_hotspots_cmd(&records, limit, as_of.as_deref(), since.as_deref(), format)
         }
         QuerySubcommand::EvidenceFreshness {
             graph,
