@@ -253,6 +253,223 @@ impl AgentAccum {
     }
 }
 
+/// Edge relations that make an agent-domain record cite a repository's code.
+/// Mirrors `sessions.rs`'s code-citation relations: a citation is an explicit
+/// agent-authored link (mentions / touched / observed / failed-on), never
+/// containment topology.
+const CITATION_RELATIONS: &[EdgeLabel] = &[
+    EdgeLabel::MentionsSymbol,
+    EdgeLabel::TouchedFile,
+    EdgeLabel::Observes,
+    EdgeLabel::FailedOn,
+];
+
+/// Compute the record IDs in scope for `--repo <want>`.
+///
+/// Code-domain records are in scope by containment
+/// ([`RepositoryIndex::owner_of`]). Agent-domain records — agents,
+/// observations, candidates, decisions, sessions, runs, verifications — are
+/// NOT in the containment walk, so they are scoped by citation instead: an
+/// agent is in scope iff any of its observations, candidates, or decisions
+/// cites (via [`CITATION_RELATIONS`]) a record the repository owns, and
+/// every record attributable to an in-scope agent participates.
+///
+/// Attribution here is deliberately *unscoped*: scope decisions must not
+/// depend on scope decisions, so the citation walk runs over the full live
+/// view. Edges are in scope exactly when both endpoints are.
+fn scoped_record_ids(
+    nodes: &HashMap<&str, &GraphRecord>,
+    edges: &HashMap<&str, &GraphRecord>,
+    repo_index: &RepositoryIndex,
+    want: &str,
+) -> BTreeSet<String> {
+    // --- 1. Citation adjacency over live edges. ---------------------------
+    let mut citations: HashMap<&str, Vec<&str>> = HashMap::new();
+    for record in edges.values() {
+        let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if CITATION_RELATIONS.contains(label) {
+            citations
+                .entry(source.as_str())
+                .or_default()
+                .push(target.as_str());
+        }
+    }
+    let cites_repo = |id: &str| -> bool {
+        citations
+            .get(id)
+            .is_some_and(|targets| targets.iter().any(|t| repo_index.owner_of(t) == Some(want)))
+    };
+
+    // --- 2. Unscoped agent attribution (same sources as the lane). ---------
+    let mut observation_agent: HashMap<&str, &str> = HashMap::new();
+    let mut session_agent: HashMap<&str, String> = HashMap::new();
+    let mut stamped_nodes: HashMap<&str, &str> = HashMap::new();
+    let mut candidate_support: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut decision_candidate: HashMap<&str, &str> = HashMap::new();
+    let mut authored_by: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut session_of: HashMap<&str, String> = HashMap::new();
+
+    for (&id, &record) in nodes {
+        let GraphRecord::Node {
+            kind,
+            agent_id,
+            user_context,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        match kind {
+            NodeKind::Observation => {
+                if let Some(stamped) = agent_id {
+                    observation_agent.insert(id, stamped.as_str());
+                }
+            }
+            NodeKind::Agent | NodeKind::AgentSession => {
+                if let Some(stamped) = agent_id {
+                    stamped_nodes.insert(id, stamped.as_str());
+                    if *kind == NodeKind::AgentSession {
+                        session_agent.insert(id, stamped.clone());
+                    }
+                }
+            }
+            NodeKind::PromoteCandidate => {
+                if let Some(evidence) = user_context.supporting_evidence.as_ref() {
+                    for link in evidence {
+                        if let Some(target) = link.target_record_id.as_deref() {
+                            candidate_support.entry(id).or_default().push(target);
+                        }
+                    }
+                }
+            }
+            NodeKind::PromotionDecision => {
+                if let Some(candidate_id) = user_context.candidate_id.as_deref() {
+                    decision_candidate.insert(id, candidate_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    for record in edges.values() {
+        let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        match label {
+            EdgeLabel::ProposedBy => {
+                candidate_support
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.as_str());
+            }
+            EdgeLabel::AuthoredBy => {
+                authored_by
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.clone());
+            }
+            EdgeLabel::SessionOf => {
+                session_of.insert(source.as_str(), target.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let support_agents = |candidate: &str| -> BTreeSet<&str> {
+        candidate_support
+            .get(candidate)
+            .map(|support| {
+                support
+                    .iter()
+                    .filter_map(|obs| observation_agent.get(obs))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // --- 3. Agents in scope: any of their observations, candidates, or
+    // decisions cites a record the repository owns. ------------------------
+    let mut citing_agents: BTreeSet<&str> = BTreeSet::new();
+    for (&observation, &agent) in &observation_agent {
+        if cites_repo(observation) {
+            citing_agents.insert(agent);
+        }
+    }
+    for &candidate in candidate_support.keys() {
+        if cites_repo(candidate) {
+            citing_agents.extend(support_agents(candidate));
+        }
+    }
+    for (&decision, &candidate) in &decision_candidate {
+        if cites_repo(decision) {
+            citing_agents.extend(support_agents(candidate));
+        }
+    }
+
+    // --- 4. Node scope: containment, or attributable to a citing agent. ---
+    let mut in_scope: BTreeSet<String> = BTreeSet::new();
+    for (&id, &record) in nodes {
+        if repo_index.owner_of(id) == Some(want) {
+            in_scope.insert(id.to_owned());
+            continue;
+        }
+        let attributed = match record.node_kind_ref() {
+            Some(NodeKind::Observation | NodeKind::Agent | NodeKind::AgentSession) => {
+                stamped_nodes
+                    .get(id)
+                    .is_some_and(|agent| citing_agents.contains(agent))
+                    || observation_agent
+                        .get(id)
+                        .is_some_and(|agent| citing_agents.contains(agent))
+            }
+            Some(NodeKind::AgentRun) => resolve_agent(id, &session_agent, &session_of)
+                .is_some_and(|agent| citing_agents.contains(agent.as_str())),
+            Some(NodeKind::PromoteCandidate) => !support_agents(id).is_disjoint(&citing_agents),
+            Some(NodeKind::PromotionDecision) => decision_candidate
+                .get(id)
+                .is_some_and(|candidate| !support_agents(candidate).is_disjoint(&citing_agents)),
+            Some(NodeKind::Verification | NodeKind::CommandRun | NodeKind::TestRun) => {
+                authored_by.get(id).is_some_and(|targets| {
+                    targets.iter().any(|target| {
+                        resolve_agent(target.as_str(), &session_agent, &session_of)
+                            .is_some_and(|agent| citing_agents.contains(agent.as_str()))
+                    })
+                })
+            }
+            _ => false,
+        };
+        if attributed {
+            in_scope.insert(id.to_owned());
+        }
+    }
+
+    // --- 5. Edges are in scope exactly when both endpoints are. ------------
+    for (&id, &record) in edges {
+        let GraphRecord::Edge { source, target, .. } = record else {
+            continue;
+        };
+        if in_scope.contains(source.as_str()) && in_scope.contains(target.as_str()) {
+            in_scope.insert(id.to_owned());
+        }
+    }
+
+    in_scope
+}
+
 /// Resolve any node to its agent via SESSION_OF chains ending at an
 /// AgentSession with a stamped agent_id. Walks at most 8 hops.
 fn resolve_agent(
@@ -275,9 +492,12 @@ fn resolve_agent(
 
 /// Compute the per-agent track record over `records`.
 ///
-/// `repo_id` is an optional repository id: when `Some`, only records owned
-/// by that repository (via [`RepositoryIndex::owner_of`]) participate.
-/// Pass `None` for the unscoped lane.
+/// `repo_id` is an optional repository id. When `Some`, code-domain records
+/// participate by containment ([`RepositoryIndex::owner_of`]) and
+/// agent-domain records participate by citation: an agent is in scope iff
+/// any of its observations, candidates, or decisions cites a record the
+/// repository owns (see [`scoped_record_ids`]). Pass `None` for the
+/// unscoped lane, whose behavior is unchanged.
 #[must_use]
 pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> TrackRecordReport {
     // Last write wins: process records in order. A node/edge with the same
@@ -303,8 +523,12 @@ pub fn agent_track_record(records: &[GraphRecord], repo_id: Option<&str>) -> Tra
     }
 
     let repo_index = RepositoryIndex::build(records);
-    let in_scope =
-        |id: &str| -> bool { repo_id.is_none_or(|want| repo_index.owner_of(id) == Some(want)) };
+    // Citation-based `--repo` scoping for agent-domain records (see
+    // `scoped_record_ids`): computed once, up front, from the unscoped live
+    // view. The unscoped lane keeps the old always-true filter.
+    let scoped_ids: Option<BTreeSet<String>> =
+        repo_id.map(|want| scoped_record_ids(&nodes, &edges, &repo_index, want));
+    let in_scope = |id: &str| -> bool { scoped_ids.as_ref().is_none_or(|ids| ids.contains(id)) };
 
     let mut agents: BTreeMap<String, AgentAccum> = BTreeMap::new();
     let mut diagnostics: Vec<TrackRecordDiagnostic> = Vec::new();
