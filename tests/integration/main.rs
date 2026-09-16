@@ -39,6 +39,7 @@ mod evidence_path;
 mod evidence_write;
 mod failure_history;
 mod failure_write;
+mod five_domain_context_join;
 mod forget;
 mod forget_repo;
 mod freshness;
