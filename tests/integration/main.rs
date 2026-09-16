@@ -87,6 +87,7 @@ mod query_debt_markers;
 mod query_dep_usage;
 mod query_failure_hotspots;
 mod query_implementors;
+mod query_latency_budget;
 mod query_lifeline;
 mod query_locate;
 mod query_orient;

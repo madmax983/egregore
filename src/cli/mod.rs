@@ -1200,6 +1200,18 @@ pub(crate) enum OutputFormat {
     Text,
 }
 
+/// Which input sources `eg audit query-latency` measures (issue #255).
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum LatencySource {
+    /// Measure only `--graph <JSONL>`.
+    Graph,
+    /// Measure only `--data-dir <embedded store>`.
+    DataDir,
+    /// Measure both sources (default).
+    #[default]
+    Both,
+}
+
 /// Subcommands for `config` (issue #261).
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigAction {
@@ -4115,6 +4127,40 @@ pub(crate) enum AuditSubcommand {
         /// Defaults to the manifest's `min_ratio`. When supplied, overrides it.
         #[arg(long)]
         min_ratio: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Measure cold query latency and gate p50 against the latency budget (issue #255).
+    ///
+    /// Builds the pinned reference corpus, then times cold wall-clock from
+    /// process start to the first emitted result line of
+    /// `eg query symbol <NAME>` — fresh processes, `--graph <JSONL>` and
+    /// `--data-dir <embedded store>` measured separately — reporting p50/p95
+    /// per source. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    QueryLatency {
+        /// Path to the query-latency corpus manifest JSON.
+        #[arg(long, default_value = "corpus/query_latency_corpus.json")]
+        corpus: PathBuf,
+        /// Cold samples measured per input source.
+        ///
+        /// Defaults to the manifest's `samples`. When supplied, overrides it.
+        #[arg(long)]
+        samples: Option<usize>,
+        /// p50 budget in milliseconds each source must meet.
+        ///
+        /// Defaults to the manifest's `budget_p50_ms`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        budget_p50_ms: Option<f64>,
+        /// Which input sources to measure.
+        #[arg(long, default_value = "both")]
+        source: LatencySource,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,

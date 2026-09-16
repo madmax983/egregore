@@ -233,6 +233,15 @@ string-literal false positives a text search drags in, and the larger the file
 bodies a structural answer summarizes, the larger the saving. See
 [docs/cli/token-cost.md](docs/cli/token-cost.md).
 
+**Cold query latency is budgeted, not just hoped for.** `eg audit
+query-latency` measures cold wall-clock from process start to the first
+emitted result line of `eg query symbol <NAME>` — 11 fresh processes each
+against `--graph <JSONL>` and `--data-dir <embedded store>` on a pinned
+reference corpus (`corpus/query_latency_corpus/`, ~10k records) — and fails
+when p50 exceeds **2s**. The benchmark runs in CI, so a future change that
+regresses cold lookup gets caught. See
+[docs/cli/query-latency.md](docs/cli/query-latency.md).
+
 ---
 
 ## All commands

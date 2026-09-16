@@ -1,4 +1,5 @@
 use super::*;
+use std::process::Stdio;
 
 /// Routes `eg audit` subcommands.
 #[allow(clippy::too_many_lines)] // a flat dispatch table, one arm per subcommand
@@ -39,6 +40,13 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             min_ratio,
             format,
         } => audit_token_cost_cmd(&corpus, min_ratio, format),
+        AuditSubcommand::QueryLatency {
+            corpus,
+            samples,
+            budget_p50_ms,
+            source,
+            format,
+        } => audit_query_latency_cmd(&corpus, samples, budget_p50_ms, source, format),
         AuditSubcommand::Accuracy {
             corpus_dir,
             labels,
@@ -1141,6 +1149,282 @@ pub(crate) fn audit_token_cost_cmd(
             .unwrap_or_else(|error| token_cost_exit("serialize_error", "", &error.to_string())),
     };
     println!("{output}");
+    std::process::exit(i32::from(!report.ok));
+}
+
+/// Prints a JSON error envelope to stderr and exits 2 (issue #255).
+pub(crate) fn query_latency_exit(code: &str, path: &str, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({ "code": code, "path": path, "message": message })
+    );
+    std::process::exit(2);
+}
+
+/// Loads the query-latency corpus manifest, applies the `--samples` /
+/// `--budget-p50-ms` overrides, and validates them. Exits 2 on any
+/// load/usage error.
+pub(crate) fn load_query_latency_corpus(
+    corpus_path: &Path,
+    samples_override: Option<usize>,
+    budget_override: Option<f64>,
+) -> crate::query_latency::QueryLatencyCorpus {
+    use crate::query_latency::QueryLatencyCorpus;
+
+    let display = corpus_path.display().to_string();
+    if let Some(samples) = samples_override
+        && samples == 0
+    {
+        // Zero samples would gate on nothing; refuse instead of passing vacuously.
+        query_latency_exit("invalid_samples", &display, "--samples must be at least 1");
+    }
+    if let Some(budget) = budget_override
+        && (!budget.is_finite() || budget <= 0.0)
+    {
+        // A non-positive or non-finite budget would silently disable the gate
+        // (p50 >= 0.0 is always true against a negative budget).
+        query_latency_exit(
+            "invalid_budget_p50_ms",
+            &display,
+            "--budget-p50-ms must be a finite, positive value",
+        );
+    }
+    let text = std::fs::read_to_string(corpus_path).unwrap_or_else(|error| {
+        query_latency_exit("corpus_read_error", &display, &error.to_string())
+    });
+    let mut corpus: QueryLatencyCorpus = serde_json::from_str(&text).unwrap_or_else(|error| {
+        query_latency_exit("corpus_parse_error", &display, &error.to_string())
+    });
+    if let Some(samples) = samples_override {
+        corpus.samples = samples;
+    }
+    if let Some(budget) = budget_override {
+        corpus.budget_p50_ms = budget;
+    }
+    if corpus.samples == 0 {
+        query_latency_exit(
+            "invalid_samples",
+            &display,
+            "manifest `samples` must be at least 1",
+        );
+    }
+    if !corpus.budget_p50_ms.is_finite() || corpus.budget_p50_ms <= 0.0 {
+        query_latency_exit(
+            "invalid_budget_p50_ms",
+            &display,
+            "manifest `budget_p50_ms` must be a finite, positive value",
+        );
+    }
+    corpus
+}
+
+/// Builds the reference corpus in a temp dir: deterministic scan of the
+/// fixture into `graph.jsonl`. Returns the work dir, the JSONL path, and the
+/// record count. Setup only — not timed.
+fn build_query_latency_corpus(
+    corpus: &crate::query_latency::QueryLatencyCorpus,
+    source_dir: &Path,
+) -> (tempfile::TempDir, std::path::PathBuf, u64) {
+    use crate::query_latency::MIN_REFERENCE_RECORDS;
+
+    let dir = source_dir.display().to_string();
+    let work = tempfile::tempdir()
+        .unwrap_or_else(|error| query_latency_exit("tempdir_error", &dir, &error.to_string()));
+    let graph = crate::scan_repository_at_with_override(
+        source_dir,
+        &corpus.scan_time,
+        Some(&corpus.repository_id_override),
+    )
+    .unwrap_or_else(|error| query_latency_exit("corpus_scan_error", &dir, &error.to_string()));
+    let record_count = graph.records().len() as u64;
+    if record_count < MIN_REFERENCE_RECORDS {
+        // A collapsed corpus would make the gate pass vacuously; refuse to
+        // measure instead of rubber-stamping a meaningless number.
+        query_latency_exit(
+            "corpus_too_small",
+            &dir,
+            &format!(
+                "reference corpus has {record_count} records, below the {MIN_REFERENCE_RECORDS} minimum"
+            ),
+        );
+    }
+    let jsonl = graph.to_jsonl().unwrap_or_else(|error| {
+        query_latency_exit("corpus_serialize_error", &dir, &error.to_string())
+    });
+    let graph_path = work.path().join("graph.jsonl");
+    std::fs::write(&graph_path, jsonl).unwrap_or_else(|error| {
+        query_latency_exit(
+            "corpus_write_error",
+            &graph_path.display().to_string(),
+            &error.to_string(),
+        )
+    });
+    (work, graph_path, record_count)
+}
+
+/// Times `samples` cold `eg query symbol` invocations against one input
+/// source. Exits 2 when a sample fails (fail-closed: an unanswered query has
+/// no time-to-first-answer).
+fn sample_query_latency(
+    exe: &Path,
+    base_args: &[String],
+    samples: usize,
+    source_name: &str,
+) -> Vec<f64> {
+    use crate::query_latency::measure_cold_query;
+
+    let mut samples_ms = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let args: Vec<&str> = base_args.iter().map(String::as_str).collect();
+        match measure_cold_query(exe, &args) {
+            Ok(ms) => samples_ms.push(ms),
+            Err(error) => query_latency_exit("query_sample_error", source_name, &error),
+        }
+    }
+    samples_ms
+}
+
+/// Handles `eg audit query-latency` (issue #255).
+pub(crate) fn audit_query_latency_cmd(
+    corpus_path: &Path,
+    samples_override: Option<usize>,
+    budget_override: Option<f64>,
+    source: LatencySource,
+    format: OutputFormat,
+) -> Result<()> {
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    use crate::query_latency::skipped_source;
+    use crate::query_latency::{LatencyReport, SourceLatency, machine_info, summarize};
+
+    let corpus = load_query_latency_corpus(corpus_path, samples_override, budget_override);
+    let measure_graph = matches!(source, LatencySource::Graph | LatencySource::Both);
+    let measure_data_dir = matches!(source, LatencySource::DataDir | LatencySource::Both);
+
+    // Resolve the corpus source directory relative to the manifest's parent so
+    // the benchmark is runnable regardless of the working directory.
+    let manifest_dir = corpus_path.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = manifest_dir.join(&corpus.source_dir);
+
+    let (_work, graph_path, record_count) = build_query_latency_corpus(&corpus, &source_dir);
+    let graph_path_str = graph_path.display().to_string();
+
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|error| query_latency_exit("current_exe_error", "", &error.to_string()));
+
+    let mut sources: std::collections::BTreeMap<String, SourceLatency> =
+        std::collections::BTreeMap::new();
+
+    // --graph <JSONL> source: measured unless `--source data-dir` selects the
+    // embedded store alone.
+    if measure_graph {
+        let graph_args = vec![
+            "query".to_owned(),
+            "symbol".to_owned(),
+            corpus.query_symbol.clone(),
+            "--graph".to_owned(),
+            graph_path_str,
+            "--format".to_owned(),
+            "text".to_owned(),
+        ];
+        let graph_samples = sample_query_latency(&exe, &graph_args, corpus.samples, "graph");
+        let graph_latency = summarize("graph", graph_samples, corpus.budget_p50_ms)
+            .unwrap_or_else(|| query_latency_exit("no_samples", "graph", "no samples measured"));
+        sources.insert("graph".to_owned(), graph_latency);
+    }
+
+    // --data-dir <embedded store> source: measured when selected and the
+    // embedded feature is enabled; explicitly skipped (never silently
+    // dropped) when selected without the feature.
+    if measure_data_dir {
+        #[cfg(feature = "embedded-aletheiadb")]
+        {
+            let data_dir = _work.path().join("data-dir");
+            let data_dir_str = data_dir.display().to_string();
+            let ingest_status = std::process::Command::new(&exe)
+                .args(["ingest"])
+                .arg(&graph_path)
+                .args(["--adapter", "embedded", "--data-dir"])
+                .arg(&data_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .status()
+                .unwrap_or_else(|error| {
+                    query_latency_exit("ingest_spawn_error", &data_dir_str, &error.to_string())
+                });
+            if !ingest_status.success() {
+                query_latency_exit(
+                    "ingest_error",
+                    &data_dir_str,
+                    &format!("`eg ingest` exited with {ingest_status}"),
+                );
+            }
+            let data_dir_args = vec![
+                "query".to_owned(),
+                "symbol".to_owned(),
+                corpus.query_symbol.clone(),
+                "--data-dir".to_owned(),
+                data_dir_str,
+                "--format".to_owned(),
+                "text".to_owned(),
+            ];
+            let data_dir_samples =
+                sample_query_latency(&exe, &data_dir_args, corpus.samples, "data_dir");
+            let data_dir_latency = summarize("data_dir", data_dir_samples, corpus.budget_p50_ms)
+                .unwrap_or_else(|| {
+                    query_latency_exit("no_samples", "data_dir", "no samples measured")
+                });
+            sources.insert("data_dir".to_owned(), data_dir_latency);
+        }
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        {
+            sources.insert(
+                "data_dir".to_owned(),
+                skipped_source(
+                    "data_dir",
+                    corpus.budget_p50_ms,
+                    "embedded-aletheiadb feature not enabled",
+                ),
+            );
+        }
+    }
+
+    let ok = sources.values().all(|source| source.pass);
+    let report = LatencyReport {
+        corpus_name: corpus.corpus_name.clone(),
+        corpus_version: corpus.corpus_version.clone(),
+        query: format!("query symbol {}", corpus.query_symbol),
+        record_count,
+        reference_record_count: corpus.reference_record_count,
+        reference_machine_class: corpus.reference_machine_class.clone(),
+        machine: machine_info(),
+        samples: corpus.samples,
+        budget_p50_ms: corpus.budget_p50_ms,
+        sources,
+        ok,
+    };
+
+    let output = match format {
+        OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|error| query_latency_exit("serialize_error", "", &error.to_string())),
+    };
+    println!("{output}");
+    for (name, source) in &report.sources {
+        if source.skipped {
+            eprintln!(
+                "query-latency[{name}]: skipped ({})",
+                source.skip_reason.as_deref().unwrap_or("")
+            );
+        } else {
+            eprintln!(
+                "query-latency[{name}]: p50 {:.0}ms, p95 {:.0}ms over {} samples (budget {:.0}ms) — {}",
+                source.p50_ms,
+                source.p95_ms,
+                source.samples_ms.len(),
+                source.budget_p50_ms,
+                if source.pass { "PASS" } else { "FAIL" },
+            );
+        }
+    }
     std::process::exit(i32::from(!report.ok));
 }
 

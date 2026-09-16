@@ -92,6 +92,8 @@ pub mod project_config;
 pub mod protected;
 /// Agent-facing graph query helpers.
 pub mod query;
+/// Cold query-latency budget measurement for time-to-first-symbol-answer (issue #255).
+pub mod query_latency;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
 pub mod redaction;
 /// At-import redaction report (issue #266).

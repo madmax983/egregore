@@ -64,3 +64,23 @@ jobs:
       # matches the subprocess-driven tests to the same bound.
       - name: test
         run: cargo test --all-targets ${{ matrix.flags }} -- --test-threads=2
+
+  query-latency:
+    name: cold query-latency budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: query-latency
+      - name: build
+        run: cargo build
+      - name: cold query-latency gate
+        # Full two-source gate (issue #255): 11 cold samples each of
+        # `eg query symbol` against --graph <JSONL> and --data-dir <embedded
+        # store> on the pinned reference corpus
+        # (corpus/query_latency_corpus.json, ~10k records). Fails when any
+        # source p50 exceeds the 2s budget.
+        run: ./target/debug/egregore audit query-latency
