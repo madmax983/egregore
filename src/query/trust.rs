@@ -336,6 +336,7 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::UnsafeSite
             | NodeKind::DependencyDeclaration
             | NodeKind::ScanCoverage
+            | NodeKind::HistoryReplayWindow
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::SemanticDrift
@@ -1010,6 +1011,7 @@ mod tests {
             NodeKind::UnsafeSite,
             NodeKind::DependencyDeclaration,
             NodeKind::ScanCoverage,
+            NodeKind::HistoryReplayWindow,
             NodeKind::Commit,
             NodeKind::Change,
             NodeKind::SemanticDrift,

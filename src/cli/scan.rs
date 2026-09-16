@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::CodegraphError;
 
 /// Scan a repository and write graph JSONL, resolving flags against the
 /// checked-in `egregore.toml` (issue #261).
@@ -96,8 +97,33 @@ fn print_scan_coverage(graph: &Graph) {
     );
 }
 
+/// Prints the single-line machine-readable JSON diagnostic for a history-window
+/// failure (issue #256) and exits non-zero without writing partial output.
+fn exit_with_window_diagnostic(code: &'static str, message: &str) -> ! {
+    let diag = serde_json::json!({ "code": code, "message": message });
+    eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
+    std::process::exit(2);
+}
+
 pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs) -> Result<()> {
     warn_on_unconsumed_scope_pins();
+
+    // Issue #256: validate the commit window before any repository or output
+    // work, so a conflicting or unparseable window fails with the single-line
+    // JSON diagnostic and never a partial output.
+    let window = match HistoryWindow::from_flags(
+        args.max_commits.as_deref(),
+        args.since.as_deref(),
+        args.from_rev.clone(),
+        args.to_rev.clone(),
+    ) {
+        Ok(window) => window,
+        Err(CodegraphError::HistoryWindow { code, message }) => {
+            exit_with_window_diagnostic(code, &message)
+        }
+        Err(err) => return Err(err.into()),
+    };
+
     // AC5: Verify git is available in PATH.
     let git_available = std::process::Command::new("git")
         .arg("--version")
@@ -158,8 +184,25 @@ pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs
     // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
     // companion store cannot affect it, and no dirty-probe exclusions are needed
     // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
-    let graph = scan_repository_history_with_override(repo_path, args.repo_id_override.as_deref())
-        .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
+    //
+    // Issue #256: a window that resolves to no commits (or an unresolvable
+    // revision) fails with the single-line JSON diagnostic and a non-zero
+    // exit; no partial output is written.
+    let graph = match scan_repository_history_with_window(
+        repo_path,
+        args.repo_id_override.as_deref(),
+        &window,
+    ) {
+        Ok(graph) => graph,
+        Err(CodegraphError::HistoryWindow { code, message }) => {
+            exit_with_window_diagnostic(code, &message)
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to scan Git history for {}", repo_path.display())
+            });
+        }
+    };
 
     let repo_identity =
         identity::compute_repository_identity(repo_path, args.repo_id_override.as_deref());

@@ -77,7 +77,10 @@ pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
 ///
 /// A `ScanCoverage` summary MUST be the target of at least one
 /// `Repository —CONTAINS→ ScanCoverage` edge — the attribution that keeps the
-/// coverage summary repository-scoped and citable. This is the true schema
+/// coverage summary repository-scoped and citable. The same invariant covers
+/// the `HistoryReplayWindow` summary (issue #256): a windowed replay's window
+/// node must be contained by the `Repository` it scopes, so a bounded store
+/// is never mistaken for full history. This is the true schema
 /// invariant behind coverage attachment, and it subsumes the partial cases the
 /// orphan and target-conditioned source-kind checks each cover: the orphan
 /// check treats ANY incident edge as sufficient, and the source-kind check
@@ -173,6 +176,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             // coverage summary to its repository (issue #135), keeping the
             // coverage node citable and non-orphan.
             NodeKind::ScanCoverage,
+            // `Repository CONTAINS HistoryReplayWindow` attributes the
+            // history-replay window summary to its repository (issue #256),
+            // keeping the window node citable and non-orphan.
+            NodeKind::HistoryReplayWindow,
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
             // sites are contained by their owning file (issue #223).
             NodeKind::PanicRiskSite,
@@ -299,10 +306,13 @@ const fn allowed_source_kinds_for_target(
     target: NodeKind,
 ) -> Option<&'static [NodeKind]> {
     match (label, target) {
-        // `Repository —CONTAINS→ ScanCoverage`: the file-level scan-coverage
+        // `Repository —CONTAINS→ ScanCoverage` (issue #135) and
+        // `Repository —CONTAINS→ HistoryReplayWindow` (issue #256): the
         // summary must be attributed to the `Repository` it scopes, never a
-        // `File` or any other container (issue #135).
-        (EdgeLabel::Contains, NodeKind::ScanCoverage) => Some(&[NodeKind::Repository]),
+        // `File` or any other container.
+        (EdgeLabel::Contains, NodeKind::ScanCoverage | NodeKind::HistoryReplayWindow) => {
+            Some(&[NodeKind::Repository])
+        }
         _ => None,
     }
 }
@@ -1011,8 +1021,10 @@ fn check_required_containment(
             .get(id)
             .is_some_and(|kinds| kinds.contains(&kind))
     }
-    // Coverage node IDs that have at least one `Repository —CONTAINS→` container.
-    let mut contained: BTreeSet<&str> = BTreeSet::new();
+    // Summary node IDs that have at least one `Repository —CONTAINS→` container,
+    // keyed by (node id, summary kind): `ScanCoverage` (issue #135) and
+    // `HistoryReplayWindow` (issue #256) share the containment invariant.
+    let mut contained: BTreeSet<(&str, NodeKind)> = BTreeSet::new();
     for record in records {
         let GraphRecord::Edge {
             label: EdgeLabel::Contains,
@@ -1029,24 +1041,31 @@ fn check_required_containment(
         // historical `node_kinds` SET: a source re-emitted as a non-`Repository`
         // kind after a `Repository` one no longer satisfies containment (its
         // historical set still contains `Repository`, but its current kind does
-        // not), so the coverage node correctly reports `missing_required_container`.
+        // not), so the summary node correctly reports `missing_required_container`.
         let source_is_repository = index.node_last_kind.get(source.as_str()).copied().flatten()
             == Some(NodeKind::Repository);
-        if has_kind(index, target, NodeKind::ScanCoverage) && source_is_repository {
-            contained.insert(target);
+        if !source_is_repository {
+            continue;
+        }
+        for summary_kind in [NodeKind::ScanCoverage, NodeKind::HistoryReplayWindow] {
+            if has_kind(index, target, summary_kind) {
+                contained.insert((target.as_str(), summary_kind));
+            }
         }
     }
     for (id, kinds) in &index.node_kinds {
-        if !kinds.contains(&NodeKind::ScanCoverage) || contained.contains(id) {
-            continue;
+        for summary_kind in [NodeKind::ScanCoverage, NodeKind::HistoryReplayWindow] {
+            if !kinds.contains(&summary_kind) || contained.contains(&(*id, summary_kind)) {
+                continue;
+            }
+            let mut diagnostic = ValidationDiagnostic::new(MISSING_REQUIRED_CONTAINER);
+            diagnostic.record_id = Some((*id).to_owned());
+            diagnostic.kind = Some(summary_kind.as_str());
+            diagnostic.relation = Some(EdgeLabel::Contains.as_str().to_owned());
+            diagnostic.allowed_kinds = Some(vec![NodeKind::Repository.as_str()]);
+            index.cite_node(&mut diagnostic, id);
+            diagnostics.insert(diagnostic);
         }
-        let mut diagnostic = ValidationDiagnostic::new(MISSING_REQUIRED_CONTAINER);
-        diagnostic.record_id = Some((*id).to_owned());
-        diagnostic.kind = Some(NodeKind::ScanCoverage.as_str());
-        diagnostic.relation = Some(EdgeLabel::Contains.as_str().to_owned());
-        diagnostic.allowed_kinds = Some(vec![NodeKind::Repository.as_str()]);
-        index.cite_node(&mut diagnostic, id);
-        diagnostics.insert(diagnostic);
     }
 }
 

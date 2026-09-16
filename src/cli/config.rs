@@ -102,6 +102,14 @@ pub(crate) struct ResolvedScanArgs {
     /// Effective scan transaction time: the config-pinned
     /// `scan.transaction_time`, or `None` for the historical wall-clock scan.
     pub transaction_time: Option<String>,
+    /// Effective `scan-history --max-commits` (raw; issue #256).
+    pub max_commits: Option<String>,
+    /// Effective `scan-history --since` (issue #256).
+    pub since: Option<String>,
+    /// Effective `scan-history --from` (issue #256).
+    pub from_rev: Option<String>,
+    /// Effective `scan-history --to` (issue #256).
+    pub to_rev: Option<String>,
 }
 
 /// Resolve `eg scan` / `eg scan-history` flags against the discovered config.
@@ -122,6 +130,10 @@ pub(crate) fn resolve_scan_args(
         repo_id_override,
         raw_literals,
         transaction_time,
+        max_commits: None,
+        since: None,
+        from_rev: None,
+        to_rev: None,
     }
 }
 

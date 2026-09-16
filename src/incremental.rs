@@ -136,10 +136,17 @@ use crate::{
 /// cached: it is recomputed on every refresh, so a source file byte-identical
 /// to its cached version whose owning `Cargo.toml` was added, renamed, or
 /// deleted is still re-attributed.
+/// 26 -> 27: trunk repair restoring audit-gap issues (commit 0f3f6fd; no
+/// per-issue doc line was recorded).
+/// 27 -> 28: #256 history-replay window. The paired codegraph
+/// `SCHEMA_VERSION` bump 9 -> 10 changes every `codegraph:v<N>:` record ID
+/// prefix (and adds the `HistoryReplayWindow` node kind), so a cache holding
+/// v9 IDs would replay records whose endpoints no longer match freshly-minted
+/// v10 ones.
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 27;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 28;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

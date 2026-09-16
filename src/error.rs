@@ -105,6 +105,22 @@ pub enum CodegraphError {
         message: String,
     },
 
+    /// A history-replay commit window was conflicting, unparseable, or resolved
+    /// to no commits (issue #256).
+    ///
+    /// The CLI maps this to a single-line machine-readable JSON diagnostic on
+    /// stderr (`{"code": ..., "message": ...}`) and exits non-zero without
+    /// writing a partial output file. The `code` is one of
+    /// `conflicting_window`, `invalid_window`, `unresolvable_rev`, or
+    /// `empty_window`.
+    #[error("history window error ({code}): {message}")]
+    HistoryWindow {
+        /// Machine-readable diagnostic code.
+        code: &'static str,
+        /// Human-readable detail; never echoes secrets.
+        message: String,
+    },
+
     /// An importer received a file with no parseable events.
     #[error("no parseable events in {path}: file is empty or entirely malformed")]
     EmptyImport {

@@ -47,6 +47,7 @@ mod go_scan;
 mod graph_index;
 mod history;
 mod history_safety;
+mod history_window;
 mod identity;
 mod import_github;
 mod import_github_behaviour;

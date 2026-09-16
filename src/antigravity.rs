@@ -302,6 +302,7 @@ fn make_node(
         dependency: None,
         log: None,
         scan_coverage: None,
+        history_replay_window: None,
         embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,

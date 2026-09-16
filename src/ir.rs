@@ -12,7 +12,7 @@ use crate::error::Result;
 /// 8→9: issue #117 adds the optional `crate_attribution` field (owning Cargo
 /// package name + the repo-relative path of the owning `Cargo.toml`) on every
 /// path-bearing code-graph node. Additive and never an identity input.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -518,6 +518,50 @@ pub struct ScanCoveragePayload {
     /// this field, which fall through to the content tie-break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_generation: Option<String>,
+}
+
+/// History-replay window summary stamped on the single `HistoryReplayWindow`
+/// node a *windowed* `eg scan-history` emits (issue #256).
+///
+/// Makes the replay window a stated, deterministic, queryable graph fact: which
+/// window form was requested, how many commits it selected, and the bounding
+/// commit SHAs / instant — so a windowed store is never mistaken for full
+/// history. All fields are additive per `docs/schema/schema-versioning.md` §2
+/// and carry no paths or PII — only the window kind, counts, commit SHAs, the
+/// operator-supplied revs, and a UTC instant — so the node is redaction-exempt
+/// deterministic code-graph data, like [`ScanCoveragePayload`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryReplayWindowPayload {
+    /// The window form: `"count"`, `"since"`, or `"range"`.
+    pub window: String,
+    /// Commits the resolved window selected (always ≥ 1: an empty window is
+    /// rejected before any record is emitted).
+    pub selected_commit_count: usize,
+    /// The requested `--max-commits` bound (count windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_commits: Option<usize>,
+    /// The requested `--since` instant, normalized to UTC `Z` form (since
+    /// windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_instant: Option<String>,
+    /// The operator-supplied `--from` revision, as given (range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_rev: Option<String>,
+    /// The operator-supplied `--to` revision, as given (`"HEAD"` when `--from`
+    /// was given alone and `--to` defaulted; range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_rev: Option<String>,
+    /// The `--from` revision resolved to a commit SHA (range windows with an
+    /// explicit `--from` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_sha: Option<String>,
+    /// The `--to` revision resolved to a commit SHA (range windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_sha: Option<String>,
+    /// Oldest selected commit SHA (oldest-first replay order).
+    pub oldest_commit_sha: String,
+    /// Newest selected commit SHA.
+    pub newest_commit_sha: String,
 }
 
 /// Per-kind payload stamped on the four log-signature node kinds (issues
@@ -1267,6 +1311,11 @@ pub enum GraphRecord {
         /// coverage stamping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scan_coverage: Option<Box<ScanCoveragePayload>>,
+        /// History-replay window payload for the single `HistoryReplayWindow`
+        /// node (issue #256); absent on all other kinds and on unwindowed
+        /// (full-history) replays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_replay_window: Option<Box<HistoryReplayWindowPayload>>,
         /// Embedding-model identity for the semantic `EmbeddingModel` node that
         /// records which model produced a store's queryable vector index (issue
         /// #104); absent on all other kinds and on stores embedded before
@@ -1883,6 +1932,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2012,6 +2062,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2140,6 +2191,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2273,6 +2325,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            history_replay_window: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2851,6 +2904,33 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps a [`HistoryReplayWindowPayload`] on the `HistoryReplayWindow`
+    /// node (issue #256). No-op on non-node records.
+    #[must_use]
+    pub fn with_history_replay_window(mut self, payload: HistoryReplayWindowPayload) -> Self {
+        if let Self::Node {
+            history_replay_window,
+            ..
+        } = &mut self
+        {
+            *history_replay_window = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the history-replay window payload when this record is a
+    /// `HistoryReplayWindow` node carrying one; `None` otherwise (issue #256).
+    #[must_use]
+    pub fn history_replay_window(&self) -> Option<&HistoryReplayWindowPayload> {
+        match self {
+            Self::Node {
+                history_replay_window,
+                ..
+            } => history_replay_window.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Stamps the queryable vector index's [`EmbeddingModel`] identity on an
     /// `EmbeddingModel` node (issue #104). No-op on non-node records.
     #[must_use]
@@ -3264,6 +3344,14 @@ pub enum NodeKind {
     /// per-extension skip tally). Attached to its `Repository` by a `CONTAINS`
     /// edge so coverage is citable and never an orphan.
     ScanCoverage,
+    /// History-replay window summary (issue #256): one node per *windowed*
+    /// `eg scan-history`, carrying a [`HistoryReplayWindowPayload`] (the
+    /// resolved window: kind, selected commit count, and bounding SHAs /
+    /// instant) so a windowed store is never mistaken for full history.
+    /// Attached to its `Repository` by a `CONTAINS` edge so the summary is
+    /// citable and never an orphan. Never emitted for unwindowed (full)
+    /// replays, which stay byte-identical to pre-#256 output.
+    HistoryReplayWindow,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -3403,7 +3491,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 60] = [
+    pub const ALL: [Self; 61] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3415,6 +3503,7 @@ impl NodeKind {
         Self::UnsafeSite,
         Self::DependencyDeclaration,
         Self::ScanCoverage,
+        Self::HistoryReplayWindow,
         Self::Commit,
         Self::Change,
         Self::SemanticDrift,
@@ -3481,6 +3570,7 @@ impl NodeKind {
             Self::UnsafeSite => "UnsafeSite",
             Self::DependencyDeclaration => "DependencyDeclaration",
             Self::ScanCoverage => "ScanCoverage",
+            Self::HistoryReplayWindow => "HistoryReplayWindow",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

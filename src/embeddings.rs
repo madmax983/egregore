@@ -225,6 +225,9 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::DependencyDeclaration
         // The scan-coverage summary is counts, not source text (issue #135).
         | NodeKind::ScanCoverage
+        // The history-replay window summary is window metadata, not source
+        // text (issue #256).
+        | NodeKind::HistoryReplayWindow
         // Log-signature nodes carry no source bytes to embed (issues #319/#320).
         | NodeKind::LogSource
         | NodeKind::ErrorSignature

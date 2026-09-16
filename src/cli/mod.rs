@@ -204,13 +204,15 @@ use crate::{
         build_verification_records,
     },
     freshness::{self, Freshness},
+    history::HistoryWindow,
     identity,
     ir::{
         CallResolution, EdgeLabel, EmbeddingModel, EvidenceLink, Graph, GraphRecord, NodeKind,
         SnapshotHead, SourceSpan,
     },
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
+    local_project, query, scan_repository_history_with_override,
+    scan_repository_history_with_window, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -282,6 +284,24 @@ pub(crate) enum Commands {
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+        /// Replay only the N most-recent commits reachable from HEAD.
+        ///
+        /// Kept as a raw string so a non-integer value becomes the
+        /// single-line JSON `invalid_window` diagnostic (issue #256), not
+        /// Clap usage prose.
+        #[arg(long)]
+        max_commits: Option<String>,
+        /// Replay commits committed at or after this RFC 3339 instant.
+        #[arg(long)]
+        since: Option<String>,
+        /// Start of a `<from>..<to>` revision range (`from` excluded).
+        /// Defaults the end to HEAD when `--to` is absent.
+        #[arg(long)]
+        from: Option<String>,
+        /// End of a `<from>..<to>` revision range (`to` included). Without
+        /// `--from`, replays everything reachable from this revision.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Extract runtime log signatures from a captured log file (issues #319 / #320).
     ///
@@ -4503,8 +4523,16 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
             raw_literals,
+            max_commits,
+            since,
+            from,
+            to,
         } => {
-            let args = resolve_scan_args(repo_id_override, raw_literals);
+            let mut args = resolve_scan_args(repo_id_override, raw_literals);
+            args.max_commits = max_commits;
+            args.since = since;
+            args.from_rev = from;
+            args.to_rev = to;
             scan_history(&repo_path, &out, &args)
         }
         Commands::Config { action } => match action {

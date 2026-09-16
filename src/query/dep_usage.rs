@@ -572,12 +572,7 @@ mod tests {
         let rows = dep_usage(&records, "tokio", &index, None).expect("query runs");
         let order: Vec<(&str, usize)> = rows
             .iter()
-            .map(|r| {
-                (
-                    r.repo_relative_path,
-                    r.span.map_or(0, |s| s.start_line),
-                )
-            })
+            .map(|r| (r.repo_relative_path, r.span.map_or(0, |s| s.start_line)))
             .collect();
         assert_eq!(
             order,

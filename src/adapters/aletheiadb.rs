@@ -2682,6 +2682,7 @@ impl EmbeddedAletheiaSink {
             dependency,
             log,
             scan_coverage,
+            history_replay_window,
             embedding_model,
             text,
             superseded_by,
@@ -2899,6 +2900,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("scan_coverage_json", json.as_str());
+        }
+        // History-replay window summary (issue #256): persisted beside the
+        // scan-coverage summary so a windowed store round-trips its window.
+        if let Some(payload) = history_replay_window
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("history_replay_window_json", json.as_str());
         }
         // Vector-index embedding-model identity (issue #104): the queryable
         // index's producing model, persisted so `eg query semantic` can prove
@@ -3699,6 +3707,21 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<crate::ir::ScanCoveragePayload>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("scan_coverage_json invalid: {e}")))?
+            .map(Box::new),
+            history_replay_window: optional_str_property(
+                record_id,
+                "history_replay_window_json",
+                node.get_property("history_replay_window_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::HistoryReplayWindowPayload>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(
+                    record_id,
+                    format!("history_replay_window_json invalid: {e}"),
+                )
+            })?
             .map(Box::new),
             embedding_model: optional_str_property(
                 record_id,
@@ -4815,6 +4838,8 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Retraction" => Ok(NodeKind::Retraction),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
         "ScanCoverage" => Ok(NodeKind::ScanCoverage),
+        // History-replay window summary (issue #256).
+        "HistoryReplayWindow" => Ok(NodeKind::HistoryReplayWindow),
         // Log-signature node kinds (issues #319 / #320).
         "LogSource" => Ok(NodeKind::LogSource),
         "ErrorSignature" => Ok(NodeKind::ErrorSignature),
@@ -5160,6 +5185,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Retraction
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
+        | NodeKind::HistoryReplayWindow
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent
@@ -6423,6 +6449,53 @@ mod tests {
             "resolution status must survive the embedded round trip"
         );
         assert_eq!(read_back, edge, "edge record must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn history_replay_window_payload_round_trips_through_the_embedded_store() {
+        // Issue #256: a windowed `scan-history` emits a `HistoryReplayWindow`
+        // summary node; the embedded adapter must persist its payload and read
+        // it back unchanged, so a windowed store is never mistaken for full
+        // history after an ingest round trip.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-window-round-trip-store");
+        let node_id = stable_id(&["node", "history-replay-window", "count", "3"]);
+        let payload = crate::ir::HistoryReplayWindowPayload {
+            window: "count".to_owned(),
+            selected_commit_count: 3,
+            max_commits: Some(3),
+            since_instant: None,
+            from_rev: None,
+            to_rev: None,
+            from_sha: None,
+            to_sha: None,
+            oldest_commit_sha: "aaa".to_owned(),
+            newest_commit_sha: "ccc".to_owned(),
+        };
+        let node = GraphRecord::node(
+            node_id,
+            NodeKind::HistoryReplayWindow,
+            None,
+            None,
+            None,
+            "windowed history replay: newest 3 commits".to_owned(),
+        )
+        .with_history_replay_window(payload);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&node).expect("window node should write");
+        let StoredRecord::Node(stored) = sink.record_handles[node.id()] else {
+            panic!("node handle should point at a node");
+        };
+        let read_back = sink
+            .read_node_record(node.id(), stored)
+            .expect("window node should read back");
+
+        assert_eq!(
+            read_back.history_replay_window(),
+            node.history_replay_window(),
+            "history-replay window payload must survive the embedded round trip"
+        );
+        assert_eq!(read_back, node, "window node must round-trip byte-for-byte");
     }
 
     #[test]

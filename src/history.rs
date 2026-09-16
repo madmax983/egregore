@@ -45,13 +45,328 @@ pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
-    scan_repository_history_inner(repo_path, repo_id_override)
+    scan_repository_history_inner(repo_path, repo_id_override, &HistoryWindow::Full)
+}
+
+/// Scans Git history with an optional identity override and a commit window
+/// (issue #256).
+///
+/// `HistoryWindow::Full` replays the entire history exactly as
+/// [`scan_repository_history`]; the three window forms bound the replay to the
+/// selected commits and record the resolved window on a `HistoryReplayWindow`
+/// graph node so a windowed store is never mistaken for full history.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid, Git is unavailable, a
+/// reachable Rust source blob cannot be parsed, a range revision does not
+/// resolve, or the window selects no commits.
+pub fn scan_repository_history_with_window(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    window: &HistoryWindow,
+) -> Result<Graph> {
+    scan_repository_history_inner(repo_path, repo_id_override, window)
+}
+
+/// Commit-window selector for history replay (issue #256).
+///
+/// The window bounds which commits are replayed; the temporal selectors
+/// (`since`/`as_of`, issues #66/#118) instead filter *queries* over an
+/// already-ingested store. `Full` is the historical default: every commit
+/// reachable from `HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HistoryWindow {
+    /// Replay the entire history reachable from `HEAD` (default; unchanged).
+    #[default]
+    Full,
+    /// Replay the `max_commits` most-recent commits reachable from `HEAD`.
+    /// The walk never visits more than `max_commits` commits.
+    Count {
+        /// Maximum commits to replay; always ≥ 1 (zero is rejected).
+        max_commits: usize,
+    },
+    /// Replay commits whose committer time is at or after the instant.
+    Since {
+        /// The `--since` instant, normalized to UTC `Z` RFC 3339 form.
+        instant: String,
+    },
+    /// Replay commits in the `<from>..<to>` revision range (`from`
+    /// exclusive, `to` inclusive). A missing `to` defaults to `HEAD`; a
+    /// missing `from` replays everything reachable from `to`.
+    Range {
+        /// Range start revision, as given on the command line.
+        from: Option<String>,
+        /// Range end revision, as given on the command line.
+        to: Option<String>,
+    },
+}
+
+impl HistoryWindow {
+    /// Builds the window from raw `scan-history` flag values (issue #256).
+    ///
+    /// At most one window form may be given: `--max-commits`, `--since`, and
+    /// the `--from`/`--to` pair conflict pairwise. `--max-commits` must parse
+    /// as a positive integer and `--since` as an RFC 3339 instant (normalized
+    /// to UTC `Z` form). Every violation returns
+    /// [`CodegraphError::HistoryWindow`] with a machine-readable `code`
+    /// (`conflicting_window` or `invalid_window`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HistoryWindow` when the flags conflict or a window value does
+    /// not parse.
+    pub fn from_flags(
+        max_commits: Option<&str>,
+        since: Option<&str>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<Self> {
+        let forms = usize::from(max_commits.is_some())
+            + usize::from(since.is_some())
+            + usize::from(from.is_some() || to.is_some());
+        if forms > 1 {
+            return Err(CodegraphError::HistoryWindow {
+                code: "conflicting_window",
+                message: "only one of --max-commits, --since, or --from/--to may be given"
+                    .to_owned(),
+            });
+        }
+        if let Some(raw) = max_commits {
+            let max_commits = raw
+                .parse::<usize>()
+                .map_err(|_| CodegraphError::HistoryWindow {
+                    code: "invalid_window",
+                    message: format!("--max-commits must be a positive integer, got {raw:?}"),
+                })?;
+            if max_commits == 0 {
+                return Err(CodegraphError::HistoryWindow {
+                    code: "invalid_window",
+                    message: "--max-commits must be at least 1".to_owned(),
+                });
+            }
+            return Ok(Self::Count { max_commits });
+        }
+        if let Some(raw) = since {
+            return Ok(Self::Since {
+                instant: normalize_since_instant(raw)?,
+            });
+        }
+        if from.is_some() || to.is_some() {
+            return Ok(Self::Range { from, to });
+        }
+        Ok(Self::Full)
+    }
+}
+
+/// Normalizes a `--since` flag value to UTC `Z` RFC 3339 form (issue #256).
+///
+/// Fractional seconds are preserved; the value must carry an explicit offset
+/// (a bare date like `2026-01-04` is not RFC 3339 and is rejected).
+///
+/// # Errors
+///
+/// Returns `invalid_window` when the value is not a valid RFC 3339 instant.
+fn normalize_since_instant(raw: &str) -> Result<String> {
+    let parsed =
+        chrono::DateTime::parse_from_rfc3339(raw).map_err(|_| CodegraphError::HistoryWindow {
+            code: "invalid_window",
+            message: format!("--since must be an RFC 3339 instant, got {raw:?}"),
+        })?;
+    Ok(parsed
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+}
+
+/// A [`HistoryWindow`] resolved against a repository: the selected commits in
+/// replay (oldest-first) order plus, for windowed replays, the summary facts
+/// recorded on the `HistoryReplayWindow` node.
+struct ResolvedWindow {
+    /// The commits to replay, oldest first.
+    commits: Vec<GitCommit>,
+    /// Payload recorded on the `HistoryReplayWindow` node; `None` for the
+    /// full-history default, which emits no window node (issue #256 AC1).
+    payload: Option<crate::ir::HistoryReplayWindowPayload>,
+}
+
+/// Resolves a window to its commit list via read-only `git rev-list` plumbing
+/// (issue #256).
+///
+/// `HistoryWindow::Full` runs the exact pre-#256 `rev-list` invocation, so an
+/// unwindowed replay is byte-identical to today. Every other form pushes the
+/// bound down into `rev-list` itself, so the walk cost scales with the window
+/// rather than total history depth. The commands are read-only and run with
+/// `GIT_OPTIONAL_LOCKS=0` like the rest of the replay, preserving issue #110's
+/// no-mutation guarantee.
+///
+/// # Errors
+///
+/// Returns `unresolvable_rev` when a `--from`/`--to` revision does not resolve
+/// to a commit, and `empty_window` when the resolved window selects no
+/// commits.
+#[allow(clippy::too_many_lines)]
+fn resolve_window(repo_root: &Path, window: &HistoryWindow) -> Result<ResolvedWindow> {
+    let (kind, max_commits, since_instant, from_rev, to_rev, from_sha, to_sha, rev_args) =
+        match window {
+            HistoryWindow::Count { max_commits } => (
+                "count",
+                Some(*max_commits),
+                None,
+                None,
+                None,
+                None,
+                None,
+                vec![format!("-n{max_commits}")],
+            ),
+            HistoryWindow::Since { instant } => (
+                "since",
+                None,
+                Some(instant.clone()),
+                None,
+                None,
+                None,
+                None,
+                vec![format!("--since={instant}")],
+            ),
+            HistoryWindow::Range { from, to } => {
+                let to_rev = to.clone().unwrap_or_else(|| "HEAD".to_owned());
+                let to_sha = resolve_rev(repo_root, &to_rev, "--to")?;
+                let (from_rev, from_sha, range) = match from {
+                    Some(from_rev) => {
+                        let from_sha = resolve_rev(repo_root, from_rev, "--from")?;
+                        let range = format!("{from_sha}..{to_sha}");
+                        (Some(from_rev.clone()), Some(from_sha), range)
+                    }
+                    None => (None, None, to_sha.clone()),
+                };
+                (
+                    "range",
+                    None,
+                    None,
+                    from_rev,
+                    Some(to_rev),
+                    from_sha,
+                    Some(to_sha),
+                    vec![range],
+                )
+            }
+            HistoryWindow::Full => {
+                // The full-history default runs the exact pre-#256 `rev-list`
+                // invocation and records no window node, so an unwindowed
+                // replay is byte-identical to today (issue #256 AC1).
+                return Ok(ResolvedWindow {
+                    commits: list_commits(repo_root)?,
+                    payload: None,
+                });
+            }
+        };
+
+    let mut full_args: Vec<&str> = vec!["rev-list", "--reverse", "--topo-order"];
+    for bound in &rev_args {
+        full_args.push(bound);
+    }
+    // A range carries its own revision operand (`<from>..<to>` or `<to>`);
+    // every other form is bounded from `HEAD`, exactly like the full-history
+    // path below.
+    if !matches!(window, HistoryWindow::Range { .. }) {
+        full_args.push("HEAD");
+    }
+    let output = git_output(repo_root, &full_args)?;
+    let shas: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut commits = shas
+        .iter()
+        .map(|sha| commit_metadata(repo_root, sha))
+        .collect::<Result<Vec<GitCommit>>>()?;
+    if let HistoryWindow::Since { instant } = window {
+        apply_since_backstop(&mut commits, instant);
+    }
+    if commits.is_empty() {
+        return Err(CodegraphError::HistoryWindow {
+            code: "empty_window",
+            message: format!("the {kind} window selects no commits"),
+        });
+    }
+    let oldest = commits
+        .first()
+        .map(|commit| commit.sha.clone())
+        .unwrap_or_default();
+    let newest = commits
+        .last()
+        .map(|commit| commit.sha.clone())
+        .unwrap_or_default();
+    let selected_commit_count = commits.len();
+    Ok(ResolvedWindow {
+        commits,
+        payload: Some(crate::ir::HistoryReplayWindowPayload {
+            window: kind.to_owned(),
+            selected_commit_count,
+            max_commits,
+            since_instant,
+            from_rev,
+            to_rev,
+            from_sha,
+            to_sha,
+            oldest_commit_sha: oldest,
+            newest_commit_sha: newest,
+        }),
+    })
+}
+
+/// Re-checks a `--since` bound in Rust against each commit's committer date
+/// (issue #256).
+///
+/// Git's `--since` misparses ISO-8601 instants with years >= 2100 (git 2.43
+/// silently treats them as the epoch, selecting every commit), so the bound
+/// is verified here. Without this a far-future `--since` would replay history
+/// instead of failing as an empty window. The bound stays inclusive, matching
+/// git's `--since` semantics for well-formed dates.
+fn apply_since_backstop(commits: &mut Vec<GitCommit>, instant: &str) {
+    if let Ok(since_utc) = chrono::DateTime::parse_from_rfc3339(instant).map(|dt| dt.to_utc()) {
+        commits.retain(|commit| {
+            chrono::DateTime::parse_from_rfc3339(&commit.committed_at)
+                .map(|dt| dt.to_utc() >= since_utc)
+                .unwrap_or(true)
+        });
+    }
+}
+
+/// Resolves a `--from`/`--to` revision to a commit SHA (issue #256).
+///
+/// `rev-parse --verify <rev>^{commit}` is read-only; an unresolvable revision
+/// becomes an `unresolvable_rev` diagnostic naming the flag, never Git's raw
+/// stderr.
+///
+/// # Errors
+///
+/// Returns `unresolvable_rev` when the revision does not resolve to a commit.
+fn resolve_rev(repo_root: &Path, rev: &str, flag: &str) -> Result<String> {
+    let output = git_output(
+        repo_root,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .map_err(|_| CodegraphError::HistoryWindow {
+        code: "unresolvable_rev",
+        message: format!("{flag} revision {rev:?} does not resolve to a commit"),
+    })?;
+    let sha = output.trim().to_owned();
+    if sha.is_empty() {
+        return Err(CodegraphError::HistoryWindow {
+            code: "unresolvable_rev",
+            message: format!("{flag} revision {rev:?} does not resolve to a commit"),
+        });
+    }
+    Ok(sha)
 }
 
 #[allow(clippy::too_many_lines)]
 fn scan_repository_history_inner(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
+    window: &HistoryWindow,
 ) -> Result<Graph> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -93,11 +408,71 @@ fn scan_repository_history_inner(
             .with_source_snapshot(snapshot),
     );
 
+    // Issue #256: resolve the commit window before walking any history. The
+    // full-history default resolves through the exact pre-#256 `rev-list`
+    // invocation and records no window node; every windowed form records one
+    // `HistoryReplayWindow` node, `CONTAINS`-attached to the Repository, so a
+    // bounded store is never mistaken for full history.
+    let resolved = resolve_window(repo_root, window)?;
+    if let Some(payload) = resolved.payload {
+        // The window node's stable ID folds in the window semantics (form and
+        // normalized bounds), not just the selected endpoints: different window
+        // forms can select the same oldest/newest commits (e.g. `--max-commits
+        // 3` versus `--since <t>`), and each must remain a distinct node.
+        let max_commits = payload
+            .max_commits
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let window_id = stable_id(&[
+            "node",
+            "history-replay-window",
+            &repository_id,
+            &payload.window,
+            &max_commits,
+            payload.since_instant.as_deref().unwrap_or(""),
+            payload.from_rev.as_deref().unwrap_or(""),
+            payload.to_rev.as_deref().unwrap_or(""),
+            payload.from_sha.as_deref().unwrap_or(""),
+            payload.to_sha.as_deref().unwrap_or(""),
+            &payload.oldest_commit_sha,
+            &payload.newest_commit_sha,
+        ]);
+        let summary = format!(
+            "History replay window '{}' selected {} commit{}",
+            payload.window,
+            payload.selected_commit_count,
+            if payload.selected_commit_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+        graph.push(
+            GraphRecord::node(
+                window_id.clone(),
+                NodeKind::HistoryReplayWindow,
+                None,
+                None,
+                None,
+                summary,
+            )
+            .with_history_replay_window(payload)
+            .with_valid_time_inferred(&transaction_time),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repository_id.clone(),
+            window_id,
+            Some("1.0".to_owned()),
+            "Repository contains history replay window summary".to_owned(),
+        ));
+    }
+
     // Manifest-parse memo keyed by blob OID (issue #117): a `Cargo.toml` is
     // typically unchanged across hundreds of commits, so each distinct manifest
     // blob is read and parsed exactly once for the whole replay.
     let mut manifest_outcome_memo: BTreeMap<String, ManifestParseOutcome> = BTreeMap::new();
-    for commit in list_commits(repo_root)? {
+    for commit in resolved.commits {
         let commit_record = commit_record(&repository_id, &commit);
         let commit_id = commit_record.id().to_owned();
         graph.push(commit_record);
@@ -856,4 +1231,148 @@ fn normalize_git_path(path: &str) -> String {
 
 fn short_sha(sha: &str) -> &str {
     if sha.len() >= 12 { &sha[..12] } else { sha }
+}
+
+#[cfg(test)]
+mod history_window_tests {
+    use super::*;
+    use crate::error::CodegraphError;
+
+    fn window_code(error: CodegraphError) -> &'static str {
+        match error {
+            CodegraphError::HistoryWindow { code, .. } => code,
+            other => panic!("expected a HistoryWindow error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_flags_selects_full_history() {
+        assert_eq!(
+            HistoryWindow::from_flags(None, None, None, None).expect("no flags are valid"),
+            HistoryWindow::Full
+        );
+    }
+
+    #[test]
+    fn max_commits_parses_positive_counts() {
+        assert_eq!(
+            HistoryWindow::from_flags(Some("3"), None, None, None).expect("valid count"),
+            HistoryWindow::Count { max_commits: 3 }
+        );
+    }
+
+    #[test]
+    fn max_commits_rejects_zero() {
+        assert_eq!(
+            window_code(
+                HistoryWindow::from_flags(Some("0"), None, None, None)
+                    .expect_err("zero commits is an empty window")
+            ),
+            "invalid_window"
+        );
+    }
+
+    #[test]
+    fn max_commits_rejects_non_integers() {
+        for raw in ["many", "-2", "3.5", ""] {
+            assert_eq!(
+                window_code(
+                    HistoryWindow::from_flags(Some(raw), None, None, None)
+                        .expect_err("non-integer count must be rejected")
+                ),
+                "invalid_window",
+                "input {raw:?} should be an invalid_window"
+            );
+        }
+    }
+
+    #[test]
+    fn since_accepts_rfc3339_and_normalizes_to_utc() {
+        assert_eq!(
+            HistoryWindow::from_flags(None, Some("2026-01-04T00:00:00Z"), None, None)
+                .expect("valid instant"),
+            HistoryWindow::Since {
+                instant: "2026-01-04T00:00:00Z".to_owned()
+            }
+        );
+        assert_eq!(
+            HistoryWindow::from_flags(None, Some("2026-01-04T02:00:00+02:00"), None, None)
+                .expect("offset instant is valid RFC 3339"),
+            HistoryWindow::Since {
+                instant: "2026-01-04T00:00:00Z".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn since_rejects_non_rfc3339() {
+        for raw in ["tomorrow", "2026-01-04", "2026-13-99T99:99:99Z", ""] {
+            assert_eq!(
+                window_code(
+                    HistoryWindow::from_flags(None, Some(raw), None, None)
+                        .expect_err("non-RFC-3339 instant must be rejected")
+                ),
+                "invalid_window",
+                "input {raw:?} should be an invalid_window"
+            );
+        }
+    }
+
+    #[test]
+    fn range_accepts_from_and_to_forms() {
+        assert_eq!(
+            HistoryWindow::from_flags(None, None, Some("v1.0".to_owned()), Some("main".to_owned()))
+                .expect("from+to is a valid range"),
+            HistoryWindow::Range {
+                from: Some("v1.0".to_owned()),
+                to: Some("main".to_owned())
+            }
+        );
+        assert_eq!(
+            HistoryWindow::from_flags(None, None, Some("v1.0".to_owned()), None)
+                .expect("lone from is a valid range"),
+            HistoryWindow::Range {
+                from: Some("v1.0".to_owned()),
+                to: None
+            }
+        );
+        assert_eq!(
+            HistoryWindow::from_flags(None, None, None, Some("main".to_owned()))
+                .expect("lone to is a valid range"),
+            HistoryWindow::Range {
+                from: None,
+                to: Some("main".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn conflicting_window_forms_are_rejected() {
+        assert_eq!(
+            window_code(
+                HistoryWindow::from_flags(Some("3"), Some("2026-01-04T00:00:00Z"), None, None)
+                    .expect_err("count and since conflict")
+            ),
+            "conflicting_window"
+        );
+        assert_eq!(
+            window_code(
+                HistoryWindow::from_flags(Some("3"), None, Some("v1.0".to_owned()), None)
+                    .expect_err("count and from conflict")
+            ),
+            "conflicting_window"
+        );
+        assert_eq!(
+            window_code(
+                HistoryWindow::from_flags(
+                    None,
+                    Some("2026-01-04T00:00:00Z"),
+                    None,
+                    Some("main".to_owned())
+                )
+                .expect_err("since and to conflict")
+            ),
+            "conflicting_window"
+        );
+    }
 }
