@@ -10053,11 +10053,33 @@ fn handle_verb_semantic_search(
         .collect::<Vec<_>>();
     attach_repository_fields(&mut result_records, &repo_index);
 
-    HttpResponse::success(
-        Some(request_id),
-        200,
-        verb_success_result("semantic_search", &snapshot, &result_records),
-    )
+    let mut result = verb_success_result("semantic_search", &snapshot, &result_records);
+    // Issue #243: stamp the embedding-provenance envelope on the verb result
+    // so CLI (`--daemon`) and future MCP consumers get the same answer
+    // contract as the embedded lane. The query identity assumes the query
+    // vector came from the default local embedder — the CLI is currently the
+    // only producer of these vectors — and the index identity is read from
+    // the same store that produced the ranking above.
+    let provenance = crate::embeddings::embedding_provenance(
+        &crate::embeddings::default_embedding_model_identity(query_vector.len()),
+        &crate::embeddings::indexed_identities(&all_records),
+    );
+    // `EmbeddingProvenance` is a plain struct of strings/bools/vecs, so this
+    // serialization is infallible in practice; the error arm stays honest
+    // rather than silently degrading the answer contract.
+    let provenance_value = match serde_json::to_value(&provenance) {
+        Ok(value) => value,
+        Err(error) => {
+            return HttpResponse::error(ApiError::internal(format!(
+                "failed to serialize embedding provenance: {error}"
+            )));
+        }
+    };
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("embedding_provenance".to_owned(), provenance_value);
+    }
+
+    HttpResponse::success(Some(request_id), 200, result)
 }
 
 // ── Verb handler: observations_for_symbol (issue #38) ────────────────────────

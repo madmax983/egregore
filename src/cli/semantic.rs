@@ -255,6 +255,38 @@ fn report_empty_semantic_result(
     std::process::exit(2);
 }
 
+/// Prints the issue #243 embedding-provenance envelope as the first line of a
+/// semantic answer, exactly once, in the answer's output format.
+///
+/// The wrapper routes through the shared [`print_result`] renderer, so JSON
+/// answers keep their JSONL contract (a leading `{"embedding_provenance":
+/// {...}}` line ahead of the unchanged `SemanticResult` rows) and text
+/// answers get one leading `embedding_provenance: ...` header line.
+#[cfg(feature = "embeddings")]
+fn print_embedding_provenance(
+    format: OutputFormat,
+    provenance: &crate::embeddings::EmbeddingProvenance,
+) -> Result<()> {
+    print_result(&EmbeddingProvenanceLine { provenance }, format)
+}
+
+/// Newtype letting the issue #243 envelope flow through [`print_result`].
+/// Serializes as `{"embedding_provenance": {...}}`; the text rendering is the
+/// envelope's one-line [`crate::embeddings::EmbeddingProvenance::as_text`].
+#[cfg(feature = "embeddings")]
+#[derive(serde::Serialize)]
+struct EmbeddingProvenanceLine<'a> {
+    #[serde(rename = "embedding_provenance")]
+    provenance: &'a crate::embeddings::EmbeddingProvenance,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for EmbeddingProvenanceLine<'_> {
+    fn as_text(&self) -> String {
+        self.provenance.as_text()
+    }
+}
+
 /// Semantic similarity search against an embedded store.
 ///
 /// `under` optionally scopes results to a repo-relative path prefix (issue #198,
@@ -317,10 +349,38 @@ pub(crate) fn query_semantic(
     if enforce_index_compatibility(&sink, &records)?
         == crate::embeddings::IndexCompatibility::IndexAbsent
     {
+        // Issue #243: even a never-embedded store gets a provenance envelope —
+        // the answer still names the query model and the absent index, with the
+        // absent-marker fingerprint. Built before the model is loaded, exactly
+        // like the gate above.
+        use crate::embeddings::{
+            DEFAULT_EMBEDDING_MODEL_DIMENSIONS, default_embedding_model_identity,
+            embedding_provenance, indexed_identities,
+        };
+        let provenance = embedding_provenance(
+            &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+            &indexed_identities(&records),
+        );
+        print_embedding_provenance(format, &provenance)?;
         report_empty_semantic_result(under_prefix, false, true);
     }
 
     let query_vector = embed_query_checked(query, &sink, &records)?;
+
+    // Issue #243: stamp the embedding-provenance envelope once, before any
+    // rows or verdicts. The query identity is derived from the actual embedded
+    // vector's length — the same derivation `embed_query_checked` gated on —
+    // and the index identity from the store that produced the ranking below.
+    {
+        use crate::embeddings::{
+            default_embedding_model_identity, embedding_provenance, indexed_identities,
+        };
+        let provenance = embedding_provenance(
+            &default_embedding_model_identity(query_vector.len()),
+            &indexed_identities(&records),
+        );
+        print_embedding_provenance(format, &provenance)?;
+    }
 
     // Over-fetch the whole index, not just `limit` raw hits: the shared vector
     // index now also embeds agent-memory nodes (issue #91), so a query whose top
@@ -897,6 +957,9 @@ pub(crate) fn query_semantic_via_daemon(
     );
 
     let query_vector = embed_query_text(query)?;
+    // Issue #243: the query identity reflects the actual embedder — derived
+    // from the produced vector's length, exactly as on the embedded lane.
+    let query_identity = crate::embeddings::default_embedding_model_identity(query_vector.len());
     let mut params = serde_json::json!({
         "query_vector": query_vector,
         "limit": limit as u64,
@@ -904,9 +967,47 @@ pub(crate) fn query_semantic_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client
-        .query_verb("semantic_search", &params, None)
-        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
+    // Issue #243: fetch the raw result object (not just the records) so the
+    // answer carries the same embedding-provenance envelope the embedded lane
+    // stamps. The daemon builds the envelope from the same store/index that
+    // produced the ranking, so MCP consumers of this verb inherit it too.
+    let result = match client.query_verb_raw("semantic_search", &params, None) {
+        Ok(result) => result,
+        Err(error) => {
+            // A store with no vector index is a no-result answer, not a
+            // transport failure: stamp the envelope (query model from the
+            // actual local embedder, absent index) and exit 2, like the
+            // embedded lane.
+            let missing_index = error
+                .downcast_ref::<crate::daemon::DaemonQueryRejection>()
+                .is_some_and(|rejection| rejection.code == "missing_semantic_index");
+            if missing_index {
+                let provenance = crate::embeddings::embedding_provenance(&query_identity, &[]);
+                print_embedding_provenance(format, &provenance)?;
+                eprintln!(
+                    "no results — store may not have embeddings (re-run ingest with --embed)"
+                );
+                std::process::exit(2);
+            }
+            return Err(surface_daemon_selector_rejection(error, repo));
+        }
+    };
+
+    // Deserialize into the typed envelope and re-serialize through the shared
+    // printer: a raw JSON round-trip would reorder the fields (serde_json maps
+    // sort keys), breaking byte parity with the embedded lane.
+    let provenance: crate::embeddings::EmbeddingProvenance = serde_json::from_value(
+        result
+            .get("embedding_provenance")
+            .cloned()
+            .unwrap_or_default(),
+    )
+    .context("daemon semantic_search result is missing its embedding_provenance envelope")?;
+    print_embedding_provenance(format, &provenance)?;
+
+    let records: Vec<serde_json::Value> =
+        serde_json::from_value(result.get("records").cloned().unwrap_or_default())
+            .context("daemon semantic_search result has no records array")?;
 
     if records.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");

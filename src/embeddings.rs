@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ir::{
     EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SEMANTIC_SCHEMA_VERSION,
     SelectionBasis, SemanticDriftMetadata, TemporalMetadata, semantic_stable_id,
@@ -1254,6 +1256,155 @@ pub fn classify_index_compatibility(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #243: embedding-provenance envelope for semantic query answers.
+// ---------------------------------------------------------------------------
+
+/// Similarity metric used by every semantic search (issue #243).
+///
+/// `AletheiaDB`'s `similarity_search` ranks by cosine similarity; the `score`
+/// on every `SemanticResult` is a cosine score. Stamped on the envelope so a
+/// consumer never has to guess what the scores mean.
+pub const EMBEDDING_SIMILARITY_METRIC: &str = "cosine";
+
+/// Provenance stamped exactly once on every semantic query answer (issue #243).
+///
+/// `SemanticResult` rows are intentionally unchanged; this envelope is printed
+/// ahead of the rows (JSON: one leading `{"embedding_provenance": ...}` line;
+/// text: one leading `embedding_provenance: ...` line), naming the model that
+/// embedded the query and the model identity recorded at index time.
+///
+/// Field order is the serialization contract: serde emits struct fields in
+/// declaration order, so re-running an identical query against an unchanged
+/// store with the same model reproduces the envelope byte-for-byte with no
+/// canonicalization pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingProvenance {
+    /// Identity of the model that produced the query vector.
+    pub query_model: EmbeddingModel,
+    /// Identity recorded when the vector index was built; `None` when the
+    /// store carries no vector index (never embedded).
+    pub index_model: Option<EmbeddingModel>,
+    /// Similarity metric the ranking used (always [`EMBEDDING_SIMILARITY_METRIC`]).
+    pub metric: String,
+    /// BLAKE3 fingerprint of the index-producing model identity, or of the
+    /// absent-marker when the store has no vector index. Two answers whose
+    /// fingerprints differ were produced under different index identities:
+    /// that is the model-drift signal. See `docs/cli/query.md`.
+    pub index_fingerprint: String,
+    /// Whether the query model identity matches the index identity exactly.
+    /// A mismatch is reported here explicitly (with the differing fields in
+    /// [`mismatch_fields`]) instead of letting scores from incomparable
+    /// embedding spaces look meaningful.
+    pub model_match: bool,
+    /// Fields where the query and index identities differ, in
+    /// [`differing_identity_fields`] declaration order (empty on match, and
+    /// empty when there is no index identity to compare against).
+    pub mismatch_fields: Vec<String>,
+}
+
+impl EmbeddingProvenance {
+    /// One-line human-readable rendering for `--format text` answers.
+    ///
+    /// Carries every envelope field; machine consumers must use the JSON
+    /// rendering (the text format is not a stability contract).
+    #[must_use]
+    pub fn as_text(&self) -> String {
+        let index_model = self.index_model.as_ref().map_or_else(
+            || "absent".to_owned(),
+            |model| {
+                format!(
+                    "name={} version={} dim={}",
+                    model.name, model.version, model.dim
+                )
+            },
+        );
+        let mismatch_fields = if self.mismatch_fields.is_empty() {
+            "none".to_owned()
+        } else {
+            self.mismatch_fields.join(",")
+        };
+        format!(
+            "embedding_provenance: provider={} name={} version={} dim={} metric={} index_fingerprint={} model_match={} mismatch_fields={} index_model=[{index_model}]",
+            self.query_model.provider,
+            self.query_model.name,
+            self.query_model.version,
+            self.query_model.dim,
+            self.metric,
+            self.index_fingerprint,
+            self.model_match,
+            mismatch_fields,
+        )
+    }
+}
+
+/// Builds the provenance envelope for one semantic query answer (issue #243).
+///
+/// `indexed_models` is the identity list from [`indexed_identities`] for the
+/// store that produced the ranking. The index side of the envelope is the
+/// single recorded identity when the store names exactly one — the
+/// compatibility gate in `src/cli/semantic.rs` refuses to search when the
+/// store names zero (treated as `None` here) or more than one. Callers that
+/// pass more than one recorded identity are misusing this constructor: it
+/// carries the first rather than silently merging identities.
+#[must_use]
+pub fn embedding_provenance(
+    query_model: &EmbeddingModel,
+    indexed_models: &[EmbeddingModel],
+) -> EmbeddingProvenance {
+    let index_model = indexed_models.first().cloned();
+    let mismatch_fields: Vec<String> = index_model.as_ref().map_or_else(Vec::new, |index| {
+        differing_identity_fields(index, query_model)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    });
+    let model_match = index_model.is_some() && mismatch_fields.is_empty();
+    EmbeddingProvenance {
+        index_fingerprint: embedding_index_fingerprint(index_model.as_ref()),
+        query_model: query_model.clone(),
+        index_model,
+        metric: EMBEDDING_SIMILARITY_METRIC.to_owned(),
+        model_match,
+        mismatch_fields,
+    }
+}
+
+/// Stable identity fingerprint for a store's vector index (issue #243).
+///
+/// BLAKE3 over the recorded index model identity (`provider`, `name`,
+/// `version`, `dim`, `content_hash`), NUL-separated exactly like
+/// [`semantic_stable_id`]. When the store carries no vector index, the hash
+/// covers the literal marker `absent` instead, so an empty store still yields
+/// a well-formed envelope with a fingerprint that can never collide with a
+/// real model identity.
+///
+/// This is an *index-identity* fingerprint, not a store-content fingerprint:
+/// it answers "which model produced this index" — the model-drift question —
+/// not "which records does this store hold". Two stores embedded with the
+/// same model share a fingerprint; two answers from the same store whose
+/// fingerprints differ mean the index was rebuilt under a different model.
+#[must_use]
+pub fn embedding_index_fingerprint(index_model: Option<&EmbeddingModel>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut push = |part: &str| {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    };
+    push("embedding_index");
+    match index_model {
+        Some(model) => {
+            push(&model.provider);
+            push(&model.name);
+            push(&model.version);
+            push(&model.dim.to_string());
+            push(&model.content_hash);
+        }
+        None => push("absent"),
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 #[cfg(test)]
 mod index_identity_tests {
     use super::*;
@@ -1874,5 +2025,200 @@ mod index_identity_tests {
         assert_eq!(identity.content_hash, DEFAULT_EMBEDDING_MODEL_CONTENT_HASH);
         assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(identity.dim as usize, DEFAULT_EMBEDDING_MODEL_DIMENSIONS);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// Issue #243: embedding-provenance envelope for semantic query answers.
+//
+// RED PHASE: these tests fail until `EMBEDDING_SIMILARITY_METRIC`,
+// `EmbeddingProvenance`, `embedding_index_fingerprint`, and
+// `embedding_provenance` exist. They pin the envelope contract: every
+// `eg query semantic` answer carries provider + name + version + dimension +
+// metric + index fingerprint exactly once, serialized byte-deterministically,
+// and a query/index identity mismatch is reported explicitly (never a silently
+// incomparable score).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn model(name: &str, version: &str, dim: u32) -> EmbeddingModel {
+        EmbeddingModel {
+            provider: "aletheiadb_re_export".to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            dim,
+            content_hash: "unknown".to_owned(),
+        }
+    }
+
+    /// Independent fingerprint oracle: BLAKE3 over NUL-joined parts, the same
+    /// framing `semantic_stable_id` uses, so the golden test does not just
+    /// re-call the implementation.
+    fn oracle_fingerprint(parts: &[&str]) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for part in parts {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// The envelope serializes byte-deterministically: two builds from the
+    /// same identities produce identical bytes, and the field order is the
+    /// declared struct order (never a sorted map).
+    #[test]
+    fn provenance_serialization_is_byte_deterministic() {
+        let query = model("m", "0.1.0", 384);
+        let first =
+            serde_json::to_string(&embedding_provenance(&query, std::slice::from_ref(&query)))
+                .expect("provenance serializes");
+        let second =
+            serde_json::to_string(&embedding_provenance(&query, std::slice::from_ref(&query)))
+                .expect("provenance serializes");
+        assert_eq!(
+            first, second,
+            "re-running against an unchanged store must reproduce the envelope byte-for-byte"
+        );
+        assert!(
+            first.starts_with(r#"{"query_model":{"provider":"aletheiadb_re_export","name":"m","version":"0.1.0","dim":384,"content_hash":"unknown"}"#),
+            "field order must be the declared struct order, got: {first}"
+        );
+    }
+
+    /// Golden JSON shape: every required envelope field is present with the
+    /// exact fingerprint the documented construction produces.
+    #[test]
+    fn provenance_golden_json_shape() {
+        let query = model("m", "0.1.0", 384);
+        let provenance = embedding_provenance(&query, std::slice::from_ref(&query));
+        let fingerprint = oracle_fingerprint(&[
+            "embedding_index",
+            "aletheiadb_re_export",
+            "m",
+            "0.1.0",
+            "384",
+            "unknown",
+        ]);
+        let expected = format!(
+            r#"{{"query_model":{{"provider":"aletheiadb_re_export","name":"m","version":"0.1.0","dim":384,"content_hash":"unknown"}},"index_model":{{"provider":"aletheiadb_re_export","name":"m","version":"0.1.0","dim":384,"content_hash":"unknown"}},"metric":"cosine","index_fingerprint":"{fingerprint}","model_match":true,"mismatch_fields":[]}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&provenance).expect("provenance serializes"),
+            expected,
+            "the envelope shape is a locked contract"
+        );
+    }
+
+    /// A query/index identity mismatch is reported explicitly: `model_match`
+    /// is false, the differing fields are named in declared order, and BOTH
+    /// identities are carried — never a silently incomparable score.
+    #[test]
+    fn provenance_reports_model_mismatch_explicitly() {
+        let query = model("model-b", "0.2.0", 384);
+        let indexed = model("model-a", "0.1.0", 384);
+        let provenance = embedding_provenance(&query, std::slice::from_ref(&indexed));
+        assert!(
+            !provenance.model_match,
+            "differing identities must not report a match"
+        );
+        assert_eq!(provenance.mismatch_fields, vec!["name", "version"]);
+        assert_eq!(provenance.query_model.name, "model-b");
+        assert_eq!(
+            provenance
+                .index_model
+                .as_ref()
+                .expect("index identity is carried")
+                .name,
+            "model-a"
+        );
+        let json = serde_json::to_string(&provenance).expect("provenance serializes");
+        assert!(json.contains(r#""model_match":false"#), "got: {json}");
+        assert!(
+            json.contains(r#""mismatch_fields":["name","version"]"#),
+            "got: {json}"
+        );
+    }
+
+    /// No vector index (never-embedded store) still yields a well-formed
+    /// envelope: `index_model` is null, `model_match` is false, and the
+    /// fingerprint is the stable absent-marker hash.
+    #[test]
+    fn provenance_absent_index_is_well_formed() {
+        let query = model("m", "0.1.0", 384);
+        let provenance = embedding_provenance(&query, &[]);
+        assert!(provenance.index_model.is_none());
+        assert!(!provenance.model_match);
+        assert!(provenance.mismatch_fields.is_empty());
+        assert_eq!(
+            provenance.index_fingerprint,
+            oracle_fingerprint(&["embedding_index", "absent"])
+        );
+        let json = serde_json::to_string(&provenance).expect("provenance serializes");
+        assert!(json.contains(r#""index_model":null"#), "got: {json}");
+    }
+
+    /// The fingerprint is a model-identity signal: same identity → same
+    /// fingerprint; any identity change → a different fingerprint (the drift
+    /// signal documented in `docs/cli/query.md`).
+    #[test]
+    fn index_fingerprint_is_stable_and_model_sensitive() {
+        let base = model("m", "0.1.0", 384);
+        let same = model("m", "0.1.0", 384);
+        let renamed = model("other", "0.1.0", 384);
+        let bumped = model("m", "0.2.0", 384);
+        assert_eq!(
+            embedding_index_fingerprint(Some(&base)),
+            embedding_index_fingerprint(Some(&same))
+        );
+        assert_ne!(
+            embedding_index_fingerprint(Some(&base)),
+            embedding_index_fingerprint(Some(&renamed))
+        );
+        assert_ne!(
+            embedding_index_fingerprint(Some(&base)),
+            embedding_index_fingerprint(Some(&bumped))
+        );
+        assert_ne!(
+            embedding_index_fingerprint(Some(&base)),
+            embedding_index_fingerprint(None)
+        );
+    }
+
+    /// The similarity metric is the documented constant: cosine.
+    #[test]
+    fn provenance_metric_is_cosine() {
+        assert_eq!(EMBEDDING_SIMILARITY_METRIC, "cosine");
+        let query = model("m", "0.1.0", 384);
+        let provenance = embedding_provenance(&query, std::slice::from_ref(&query));
+        assert_eq!(provenance.metric, "cosine");
+    }
+
+    /// The text rendering carries every required field exactly once.
+    #[test]
+    fn provenance_text_rendering_carries_required_fields() {
+        let query = model("m", "0.1.0", 384);
+        let provenance = embedding_provenance(&query, std::slice::from_ref(&query));
+        let text = provenance.as_text();
+        for required in [
+            "aletheiadb_re_export",
+            "name=m",
+            "version=0.1.0",
+            "dim=384",
+            "metric=cosine",
+            "index_fingerprint=",
+            "model_match=true",
+        ] {
+            assert!(
+                text.contains(required),
+                "text rendering must carry {required}, got: {text}"
+            );
+        }
+        assert_eq!(
+            text.matches("index_fingerprint=").count(),
+            1,
+            "envelope appears once per answer, got: {text}"
+        );
     }
 }

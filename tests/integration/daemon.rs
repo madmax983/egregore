@@ -12580,6 +12580,94 @@ fn daemon_semantic_search_omits_span_when_absent() {
     );
 }
 
+// ── Issue #243: the verb result carries the embedding-provenance envelope ────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_result_carries_embedding_provenance() {
+    // The envelope is built from the same store/index that produced the
+    // ranking, so `--daemon` CLI answers and future MCP consumers get the same
+    // contract as the embedded lane. Driven with a synthetic query vector — no
+    // embedding model is loaded anywhere in this test.
+    use aletheia_egregore::embeddings::{
+        default_embedding_model_identity, embedding_index_identity_record,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-provenance-store");
+    build_semantic_fixture_store(&data_dir, 8);
+
+    // Stamp the index identity the daemon reads back: the default model
+    // identity at the fixture's synthetic dimension, so the query identity
+    // (derived from the actual query vector length) matches it exactly.
+    let identity = default_embedding_model_identity(SEMANTIC_FIXTURE_DIM);
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("store should reopen");
+        sink.write_record(&embedding_index_identity_record(&identity))
+            .expect("identity record should write");
+        sink.persist_indexes().expect("indexes should persist");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "provenance-verb",
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0), "limit": 5_u64 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "semantic_search should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    let provenance = &body["result"]["embedding_provenance"];
+    assert!(
+        provenance.is_object(),
+        "verb result must carry the embedding_provenance envelope, got {body}"
+    );
+    assert_eq!(
+        provenance["query_model"]["provider"], "aletheiadb_re_export",
+        "query identity names the embedder, got {provenance}"
+    );
+    assert_eq!(
+        provenance["query_model"]["name"], "sentence-transformers/all-MiniLM-L6-v2",
+        "got {provenance}"
+    );
+    assert_eq!(
+        provenance["query_model"]["dim"], SEMANTIC_FIXTURE_DIM as u64,
+        "query identity reflects the ACTUAL query vector length, got {provenance}"
+    );
+    assert_eq!(
+        provenance["index_model"]["name"], "sentence-transformers/all-MiniLM-L6-v2",
+        "index identity is read from the ranked store, got {provenance}"
+    );
+    assert_eq!(provenance["metric"], "cosine", "got {provenance}");
+    assert_eq!(provenance["model_match"], true, "got {provenance}");
+    assert_eq!(
+        provenance["mismatch_fields"],
+        serde_json::json!([]),
+        "got {provenance}"
+    );
+    assert_eq!(
+        provenance["index_fingerprint"].as_str().map(str::len),
+        Some(64),
+        "fingerprint is BLAKE3 hex, got {provenance}"
+    );
+    // Rows are unchanged: still bounded retrieval leads.
+    let rows = body["result"]["records"]
+        .as_array()
+        .expect("records must be an array");
+    assert!(!rows.is_empty(), "expected ranked rows, got {body}");
+}
+
 // ── AC6 + AC7: rows are bounded retrieval leads, never raw content or proof ───
 #[cfg(feature = "embeddings")]
 #[test]

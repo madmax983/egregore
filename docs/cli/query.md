@@ -1131,10 +1131,12 @@ would let a model swap, cache change, or version bump produce a cosine ranking
 computed **across incompatible vector spaces** and return it as a confident
 answer.
 
-When the identities match, results are returned **exactly as before**: the check
-adds no change to ranking, scores, ordering, or the output schema. When they do
-not, the query is refused with a stable machine-readable envelope on stdout and a
-distinct nonzero exit code — never a ranked result list:
+When the identities match, ranking, scores, ordering, and the `SemanticResult`
+row fields are unchanged by the check — but every answer now starts with the
+[embedding-provenance envelope](#embedding-provenance-envelope-issue-243)
+(issue #243), which is additive and appears once per answer, not per row. When
+they do not match, the query is refused with a stable machine-readable envelope
+on stdout and a distinct nonzero exit code — never a ranked result list:
 
 | Exit | `code` | Condition |
 |------|--------|-----------|
@@ -1176,6 +1178,69 @@ One JSON object per line (JSONL). The default output format is `json`. Field nam
 | `repository` | string | when attributable | Human-usable repository identity handle. |
 
 Machine consumers must depend only on the fields listed above. Additional fields may be added in future releases; removing or renaming any of the fields above constitutes a breaking contract change and requires a version bump.
+
+### Embedding-provenance envelope (issue #243)
+
+Every `eg query semantic` answer starts with one embedding-provenance envelope,
+printed exactly once ahead of the result rows (or ahead of the abstention
+verdict, or ahead of nothing on a no-result answer). The envelope names the
+model that embedded the query and the model identity recorded when the vector
+index was built, so a score is never silently incomparable across embedding
+spaces. `SemanticResult` row fields are unchanged; the envelope is additive.
+
+JSON answers keep their JSONL contract: the first line is a single-key object,
+followed by one `SemanticResult` object per line:
+
+```json
+{"embedding_provenance":{"query_model":{"provider":"aletheiadb_re_export","name":"sentence-transformers/all-MiniLM-L6-v2","version":"0.1.0","dim":384,"content_hash":"unknown"},"index_model":{"provider":"aletheiadb_re_export","name":"sentence-transformers/all-MiniLM-L6-v2","version":"0.1.0","dim":384,"content_hash":"unknown"},"metric":"cosine","index_fingerprint":"9f2c…","model_match":true,"mismatch_fields":[]}}
+{"record_id":"codegraph:v1:abc123","name":"…","score":0.9231,…}
+```
+
+Text answers start with one header line instead:
+
+```text
+embedding_provenance: provider=aletheiadb_re_export name=sentence-transformers/all-MiniLM-L6-v2 version=0.1.0 dim=384 metric=cosine index_fingerprint=9f2c… model_match=true mismatch_fields=none index_model=[name=sentence-transformers/all-MiniLM-L6-v2 version=0.1.0 dim=384]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `query_model` | object | Identity of the model that produced the query vector: `provider`, `name`, `version`, `dim`, `content_hash`. Derived from the actual embedded query, not from configuration. |
+| `index_model` | object or `null` | Identity recorded when the vector index was built. `null` when the store carries no vector index (never `--embed`ed). |
+| `metric` | string | Similarity metric the ranking used: always `"cosine"`. The `score` on every row is a cosine similarity. |
+| `index_fingerprint` | string | BLAKE3 fingerprint (64 lowercase hex chars) of the index-producing model identity, or of the literal marker `absent` when the store has no vector index. |
+| `model_match` | boolean | Whether the query model identity matches the index identity exactly. A mismatch is reported here explicitly — never as silently incomparable scores. (When the mismatch is one the compatibility gate refuses, the query is still refused with exits `7`–`11` before any answer is produced; see below.) |
+| `mismatch_fields` | string[] | Fields where the query and index identities differ (`provider`, `name`, `version`, `dim`, `content_hash`), in declaration order. Empty on match, and empty when there is no index identity to compare against. |
+
+The envelope is emitted on **every** answer shape, including the no-result
+(exit `2`) and never-embedded-store (exit `2`) answers, where `index_model`
+is `null` and `model_match` is `false`. Re-running an identical query against
+an unchanged store with the same model reproduces the envelope byte-for-byte:
+field order is fixed and no timestamps or paths are included.
+
+#### Drift detection via field comparison
+
+No new CLI verb is needed to detect model drift; compare the envelope fields
+across runs:
+
+1. Capture the envelope line: `eg query semantic "…" --data-dir <DIR> | head -n 1`.
+2. Compare `index_fingerprint` between runs. A changed fingerprint means the
+   index was rebuilt under a different model identity — that is the drift
+   signal. Two stores embedded with the same model share a fingerprint; it is
+   an index-*identity* fingerprint, not a store-content fingerprint, and it
+   deliberately contains no filesystem paths, so it stays comparable across
+   machines and data-dir renames.
+3. For the details behind a changed fingerprint, compare `index_model`
+   field-by-field (`name`, `version`, `dim`, …) and read `model_match` /
+   `mismatch_fields` for the query-vs-index verdict on the latest run.
+
+The `--daemon` lane prints the same envelope: the daemon's `semantic_search`
+verb result carries `embedding_provenance`, built from the same store/index
+that produced the ranking, and the CLI re-serializes it through the identical
+printer, so the bytes match the embedded lane field-for-field. (The daemon
+assumes the query vector came from the default local embedder — the CLI is
+currently the only producer of these vectors.) There is not yet a
+semantic-search MCP tool (that is issue #181); when it lands on the daemon
+verb it will inherit this envelope unchanged.
 
 ### No-result and missing-embedding behavior
 
