@@ -209,6 +209,14 @@ Outcomes:
   embeddings` message so an agent can tell "nothing under this prefix" apart from
   "this store has no semantic index".
 
+## Capability manifest (`eg query lanes`, issue #251)
+
+`eg query lanes [--format json|text]` emits the machine-readable capability
+manifest: a deterministic JSON catalog of every public query lane (stable id,
+one-line purpose, required inputs, store mode, answer trust classes,
+citation-handle flag, freshness semantics). Local and pure — no network, no
+ingested store, no project config. See [query-lanes.md](query-lanes.md).
+
 ## Exit codes
 
 | Code | Meaning |

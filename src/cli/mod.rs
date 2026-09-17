@@ -40,6 +40,7 @@ mod import;
 mod index;
 mod ingest;
 mod inspect;
+mod lanes;
 mod lifeline;
 mod link_logs;
 mod locate;
@@ -131,6 +132,7 @@ pub(crate) use import::*;
 pub(crate) use index::*;
 pub(crate) use ingest::*;
 pub(crate) use inspect::*;
+pub(crate) use lanes::*;
 pub(crate) use lifeline::*;
 pub(crate) use link_logs::*;
 pub(crate) use locate::*;
@@ -3746,6 +3748,16 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Emit the machine-readable query-lane capability manifest (issue #251).
+    ///
+    /// Local and pure: derived from the command surface alone — no network,
+    /// no ingested store, no project config. Works on a fresh clone with an
+    /// empty data dir.
+    Lanes {
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -5905,8 +5917,13 @@ pub(crate) struct FailureHistoryResponse<'a> {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
     // Fail fast on a malformed `egregore.toml` even for lanes that never read
-    // the store (issue #261): a bad config is never silently ignored.
-    let _ = cli_project_config();
+    // the store (issue #261): a bad config is never silently ignored. The
+    // lanes manifest (issue #251) is the exception: it is local and pure —
+    // clap metadata only — so it skips config parsing entirely and works on
+    // a fresh clone with an empty data dir.
+    if !matches!(subcommand, QuerySubcommand::Lanes { .. }) {
+        let _ = cli_project_config();
+    }
     match subcommand {
         QuerySubcommand::Churn {
             graph,
@@ -8219,6 +8236,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_session_cmd(&records, &id_or_handle, format)
         }
+        QuerySubcommand::Lanes { format } => query_lanes_cmd(format),
     }
 }
 

@@ -260,6 +260,7 @@ egregore query symbol <name>  --data-dir .egregore
 egregore query file   <path>  --data-dir .egregore
 egregore query drift          --data-dir .egregore
 egregore query semantic <text> --data-dir .egregore-semantic
+egregore query lanes                                  # capability manifest: every query lane, JSON
 egregore import-codex session.jsonl --out agent.graph.jsonl  # Codex session/rollout import
 egregore bundle export --root-selector <selector> \
     --graph <path> --out <path>                            # export evidence bundle

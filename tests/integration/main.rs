@@ -55,6 +55,7 @@ mod import_github_behaviour;
 mod incremental;
 mod ingest;
 mod inspect_store;
+mod lane_manifest;
 mod line_ending_determinism;
 mod link_evidence;
 mod link_logs;
