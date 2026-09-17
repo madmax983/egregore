@@ -234,6 +234,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "deprecated-symbols",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
         "deps",
         LaneStatic {
             store_mode: StoreMode::Structural,
@@ -965,10 +974,7 @@ mod tests {
             json(),
             "manifest JSON must be byte-for-byte stable across runs"
         );
-        assert_eq!(
-            with_big_stack(render_text),
-            with_big_stack(render_text)
-        );
+        assert_eq!(with_big_stack(render_text), with_big_stack(render_text));
     }
 
     #[test]
