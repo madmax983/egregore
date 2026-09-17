@@ -68,6 +68,10 @@ Evidence-backed audit subcommands have their own pages:
   agent-failure density** across all imported runs, the store-wide complement
   to `eg query failures` ([failure-hotspots.md](failure-hotspots.md), issue
   #254).
+- `eg query diagnostics` — **extractor-coverage-gap diagnostics** — the
+  extractor's self-declared blind spots (unsupported macro invocations,
+  unresolved call/dispatch stubs) as citable `Diagnostic` rows, one per gap,
+  with no scan or recompute ([diagnostics.md](diagnostics.md), issue #246).
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
@@ -2013,3 +2017,40 @@ rank by *source change frequency* — a stable file that silently defeats every
 agent shows up in neither. Issue trackers know task status, not
 code-target-level agent attempts. Nothing else aggregates per-run failures
 into a ranked, evidence-cited map of where agents keep drowning.
+
+## eg query diagnostics
+
+List persisted **extractor-coverage-gap `Diagnostic` graph nodes** (issue
+#246): the extractor's self-declared blind spots — where it flagged something
+it could not parse or resolve — as citable rows, with no scan or recompute.
+Each row carries the stable `record_id`, `repo_relative_path`, the complete
+byte/line `span` (which slices the cited source), the diagnostic
+`name`/subject, and the human `summary` (e.g. `unsupported macro invocation
+println!`).
+
+```sh
+eg query diagnostics --graph graph.jsonl                    # all gap markers
+eg query diagnostics --graph graph.jsonl --file src/main.rs # one file
+eg query diagnostics --data-dir .egregore --repo owner/name # one repository
+```
+
+The closed set is `Diagnostic` nodes carrying **both** a repo-relative path
+and a span. Source-authored markers (TODO/FIXME `DebtMarker`s,
+`.unwrap()`/`.expect()` `PanicRiskSite`s) are different node kinds and can
+never match — the lane never reclassifies them. Span-less `Diagnostic` nodes
+(skipped-manifest holes) and path-less importer diagnostics are excluded by
+construction. Rows are ordered deterministically (`repo_relative_path`,
+`span.start_byte`, `git_commit`, `record_id`), so repeated runs over an
+unchanged store are byte-identical. Supports `--repo`, `--file`,
+`--at-head`/`--all-history` corpus selectors, and `--format json|text`. See
+[diagnostics.md](diagnostics.md) for the full field table.
+
+Exit codes: `0` with NDJSON rows when gaps exist; `0` with an explicit
+`{"ok":true,"lane":"diagnostics","diagnostics":[],"empty_reason":"no_gaps_in_scope"}`
+marker when the scope is clean (a citable positive fact, distinct from error);
+`2` when `--file` names nothing in the store (`unknown_file`); `1` for an
+unknown/ambiguous `--repo` selector.
+
+"No extraction-gap diagnostics in scope" is not proof the code is fully
+understood for any other purpose — only that the extractor flagged nothing it
+could not parse.

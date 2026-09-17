@@ -21,6 +21,7 @@ mod decide;
 mod deltas;
 mod dep_usage;
 mod deps;
+mod diagnostics;
 mod doctor;
 mod drift;
 mod error_context;
@@ -111,6 +112,7 @@ pub(crate) use debt_markers::*;
 pub(crate) use decide::*;
 pub(crate) use deltas::*;
 pub(crate) use deps::*;
+pub(crate) use diagnostics::*;
 pub(crate) use doctor::*;
 pub(crate) use drift::*;
 pub(crate) use error_context::*;
@@ -2847,6 +2849,56 @@ pub(crate) enum QuerySubcommand {
         /// so a record removed at a later commit still appears. Mutually
         /// exclusive with --at-head and --at (enforced at runtime with an
         /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// List extractor-coverage-gap diagnostics (issue #246).
+    ///
+    /// Returns every persisted `Diagnostic` graph node carrying both a
+    /// repo-relative path and a span — the extractor's self-declared blind
+    /// spots (unsupported macro invocations, unresolved call/dispatch stubs)
+    /// — as citable rows, one NDJSON object per gap, with no scan or
+    /// recompute. Each row carries the record ID, the complete byte/line
+    /// span (which slices the cited source), the diagnostic name, and a
+    /// human summary.
+    ///
+    /// The lane never reclassifies source-authored markers: TODO/FIXME
+    /// `DebtMarker`s and `.unwrap()`/`.expect()` `PanicRiskSite`s belong to
+    /// other lanes and are excluded by construction.
+    ///
+    /// A scope with zero gap diagnostics is an explicit success (exit 0)
+    /// with an empty `diagnostics` array and `empty_reason`
+    /// `no_gaps_in_scope` — distinct from unknown/no-match/error. "No
+    /// extraction-gap diagnostics in scope" is not proof the code is fully
+    /// understood for any other purpose, only that the extractor flagged
+    /// nothing it could not parse.
+    Diagnostics {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict results to one repo-relative file path.
+        #[arg(long)]
+        file: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a gap removed at a later commit still appears (once per commit,
+        /// distinguished by `git_commit`). Mutually exclusive with --at-head
+        /// (enforced at runtime with an `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
         /// Output format.
@@ -7461,6 +7513,28 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        QuerySubcommand::Diagnostics {
+            graph,
+            data_dir,
+            repo,
+            file,
+            at_head,
+            all_history,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_diagnostics_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                file.as_deref(),
                 at_head,
                 all_history,
                 format,

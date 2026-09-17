@@ -149,3 +149,5 @@ mod trust_class;
 mod typescript_scan;
 mod validate;
 mod watch;
+// Appended (issue #246); kept at the end to minimize cross-lane merge conflicts.
+mod query_diagnostics;
