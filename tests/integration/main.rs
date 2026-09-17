@@ -86,6 +86,7 @@ mod query_cli;
 mod query_cycles;
 mod query_debt_markers;
 mod query_dep_usage;
+mod query_deprecated_symbols;
 mod query_failure_hotspots;
 mod query_implementors;
 mod query_latency_budget;

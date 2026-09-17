@@ -1265,6 +1265,14 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<Vec<RouteAnnotation>>,
+        // ── Deprecation facts (issue #249) ──────────────────────────────────
+        /// `#[deprecated]` attribute facts on a `Symbol` node (issue #249):
+        /// presence means the item carried the attribute; `since` and `note`
+        /// carry its verbatim bounded payloads (absent when the attribute did
+        /// not carry them — never synthesized). Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deprecated: Option<DeprecationMark>,
         // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
         /// The Cargo package that owns this code fact, resolved from the
         /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
@@ -1838,6 +1846,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -1968,6 +1977,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2097,6 +2107,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2231,6 +2242,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            deprecated: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2693,6 +2705,27 @@ impl GraphRecord {
     pub fn route(&self) -> Option<&[RouteAnnotation]> {
         match self {
             Self::Node { route, .. } => route.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches deprecation-attribute facts (`#[deprecated]`, …) to a
+    /// `Symbol` node (issue #249). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_deprecated(mut self, mark: DeprecationMark) -> Self {
+        if let Self::Node { deprecated, .. } = &mut self {
+            *deprecated = Some(mark);
+        }
+        self
+    }
+
+    /// Returns the deprecation-attribute facts when present (issue #249).
+    #[must_use]
+    pub const fn deprecated(&self) -> Option<&DeprecationMark> {
+        match self {
+            Self::Node { deprecated, .. } => deprecated.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -4006,6 +4039,41 @@ pub struct RouteAnnotation {
     pub method: String,
     /// Route path, the first string literal in the attribute.
     pub path: String,
+}
+
+/// Maximum number of characters captured from one `#[deprecated]` attribute
+/// payload (`since` or `note`) (issue #249).
+///
+/// The bound keeps graph records small and deterministic: a longer attribute
+/// literal is stored as its verbatim first-`MAX_DEPRECATION_STRING_LEN`
+/// characters, with no truncation marker synthesized (a marker would not be
+/// the attribute's text).
+pub const MAX_DEPRECATION_STRING_LEN: usize = 256;
+
+/// Deprecation-annotation facts captured from a Rust `#[deprecated]`
+/// attribute on a `Symbol` node (issue #249).
+///
+/// The mark's *presence* is the deprecation fact: a bare `#[deprecated]`
+/// yields a mark with both payloads `None`. Absent `since` / `note` are
+/// never synthesized from elsewhere — absent is the documented absent
+/// value.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping deprecation
+/// facts never moves a record ID.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct DeprecationMark {
+    /// The `since` value from `#[deprecated(since = "...")]`, bounded to
+    /// [`MAX_DEPRECATION_STRING_LEN`] chars and passed through redaction
+    /// policy v1 like issue #124 doc facts. Absent when the attribute did
+    /// not carry `since`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// The `note` value from `#[deprecated(note = "...")]` or the
+    /// `#[deprecated = "..."]` shorthand, bounded and redacted the same way.
+    /// Absent when the attribute did not carry a note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Owning-Cargo-package attribution for one code-graph node (issue #117).

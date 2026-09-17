@@ -19,9 +19,9 @@ use crate::{
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        CrateAttribution, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource,
-        MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata,
-        SourceSpan, TemporalMetadata, UserContextFields,
+        CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord,
+        IdentitySource, MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis,
+        SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
@@ -2673,6 +2673,7 @@ impl EmbeddedAletheiaSink {
             note,
             content_signature,
             route,
+            deprecated,
             crate_attribution,
             temporal,
             semantic_drift,
@@ -2804,6 +2805,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(route)
         {
             builder = builder.insert("route_json", json.as_str());
+        }
+        // Deprecation facts (issue #249). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(mark) = deprecated
+            && let Ok(json) = serde_json::to_string(mark)
+        {
+            builder = builder.insert("deprecated_json", json.as_str());
         }
         // Owning-package attribution (issue #117). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3579,6 +3587,19 @@ impl EmbeddedAletheiaSink {
                 .map(serde_json::from_str::<Vec<RouteAnnotation>>)
                 .transpose()
                 .map_err(|e| read_back_error(record_id, format!("route_json invalid: {e}")))?,
+            // Deprecation facts (issue #249). The read MUST mirror the
+            // write: `compare_node_record` is full structural equality of the
+            // reconstructed record, so a written-but-unread property would make
+            // every re-ingest write a new physical version forever.
+            deprecated: optional_str_property(
+                record_id,
+                "deprecated_json",
+                node.get_property("deprecated_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<DeprecationMark>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("deprecated_json invalid: {e}")))?,
             // Owning-package attribution (issue #117). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make

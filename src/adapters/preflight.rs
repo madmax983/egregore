@@ -270,6 +270,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 schema_version: _,
                 span: _,
                 draft: _,
+                deprecated: _,
             } => {
                 node_count += 1;
                 values.insert(id.clone());

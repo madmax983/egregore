@@ -20,6 +20,7 @@ mod debt_markers;
 mod decide;
 mod deltas;
 mod dep_usage;
+mod deprecated_symbols;
 mod deps;
 mod diagnostics;
 mod doctor;
@@ -189,6 +190,8 @@ pub(crate) use track_record::*;
 pub(crate) use session_retrospective::*;
 // Appended (issue #258); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use dep_usage::*;
+// Appended (issue #249); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use deprecated_symbols::*;
 
 use std::{
     collections::BTreeMap,
@@ -2903,6 +2906,60 @@ pub(crate) enum QuerySubcommand {
         /// (enforced at runtime with an `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory `#[deprecated]` symbols with their still-resolvable call sites (issue #249).
+    ///
+    /// Returns every code symbol carrying a `#[deprecated]` attribute mark —
+    /// bare, `= "..."` note shorthand, or `(since = "...", note = "...")`
+    /// meta form — as an inventory row: a stable record ID, the repo-relative
+    /// file/span handle, and the verbatim bounded `deprecated_since` /
+    /// `deprecated_note` payloads
+    /// (`null` when the attribute did not carry them — never fabricated).
+    /// For each deprecated symbol, the lane reports its still-resolvable call
+    /// sites over the existing `CALLS` edge vocabulary as a migration
+    /// worklist, each call site carrying a citable edge record ID and the
+    /// caller's repo-relative file/span. Call edges the graph cannot resolve
+    /// are cited under `coverage.unresolved_call_edges` — never silently
+    /// dropped and never counted as zero.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that the mark exists and the listed calls resolve — never what should
+    /// replace the symbol. No LLM prose, no replacement suggestions, and no
+    /// raw source text beyond the bounded attribute payloads is synthesized.
+    /// Strictly read-only; byte-identical across runs on an unchanged store.
+    /// Ordering is deterministic: symbols by (path, span start line, record
+    /// ID), call sites by (caller path, caller span start line, edge ID).
+    ///
+    /// `--file <PATH>` scopes the inventory (and the `symbols_considered`
+    /// tally) to declarations in that repo-relative file; the call-site
+    /// worklists of the selected symbols stay complete, citing callers
+    /// wherever they are.
+    ///
+    /// Exit codes:
+    ///   0 — inventory returned (at least one deprecated symbol).
+    ///   3 — `no_deprecated_symbols`: live code symbols exist, none marked.
+    ///   4 — `no_code_symbols`: the input resolves to zero code-graph nodes.
+    ///   1 — malformed input (unknown/ambiguous `--repo`, unreadable graph,
+    ///       both/neither `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/deprecated-symbols.md`.
+    DeprecatedSymbols {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the inventory to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict the inventory to symbols declared in this repo-relative
+        /// file.
+        #[arg(long)]
+        file: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7554,6 +7611,40 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 file.as_deref(),
                 at_head,
                 all_history,
+                format,
+            )
+        }
+        QuerySubcommand::DeprecatedSymbols {
+            graph,
+            data_dir,
+            repo,
+            file,
+            format,
+        } => {
+            // Strictly read-only lane (issue #249): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_deprecated_symbols_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                file.as_deref(),
                 format,
             )
         }

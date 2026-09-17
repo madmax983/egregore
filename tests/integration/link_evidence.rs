@@ -121,6 +121,7 @@ fn make_agent_memory_node(
         note: None,
         content_signature: None,
         route: None,
+        deprecated: None,
         crate_attribution: None,
         temporal: None,
         semantic_drift: None,

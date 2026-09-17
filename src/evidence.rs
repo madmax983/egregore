@@ -635,6 +635,7 @@ fn evidence_producer_at(started_at: &str) -> Producer {
 fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&["node", "agent", agent_id, agent_kind]);
     GraphRecord::Node {
+        deprecated: None,
         id,
         kind: NodeKind::Agent,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -764,6 +765,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         &prov.observed_at,
     ]);
     GraphRecord::Node {
+        deprecated: None,
         id,
         kind: NodeKind::AgentSession,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1038,6 +1040,7 @@ pub fn build_observation_records(
 
     // Build the observation node
     let obs_node = GraphRecord::Node {
+        deprecated: None,
         id: obs_id.clone(),
         kind: NodeKind::Observation,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1288,6 +1291,7 @@ pub fn build_failure_records(
 
     // Build the failure node
     let failure_node = GraphRecord::Node {
+        deprecated: None,
         id: failure_id.clone(),
         kind: NodeKind::Failure,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1542,6 +1546,7 @@ pub fn build_command_evidence_records(
     let exit_status = if req.exit_code == 0 { "pass" } else { "fail" };
 
     let cmd_node = GraphRecord::Node {
+        deprecated: None,
         id: cmd_id.clone(),
         kind: NodeKind::CommandEvidence,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1796,6 +1801,7 @@ pub fn build_artifact_records(
     );
 
     let art_node = GraphRecord::Node {
+        deprecated: None,
         id: art_id.clone(),
         kind: NodeKind::PatchArtifact,
         schema_version: ARTIFACT_SCHEMA_VERSION,
@@ -2023,6 +2029,7 @@ pub fn build_verification_records(
     let stdout_handle = redacted_stdout.as_deref().map(output_handle).map(Box::new);
 
     let ver_node = GraphRecord::Node {
+        deprecated: None,
         id: ver_id.clone(),
         kind: NodeKind::Verification,
         schema_version: VERIFICATION_SCHEMA_VERSION,

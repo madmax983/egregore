@@ -1523,6 +1523,7 @@ fn make_node(
         None
     };
     GraphRecord::Node {
+        deprecated: None,
         id,
         kind,
         schema_version: extra

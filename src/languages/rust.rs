@@ -10,7 +10,10 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, RouteAnnotation, SourceSpan, stable_id},
+    ir::{
+        DeprecationMark, EdgeLabel, Graph, GraphRecord, MAX_DEPRECATION_STRING_LEN, NodeKind,
+        RouteAnnotation, SourceSpan, stable_id,
+    },
     languages::{
         common::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
@@ -1655,6 +1658,29 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         })
     }
 
+    /// Collects the `#[deprecated]` attribute facts on the item preceding
+    /// `node`, walking prev-siblings exactly like [`Self::has_test_attribute`]
+    /// (issue #249). The nearest `deprecated` attribute wins; the mark's
+    /// *presence* is the fact, so a bare `#[deprecated]` records a mark with
+    /// both payloads absent. Returns `None` when no `deprecated` attribute
+    /// precedes the item.
+    fn deprecation_attribute(&self, node: Node<'_>) -> Option<DeprecationMark> {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if let Some(mark) = deprecation_from_attribute(sibling, self.source) {
+                        return Some(mark);
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        None
+    }
+
     /// Collects route-registration references from a `macro_invocation` when its
     /// macro name is in the closed registration set (`routes`) (issue #445).
     /// Each bare `identifier` token inside the macro's `token_tree` is recorded
@@ -1885,6 +1911,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let route = self.route_annotations(node);
         if !route.is_empty() {
             record = record.with_route(route);
+        }
+        // Deprecation facts (issue #249): the mark's presence is the fact.
+        // The `since` / `note` payloads passed through redaction policy v1
+        // (like doc facts), so the policy version is stamped too.
+        if let Some(deprecation) = self.deprecation_attribute(node) {
+            record = record.with_deprecated(deprecation);
+            record = record.with_redaction_policy_version(REDACTION_POLICY_VERSION);
         }
         self.graph.push(record);
         self.add_edge(
@@ -3544,6 +3577,77 @@ fn struct_literal_has_base(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "base_field_initializer")
 }
 
+/// Decodes one `#[deprecated]` payload string literal: verbatim decode via
+/// [`string_literal_text`], bounded to [`MAX_DEPRECATION_STRING_LEN`]
+/// characters (a verbatim prefix — no truncation marker is synthesized),
+/// then redaction policy v1 like issue #124 doc facts. Returns `None` for
+/// anything that is not a single string literal.
+fn deprecation_literal_text(literal: Node<'_>, source: &str) -> Option<String> {
+    let decoded = string_literal_text(node_source(literal, source).trim())?;
+    let bounded: String = decoded.chars().take(MAX_DEPRECATION_STRING_LEN).collect();
+    Some(crate::redaction::redact_value(&bounded))
+}
+
+/// Parses one `attribute_item` into a [`DeprecationMark`] when its attribute
+/// name leaf is exactly `deprecated` (issue #249). The three supported forms
+/// are the bare `#[deprecated]`, the note shorthand `#[deprecated = "..."]`,
+/// and the meta form `#[deprecated(since = "...", note = "...")]`. Key/value
+/// pairs are read from the attribute's `arguments` token tree by walking
+/// named children — Tree-sitter node walking only, never regex.
+///
+/// Unknown keys, non-literal values, and unnamed literals contribute
+/// nothing: the mark's *presence* is the fact either way. Returns `None` for
+/// every other attribute.
+fn deprecation_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<DeprecationMark> {
+    let attribute = first_descendant_of_kind(attribute_item, "attribute")?;
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if leaf != "deprecated" {
+        return None;
+    }
+    let mut since: Option<String> = None;
+    let mut note: Option<String> = None;
+    if let Some(value) = attribute.child_by_field_name("value") {
+        // `#[deprecated = "..."]`: the value expression is the note shorthand.
+        if value.kind() == "string_literal" {
+            note = deprecation_literal_text(value, source);
+        }
+    } else if let Some(arguments) = attribute.child_by_field_name("arguments") {
+        // `#[deprecated(since = "...", note = "...")]`: pair each `since` /
+        // `note` identifier key with the string literal that follows it.
+        let mut cursor = arguments.walk();
+        let named: Vec<Node<'_>> = arguments.named_children(&mut cursor).collect();
+        for (index, child) in named.iter().enumerate() {
+            if child.kind() != "identifier" {
+                continue;
+            }
+            let key = node_source(*child, source).trim();
+            if !matches!(key, "since" | "note") {
+                continue;
+            }
+            let Some(literal) = named.get(index + 1) else {
+                continue;
+            };
+            if literal.kind() != "string_literal" {
+                continue;
+            }
+            let Some(text) = deprecation_literal_text(*literal, source) else {
+                continue;
+            };
+            if key == "since" {
+                since = Some(text);
+            } else {
+                note = Some(text);
+            }
+        }
+    }
+    Some(DeprecationMark { since, note })
+}
+
 /// `true` when one attribute item's source text is a dedicated test attribute:
 /// `#[test]` or a path attribute whose name ends in `::test` (such as
 /// `#[tokio::test]`), with or without arguments. Configuration attributes that
@@ -4523,6 +4627,92 @@ mod tests {
         assert!(is_route_registration_macro("routes"));
         assert!(!is_route_registration_macro("vec"));
         assert!(!is_route_registration_macro("println"));
+    }
+
+    /// Runs `deprecation_from_attribute` over the first `attribute_item` in a
+    /// real parse, mirroring the extractor's prev-sibling walk input shape
+    /// (issue #249).
+    fn dep_attr(source: &str) -> Option<DeprecationMark> {
+        let tree = parse_tree(source);
+        let attribute_item = first_descendant_of_kind(tree.root_node(), "attribute_item")?;
+        deprecation_from_attribute(attribute_item, source)
+    }
+
+    #[test]
+    fn deprecated_bare_form_records_mark_without_payload() {
+        let mark = dep_attr("#[deprecated]\nfn old() {}").expect("bare deprecated must parse");
+        assert_eq!(mark.since, None, "absent since is None, never fabricated");
+        assert_eq!(mark.note, None, "absent note is None, never fabricated");
+    }
+
+    #[test]
+    fn deprecated_note_shorthand_is_verbatim() {
+        let mark = dep_attr("#[deprecated = \"use new() instead\"]\nfn old() {}")
+            .expect("note shorthand must parse");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note.as_deref(), Some("use new() instead"));
+    }
+
+    #[test]
+    fn deprecated_since_and_note_meta_form() {
+        let mark = dep_attr("#[deprecated(since = \"1.2.0\", note = \"use new()\")]\nfn old() {}")
+            .expect("meta form must parse");
+        assert_eq!(mark.since.as_deref(), Some("1.2.0"));
+        assert_eq!(mark.note.as_deref(), Some("use new()"));
+    }
+
+    #[test]
+    fn deprecated_meta_form_key_order_is_free() {
+        let mark = dep_attr("#[deprecated(note = \"use new()\", since = \"1.2.0\")]\nfn old() {}")
+            .expect("reversed key order must parse");
+        assert_eq!(mark.since.as_deref(), Some("1.2.0"));
+        assert_eq!(mark.note.as_deref(), Some("use new()"));
+    }
+
+    #[test]
+    fn deprecated_other_attributes_are_ignored() {
+        assert_eq!(dep_attr("#[test]\nfn old() {}"), None);
+        assert_eq!(dep_attr("#[allow(dead_code)]\nfn old() {}"), None);
+        assert_eq!(
+            dep_attr("#[doc = \"not a deprecation\"]\nfn old() {}"),
+            None,
+            "a doc attribute with a deprecation-shaped payload is not a mark"
+        );
+    }
+
+    #[test]
+    fn deprecated_non_literal_values_are_not_captured() {
+        // A non-literal `note` value cannot be decoded, so the mark records
+        // presence with the payload absent — never a fabricated string.
+        let mark = dep_attr("#[deprecated(note = NOTE_CONST)]\nfn old() {}")
+            .expect("attribute name still marks the item");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note, None);
+    }
+
+    #[test]
+    fn deprecated_unknown_meta_keys_are_ignored() {
+        let mark = dep_attr("#[deprecated(foo = \"bar\")]\nfn old() {}")
+            .expect("unknown keys still mark the item deprecated");
+        assert_eq!(mark.since, None);
+        assert_eq!(mark.note, None);
+    }
+
+    #[test]
+    fn deprecated_note_is_bounded() {
+        let long_note = "n".repeat(MAX_DEPRECATION_STRING_LEN + 40);
+        let source = format!("#[deprecated = \"{long_note}\"]\nfn old() {{}}");
+        let mark = dep_attr(&source).expect("long note must parse");
+        let note = mark.note.expect("note captured");
+        assert_eq!(
+            note.len(),
+            MAX_DEPRECATION_STRING_LEN,
+            "note is bounded to the documented length"
+        );
+        assert!(
+            long_note.starts_with(&note),
+            "the bound is a verbatim prefix of the attribute text"
+        );
     }
 
     #[test]

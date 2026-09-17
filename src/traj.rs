@@ -919,6 +919,7 @@ fn make_node(
         None
     };
     GraphRecord::Node {
+        deprecated: None,
         id,
         kind,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
