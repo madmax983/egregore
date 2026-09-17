@@ -487,6 +487,24 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot", "valid_time"],
         },
     ),
+    (
+        "redaction-audit",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &[
+                "source_derived",
+                "verification_evidence",
+                "agent_verified",
+                "agent_unverified",
+                "agent_contradicted",
+                "project_state",
+                "artifact",
+                "runtime_observation",
+            ],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
     #[cfg(feature = "embeddings")]
     (
         "semantic",

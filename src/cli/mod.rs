@@ -59,6 +59,7 @@ mod public_api;
 mod public_api_deltas;
 mod recency;
 mod records;
+mod redaction_audit;
 mod repair_cmd;
 mod resolve_frames;
 mod scan;
@@ -151,6 +152,7 @@ pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
 pub(crate) use recency::*;
 pub(crate) use records::*;
+pub(crate) use redaction_audit::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
 pub(crate) use scan::*;
@@ -2960,6 +2962,52 @@ pub(crate) enum QuerySubcommand {
         /// file.
         #[arg(long)]
         file: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Audit the resting store for secret-shaped values that bypassed redaction (issue #244).
+    ///
+    /// Sweeps every persisted queryable string field across all domains —
+    /// agent-memory, artifact, verification, project, user-context, log-graph,
+    /// and code-graph records (code-graph symbol bodies/spans and import
+    /// paths are exempt from the write gate, so they are the prime
+    /// unredacted-at-rest risk) — and reports secret-shaped values.
+    ///
+    /// Detection is two-layered: (a) known token patterns aligned to the
+    /// `secret_class` taxonomy in `docs/schema/redaction.md` (`api_token`,
+    /// `ssh_private_key`, `database_url`, `cloud_credential`,
+    /// `webhook_secret`, `session_cookie`, `env_secret`, `email`), and (b)
+    /// generic tokens above the documented Shannon-entropy + length threshold
+    /// (≥20 chars, ≥4.2 bits/char). Each finding carries `record_id`,
+    /// `domain`, `field_path`, `classification` (`secret_class` or
+    /// `high_entropy`), and a BLAKE3 `hash_prefix` — never the raw value.
+    ///
+    /// Records stamped `redaction_policy_version: "v1"` and values that are
+    /// already `<REDACTED:secret_class:hash_prefix>` markers are recognized as
+    /// already-handled and are never flagged; the documented allowlist
+    /// suppresses public sample keys and test-fixture tokens. Strictly
+    /// read-only; byte-identical across runs on an unchanged store. Findings
+    /// are advisory heuristic matches — never confirmed secrets — and a clean
+    /// sweep is not proof the store holds no secrets.
+    ///
+    /// Exit codes:
+    ///   0 — clean store: zero findings.
+    ///   3 — ≥1 finding reported.
+    ///   1 — malformed input (unknown/ambiguous `--repo`, unreadable graph,
+    ///       both/neither `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/redaction-audit.md`.
+    RedactionAudit {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the sweep to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7647,6 +7695,33 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 file.as_deref(),
                 format,
             )
+        }
+        QuerySubcommand::RedactionAudit {
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #244): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_redaction_audit_cmd(&records, &index, selected.as_deref(), format)
         }
         QuerySubcommand::UnsafeSites {
             path,

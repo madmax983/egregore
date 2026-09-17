@@ -97,6 +97,7 @@ mod query_ownership;
 mod query_path;
 mod query_public_api;
 mod query_recency;
+mod query_redaction_audit;
 mod query_subsystem;
 mod query_symbols;
 mod query_track_record;

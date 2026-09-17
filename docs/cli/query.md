@@ -36,6 +36,7 @@ eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--in
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 eg query deprecated-symbols --graph <PATH> [--repo <SELECTOR>] [--file <PATH>] [--format json|text]
+eg query redaction-audit --graph <PATH> [--repo <SELECTOR>] [--format json|text]
 eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
 eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 eg query session <ID>     --graph <PATH>   [--format json|text]
@@ -124,6 +125,13 @@ Evidence-backed audit subcommands have their own pages:
   bounded `deprecated_since`/`deprecated_note` payloads, citable handles on every row and call
   site, unresolved call edges cited under a coverage field, code facts only
   ([deprecated-symbols.md](deprecated-symbols.md), issue #249).
+- `eg query redaction-audit` — resting-store **secret sweep**: every persisted
+  queryable string field across all domains (including code-graph symbol
+  bodies, which the write gate never sees) checked against known token
+  patterns plus a documented Shannon-entropy + length threshold;
+  advisory findings citing (`record_id`, `field_path`,
+  `classification`, `hash_prefix`) — never raw values; exit 3 on findings,
+  0 clean ([redaction-audit.md](redaction-audit.md), issue #244).
 - `eg query blind-spots` — code targets (symbols and/or files) with **zero
   cross-domain evidence** into the agent-memory, verification, or project
   domains, ranked riskiest-first by inbound structural reference count —
