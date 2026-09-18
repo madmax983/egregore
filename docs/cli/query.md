@@ -5,12 +5,12 @@ Query an existing graph JSONL for symbols, files, who last changed a symbol, sem
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
 eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
 eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--role all|production|test] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
@@ -534,6 +534,32 @@ the file is compiled into that package. Full contract, including the closed
 unattributed-reason set and every documented limit, in
 [`crate-attribution.md`](crate-attribution.md).
 
+## Test-vs-production role (`--role`, issue #238)
+
+Every Rust `Symbol` and `File` record carries a deterministic `role` —
+`"test"` or `"production"` — derived from source signals only:
+
+- a `#[test]`-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`, …),
+- lexical membership under a `#[cfg(test)]` module (inline or out-of-line),
+- a file rooted under `tests/` or `benches/`.
+
+Anything else is production. The role is **additive metadata, never an identity
+input**: it does not contribute to stable record IDs.
+
+`eg query symbol` and `eg query file` accept `--role all|production|test`
+(default `all`) and expose `role` on every row in JSON and text. `--role all`
+returns every row, including records from graphs that predate issue #238 whose
+role is unknown; `--role production` / `--role test` keep only rows carrying
+that explicit role. An absent `role` key means the record predates issue #238
+— unknown, never fabricated as `"production"`. In `--format text` an absent
+field prints nothing.
+
+A scoped query that matches nothing exits **2** (`no match found`); the filter
+is order-preserving, so a scoped answer is always a subsequence of the
+unscoped one. On `--daemon` the filter applies client-side. Full contract,
+including the closed signal set and the out-of-line propagation rule, in
+[`test-production-roles.md`](test-production-roles.md).
+
 ## Repository scope (`--repo`, issue #67)
 
 A shared local store can hold more than one repository, and two repositories
@@ -741,6 +767,7 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `--graph <PATH>` | yes | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--at <COMMIT>` | no | Restrict to the single best record whose `git_commit` starts with this SHA prefix. Exit `1` with `error: ambiguous commit prefix` when the prefix matches more than one distinct commit SHA. Requires a history graph. |
 | `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--role <ROLE>` | no | `all` (default), `production`, or `test`: keep only rows whose test-vs-production role matches (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -756,6 +783,7 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `visibility` | string | Rust declaration-surface symbols | Declaration visibility class from the closed set `public` / `crate` / `restricted` / `private`, derived from the source `pub` modifier (`pub(in path)` and `pub(super)` map to `restricted`; `pub(self)` and no modifier map to `private`). Present on Rust `fn` / method / `struct` / `enum` / `trait` / type-alias / `const` / `static` symbols extracted at issue #124 or later; absent on `impl` symbols and records from older graphs. |
 | `signature` | string | Rust declaration-surface symbols | Normalized declaration header: item keyword through the end of the parameter list / return type / where-clause for callables (or the item header for type-defining items), body excluded, interior whitespace collapsed deterministically. Same presence rules as `visibility`. |
 | `doc` | string | when the item has a doc comment | Doc-comment text (`///` or `/** */`) after redaction policy v1 (see [`docs/schema/redaction.md`](../schema/redaction.md)); a secret-shaped value is replaced by a `<REDACTED:class:hash>` marker. Omitted entirely when the item has no doc comment — never an empty string. |
+| `role` | string | records extracted at issue #238 or later | Test-vs-production role: `"test"` or `"production"` (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). Omitted on records from older graphs — unknown, never fabricated. |
 | `git_commit` | string | only in history graphs | Full commit SHA for history-backed records. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. Absent only for legacy graphs without repository topology. |
 | `repository` | string | when attributable | Human-usable repository identity handle, e.g. `acme/widget`. |
@@ -861,7 +889,7 @@ routing.
 List all `Symbol` nodes defined in a file, resolved through `DEFINES` edges.
 
 ```text
-eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--role all|production|test] [--format json|text]
 ```
 
 ### Arguments
@@ -874,6 +902,7 @@ eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--forma
 | `--as-of <RFC3339>` | no | Pin the listing to the file's recorded state at the most recent commit at or before this instant (valid-time axis). Mutually exclusive with `--at`. |
 | `--tx-as-of <RFC3339>` | no | Reserved for `query file`: always returns a `not_implemented` error envelope and exit `1`, never a silently coerced result. Transaction time currently covers `query symbol` only (issue #66). |
 | `--repo <SELECTOR>` | no | Restrict results to one repository. A matching path in another repository is excluded and reported only through the `excluded_other_repositories` stderr diagnostic. |
+| `--role <ROLE>` | no | `all` (default), `production`, or `test`: keep only symbol rows whose test-vs-production role matches (see [Test-vs-production role](#test-vs-production-role---role-issue-238)). |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -928,7 +957,8 @@ envelope** (not JSONL rows), byte-identical across repeated runs:
       "repo_relative_path": "src/parser.rs",
       "span": { "start_byte": 0, "end_byte": 30, "start_line": 1, "end_line": 1 },
       "commit": "<resolved full SHA>",
-      "valid_time": "2026-01-01T00:00:00Z"
+      "valid_time": "2026-01-01T00:00:00Z",
+      "role": "production"
     }
   ],
   "returned": 1,
@@ -941,7 +971,11 @@ resolved as-of the point (module-level symbols without a span carry a
 documented `absent_span_reason`), and the envelope records the resolved
 commit/instant it was computed against. Output is bounded and redaction-safe:
 record IDs, commit handles, paths, spans, and counts only — never raw source
-text, patch hunks, or commit-message bodies.
+text, patch hunks, or commit-message bodies. Each symbol row also carries its
+test-vs-production `role` (issue #238; omitted on rows whose record predates
+it), and `--role` narrows the reconstructed set — a filter that empties a
+non-empty set is reported as an `empty_role_set` diagnostic, not a silent
+empty answer.
 
 Not-found is never conflated with empty: a file that existed at the point but
 defined zero symbols returns `ok: true` with an explicit `empty_symbol_set`

@@ -109,6 +109,7 @@ pub(crate) fn query_symbol_as_of(
     selected_repo: Option<&str>,
     package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    role: RoleFilter,
 ) -> Result<()> {
     // Package scope narrows the candidate records BEFORE the one-best-per-repo
     // selection, for the same reason as the `--at` lane (issue #117): filtering
@@ -183,6 +184,12 @@ pub(crate) fn query_symbol_as_of(
             // Package scope (issue #117), applied to the recorded attribution AT
             // the resolved instant.
             retain_package_scope(&mut symbol_results, package);
+            // Role scope (issue #238), applied to the recorded role AT the
+            // resolved instant: the instant decides WHICH version, and the
+            // selector then decides whether that version's role matches. A
+            // row whose record predates issue #238 (role unknown) survives
+            // only `RoleFilter::All`.
+            symbol_results.retain(|r| role.matches(r.role.copied()));
             if symbol_results.is_empty() {
                 eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
                 std::process::exit(2);

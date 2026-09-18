@@ -1284,6 +1284,19 @@ pub enum GraphRecord {
         /// moves a record ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entry_point: Option<EntryPointMark>,
+        // ── Test-vs-production role facts (issue #238) ───────────────────────
+        /// Deterministic test-vs-production classification of a `Symbol` or
+        /// `File` node (issue #238): `Test` when the item carries a
+        /// test-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`,
+        /// …), sits inside a `#[cfg(test)]`-gated module, or lives under a
+        /// top-level `tests/` or `benches/` root; `Production` otherwise. A
+        /// `TrustClass::SourceDerived` code-graph fact drawn from the AST and
+        /// the file path — no agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        /// Absent on records produced before issue #238 (unknown, never
+        /// fabricated) and on node kinds outside the code-graph domain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<SymbolRole>,
         // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
         /// The Cargo package that owns this code fact, resolved from the
         /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
@@ -1859,6 +1872,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             entry_point: None,
+            role: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -1991,6 +2005,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             entry_point: None,
+            role: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2122,6 +2137,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             entry_point: None,
+            role: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2258,6 +2274,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             entry_point: None,
+            role: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2762,6 +2779,29 @@ impl GraphRecord {
     pub const fn entry_point(&self) -> Option<&EntryPointMark> {
         match self {
             Self::Node { entry_point, .. } => entry_point.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches a test-vs-production role to a `Symbol` or `File` node
+    /// (issue #238). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub const fn with_role(mut self, role: SymbolRole) -> Self {
+        if let Self::Node { role: slot, .. } = &mut self {
+            *slot = Some(role);
+        }
+        self
+    }
+
+    /// Returns the test-vs-production role when stamped (issue #238).
+    /// `None` means the record predates issue #238 or its producer does not
+    /// classify roles — unknown, never a fabricated `Production`.
+    #[must_use]
+    pub const fn role(&self) -> Option<&SymbolRole> {
+        match self {
+            Self::Node { role, .. } => role.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -4142,6 +4182,42 @@ pub enum EntryPointKind {
     BinaryEntry,
 }
 
+/// Deterministic test-vs-production classification of one `Symbol` or `File`
+/// node (issue #238).
+///
+/// The full decision procedure lives in
+/// `docs/cli/test-production-roles.md`; in short, `Test` iff the item
+/// carries a test-family attribute (`#[test]`, `#[tokio::test]`, `#[bench]`,
+/// or another `*::test` / `*::bench` path), sits lexically inside a
+/// `#[cfg(test)]`-gated module (directly or through an enclosing gated
+/// `mod`), or lives under a top-level `tests/` or `benches/` root —
+/// `Production` otherwise. A `TrustClass::SourceDerived` fact: drawn from the
+/// AST and the file path, carrying no agent-authored confidence.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping a role never
+/// moves a record ID.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolRole {
+    /// Test code: a test-harness entry, a `#[cfg(test)]`-gated module member,
+    /// or an integration-test / bench-root file.
+    Test,
+    /// Production (shipping) code: matched none of the test signals.
+    Production,
+}
+
+impl SymbolRole {
+    /// The stable wire string: `"test"` or `"production"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Production => "production",
+        }
+    }
+}
+
 /// Owning-Cargo-package attribution for one code-graph node (issue #117).
 ///
 /// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
@@ -4880,5 +4956,84 @@ mod call_resolution_tests {
         assert_eq!(json, "\"unresolved_dispatch\"");
         let back: CallResolution = serde_json::from_str(&json).expect("resolution deserializes");
         assert_eq!(back, CallResolution::UnresolvedDispatch);
+    }
+}
+
+#[cfg(test)]
+mod symbol_role_tests {
+    use super::{GraphRecord, SourceSpan, SymbolRole};
+
+    fn test_symbol() -> GraphRecord {
+        GraphRecord::symbol(
+            "node:symbol:repo:src/lib.rs:check".to_owned(),
+            "Function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "check".to_owned(),
+            "fn check()".to_owned(),
+        )
+    }
+
+    #[test]
+    fn role_does_not_change_stable_id() {
+        // Issue #238: role is additive metadata, never an identity input.
+        let base = test_symbol();
+        let base_id = base.id().to_owned();
+        for role in [SymbolRole::Test, SymbolRole::Production] {
+            let stamped = base.clone().with_role(role);
+            assert_eq!(
+                stamped.id(),
+                base_id,
+                "stamping {role:?} must not change the stable ID"
+            );
+            assert_eq!(stamped.role(), Some(&role));
+        }
+        assert_eq!(base.role(), None, "unstamped record has unknown role");
+    }
+
+    #[test]
+    fn role_serde_wire_values_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SymbolRole::Test).expect("serializes"),
+            "\"test\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SymbolRole::Production).expect("serializes"),
+            "\"production\""
+        );
+        let back: SymbolRole = serde_json::from_str("\"test\"").expect("deserializes");
+        assert_eq!(back, SymbolRole::Test);
+        let back: SymbolRole = serde_json::from_str("\"production\"").expect("deserializes");
+        assert_eq!(back, SymbolRole::Production);
+    }
+
+    #[test]
+    fn role_round_trips_through_record_json() {
+        let record = test_symbol().with_role(SymbolRole::Test);
+        let json = serde_json::to_string(&record).expect("record serializes");
+        assert!(
+            json.contains("\"role\":\"test\""),
+            "role is serialized on the record, got: {json}"
+        );
+        let back: GraphRecord = serde_json::from_str(&json).expect("record deserializes");
+        assert_eq!(back.role(), Some(&SymbolRole::Test));
+        assert_eq!(back.id(), record.id(), "ID survives the round trip");
+    }
+
+    #[test]
+    fn missing_role_deserializes_as_unknown() {
+        // Pre-#238 records carry no `role` field: they deserialize to
+        // unknown (`None`), never a fabricated `Production`.
+        let json = serde_json::to_string(&test_symbol()).expect("serializes");
+        assert!(!json.contains("\"role\""), "unstamped record omits role");
+        let back: GraphRecord = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.role(), None);
     }
 }

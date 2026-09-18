@@ -43,7 +43,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::crate_attribution::CrateAttributionIndex;
-use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, stable_id};
+use crate::ir::{
+    CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, SymbolRole, stable_id,
+};
 use crate::languages::rust::is_impl_target_kind;
 
 /// A callable definition exported by a per-file extractor for repo-wide
@@ -958,10 +960,74 @@ pub fn apply_out_of_line_test_scope(
     records: &mut [GraphRecord],
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) {
-    // Known repo-relative file paths: fact keys plus every file-backed record
-    // path, so a module file that exported no facts still resolves.
-    let mut known_paths: std::collections::BTreeSet<String> =
-        facts_by_file.keys().cloned().collect();
+    let known_paths = known_file_paths(records, facts_by_file);
+    let test_files = test_only_module_files(facts_by_file, &known_paths);
+    if test_files.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        if let GraphRecord::Node {
+            kind: NodeKind::PanicRiskSite,
+            repo_relative_path: Some(path),
+            call_context,
+            ..
+        } = record
+            && test_files.contains(path.as_str())
+        {
+            *call_context = Some("test".to_owned());
+        }
+    }
+}
+
+/// Stamps the test-vs-production role on `File` AND `Symbol` records for
+/// out-of-line `#[cfg(test)]`-gated modules (issue #238).
+///
+/// The per-file extractor stamps each `File` record's role from its path
+/// alone and each `Symbol` record's role from its lexical signals alone, so a
+/// `#[cfg(test)] mod helpers;` declaration (whose body lives in
+/// `src/helpers.rs`) would leave that file — and every symbol it defines —
+/// `Production` even though the module only compiles under `cfg(test)`.
+/// Issue #238's signal (b) explicitly covers out-of-line modules, so this
+/// deterministic repo-wide pass upgrades those `File` records AND the
+/// `Symbol` records they contain to `Test`, sharing issue #223's test-only
+/// module resolution — including production-precedence for dual-use files,
+/// so a module file also loaded by an ungated declaration (and its symbols)
+/// keeps `Production`. `role` is never an identity input, so record IDs are
+/// unchanged; records already `Test` (via path or lexical signals) are
+/// untouched.
+pub fn apply_out_of_line_test_roles(
+    records: &mut [GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) {
+    let known_paths = known_file_paths(records, facts_by_file);
+    let test_files = test_only_module_files(facts_by_file, &known_paths);
+    if test_files.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        if let GraphRecord::Node {
+            kind: NodeKind::File | NodeKind::Symbol,
+            repo_relative_path: Some(path),
+            role,
+            ..
+        } = record
+            && test_files.contains(path.as_str())
+        {
+            *role = Some(SymbolRole::Test);
+        }
+    }
+}
+
+/// Every repo-relative file path the repo-wide out-of-line passes can resolve
+/// a module declaration against: fact keys plus every file-backed record
+/// path, so a module file that exported no facts still resolves.
+fn known_file_paths(
+    records: &[GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeSet<String> {
+    let mut known_paths: BTreeSet<String> = facts_by_file.keys().cloned().collect();
     for record in records.iter() {
         if let GraphRecord::Node {
             repo_relative_path: Some(path),
@@ -971,32 +1037,43 @@ pub fn apply_out_of_line_test_scope(
             known_paths.insert(path.clone());
         }
     }
+    known_paths
+}
 
+/// Resolves out-of-line module declarations to the set of files reachable
+/// ONLY through test-gated declarations (issue #223's rule, shared with the
+/// issue #238 `File`-role pass).
+///
+/// Production takes precedence for dual-use files: a module file that a
+/// non-test declaration also loads still compiles into the production build,
+/// so it is excluded from the returned set. The production-reachable set is
+/// seeded by declaring files that are never themselves loaded as out-of-line
+/// modules (e.g. crate roots) plus conventional crate roots (which always
+/// compile into a production build), then propagated through ungated
+/// declarations to a fixpoint; the test set seeds from every test-gated
+/// declaration's target and expands through all declarations of test-only
+/// files — never rewriting or expanding through anything
+/// production-reachable. Deterministic: `BTreeSet` iteration throughout.
+fn test_only_module_files(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    known_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
     // Resolve every out-of-line declaration once into (from, to, gated)
     // module-load edges.
     let mut edges: Vec<(String, String, bool)> = Vec::new();
     for (file, facts) in facts_by_file {
         for fact in &facts.out_of_line_mods {
-            if let Some(target) = resolve_out_of_line_target(file, fact, &known_paths) {
+            if let Some(target) = resolve_out_of_line_target(file, fact, known_paths) {
                 edges.push((file.clone(), target, fact.test_gated));
             }
         }
     }
     if edges.is_empty() {
-        return;
+        return BTreeSet::new();
     }
 
-    // Production takes precedence for dual-use files: a module file that a
-    // non-test declaration also loads still compiles into the production
-    // build, and hiding its panic-risk sites behind a `test` label would
-    // hide production risk. Compute the production-reachable set first —
-    // declaring files that are never themselves loaded as out-of-line
-    // modules (e.g. crate roots) seed it, and it propagates through ungated
-    // declarations to a fixpoint — then never rewrite (or expand through)
-    // anything production-reachable.
-    let targets: std::collections::BTreeSet<&str> =
-        edges.iter().map(|(_, to, _)| to.as_str()).collect();
-    let mut production: std::collections::BTreeSet<String> = edges
+    let targets: BTreeSet<&str> = edges.iter().map(|(_, to, _)| to.as_str()).collect();
+    let mut production: BTreeSet<String> = edges
         .iter()
         .filter(|(from, _, _)| !targets.contains(from.as_str()))
         .map(|(from, _, _)| from.clone())
@@ -1028,7 +1105,7 @@ pub fn apply_out_of_line_test_scope(
     // target, expand through all declarations of test-only files — but a
     // production-reachable file is never rewritten and never expanded
     // through (its children compile in the production instantiation too).
-    let mut test_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut test_files: BTreeSet<String> = BTreeSet::new();
     let mut worklist: Vec<String> = edges
         .iter()
         .filter(|(_, _, gated)| *gated)
@@ -1044,22 +1121,7 @@ pub fn apply_out_of_line_test_scope(
             }
         }
     }
-    if test_files.is_empty() {
-        return;
-    }
-
-    for record in records.iter_mut() {
-        if let GraphRecord::Node {
-            kind: NodeKind::PanicRiskSite,
-            repo_relative_path: Some(path),
-            call_context,
-            ..
-        } = record
-            && test_files.contains(path.as_str())
-        {
-            *call_context = Some("test".to_owned());
-        }
-    }
+    test_files
 }
 
 /// Resolves one out-of-line module declaration to a scanned repo-relative
@@ -6452,5 +6514,199 @@ mod tests {
                 && matches!(r, GraphRecord::Edge { .. })
         });
         assert!(typed, "dispatch edge must be unresolved_dispatch-typed");
+    }
+
+    // ── Out-of-line test-role propagation (issue #238, RED) ───────────────
+
+    /// One out-of-line `mod <name>;` fact with an explicit gate flag.
+    fn gated_mod_fact(name: &str, test_gated: bool) -> OutOfLineModFact {
+        OutOfLineModFact {
+            name: name.to_owned(),
+            inline_module_path: Vec::new(),
+            test_gated,
+            path_override: None,
+            under_inline_path_override: false,
+        }
+    }
+
+    /// A `File` node record for `path` with a path-derived initial role,
+    /// mirroring `scan_source_text_records`.
+    fn file_record(path: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("file:{path}"),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("summary for {path}"),
+        )
+        .with_role(crate::ir::SymbolRole::Production)
+    }
+
+    /// A `Symbol` node record for `name` in `path` with a lexical initial
+    /// role, mirroring the per-file extractor.
+    fn symbol_record(name: &str, path: &str, role: crate::ir::SymbolRole) -> GraphRecord {
+        GraphRecord::node(
+            format!("symbol:{path}#{name}"),
+            NodeKind::Symbol,
+            Some(name.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("summary for {name}"),
+        )
+        .with_role(role)
+    }
+
+    fn record_role(records: &[GraphRecord], id: &str) -> Option<crate::ir::SymbolRole> {
+        records
+            .iter()
+            .find(|r| r.id() == id)
+            .unwrap_or_else(|| panic!("record `{id}` should exist"))
+            .role()
+            .copied()
+    }
+
+    fn file_role(records: &[GraphRecord], path: &str) -> Option<crate::ir::SymbolRole> {
+        record_role(records, &format!("file:{path}"))
+    }
+
+    #[test]
+    fn out_of_line_test_gated_module_file_is_test() {
+        // `#[cfg(test)] mod helpers;` in src/lib.rs → src/helpers.rs is a
+        // test-only module file (issue #238 signal b, out-of-line form).
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("helpers", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            // Symbols carry only their lexical role before the repo-wide
+            // pass: `helper` has no in-file test signal, so it extracts as
+            // production even though its module only compiles under cfg(test).
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+            symbol_record(
+                "already_test",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Test,
+            ),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/helpers.rs"),
+            Some(crate::ir::SymbolRole::Test),
+            "test-gated out-of-line module file must be test"
+        );
+        assert_eq!(
+            file_role(&records, "src/lib.rs"),
+            Some(crate::ir::SymbolRole::Production),
+            "the declaring crate root stays production"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/helpers.rs#helper"),
+            Some(crate::ir::SymbolRole::Test),
+            "issue #238 signal (b) covers out-of-line modules: a symbol in a \
+             test-only module file is test even with no lexical signal"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/helpers.rs#already_test"),
+            Some(crate::ir::SymbolRole::Test),
+            "an already-test symbol stays test"
+        );
+    }
+
+    #[test]
+    fn out_of_line_dual_use_module_file_stays_production() {
+        // Production takes precedence (issue #223's rule, reused for #238):
+        // a module file loaded by BOTH a test-gated and an ungated
+        // declaration still compiles into the production build.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("shared", false)],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/other.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("shared", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/other.rs"),
+            file_record("src/shared.rs"),
+            symbol_record(
+                "shared_fn",
+                "src/shared.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/shared.rs"),
+            Some(crate::ir::SymbolRole::Production),
+            "dual-use module file must stay production"
+        );
+        assert_eq!(
+            record_role(&records, "symbol:src/shared.rs#shared_fn"),
+            Some(crate::ir::SymbolRole::Production),
+            "production precedence extends to the dual-use file's symbols"
+        );
+    }
+
+    #[test]
+    fn out_of_line_test_scope_is_transitive_through_test_files() {
+        // A test-gated module's own out-of-line submodules are test too,
+        // even when their declarations carry no gate of their own.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("helpers", true)],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/helpers.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![gated_mod_fact("inner", false)],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers/inner.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            file_record("src/helpers/inner.rs"),
+        ];
+        apply_out_of_line_test_roles(&mut records, &facts);
+        assert_eq!(
+            file_role(&records, "src/helpers/inner.rs"),
+            Some(crate::ir::SymbolRole::Test),
+            "transitive submodule of a test-only module must be test"
+        );
     }
 }

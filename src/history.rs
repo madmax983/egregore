@@ -665,6 +665,12 @@ fn scan_repository_history_inner(
             &mut graph.records_mut()[commit_records_start..],
             &facts_by_file,
         );
+        // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238),
+        // slice-scoped to this commit like the pass above.
+        crate::languages::cross_file::apply_out_of_line_test_roles(
+            &mut graph.records_mut()[commit_records_start..],
+            &facts_by_file,
+        );
         // Owning-Cargo-package attribution (issue #117), scoped to THIS
         // COMMIT'S SLICE. Slice-scoping is mandatory, for the same reason the
         // resolution-labeling pass above is scoped: an ADR-0004 symbol ID

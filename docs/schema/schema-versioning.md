@@ -111,6 +111,13 @@ records whose endpoints no longer match freshly-minted v10 ones.
 Re-extraction from source regenerates every codegraph record under the current
 version deterministically.
 
+Issue #238 added the optional `role` field (`"test"` | `"production"`) on
+`Symbol` and `File` node records WITHOUT a version bump: the addition is
+`additive` — `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+a legacy node record with no `role` key still deserializes (as unknown), and
+it is **never an identity input**, so `stable_id`'s preimage is unchanged.
+Re-extraction from source stamps every record deterministically.
+
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for
 unrelated codegraph `Symbol` records in the same store. For the code-graph

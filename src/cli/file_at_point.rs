@@ -6,6 +6,7 @@ pub(crate) fn query_file_via_daemon(
     data_dir: &Path,
     repo: Option<&str>,
     format: OutputFormat,
+    role: RoleFilter,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
@@ -29,6 +30,12 @@ pub(crate) fn query_file_via_daemon(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    // Role scope (issue #238) applies client-side, like the symbol daemon
+    // path: the daemon verb predates the selector.
+    let records: Vec<serde_json::Value> = records
+        .into_iter()
+        .filter(|rec| role.matches(daemon_record_role(rec)))
+        .collect();
     if records.is_empty() {
         eprintln!("error: no match found for file `{path}`");
         std::process::exit(2);
@@ -51,6 +58,7 @@ pub(crate) fn query_file(
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    role: RoleFilter,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
@@ -150,6 +158,9 @@ pub(crate) fn query_file(
             corpus_mode: None,
             corpus_mode_source: None,
             corpus_disclaimer: None,
+            // The row IS the symbol's record, so its role rides along like
+            // every other `eg query symbol` field (issue #238).
+            role: r.role(),
         });
     }
 
@@ -165,6 +176,18 @@ pub(crate) fn query_file(
 
     if !file_exists || results.is_empty() {
         eprintln!("error: no match found for file `{path}`");
+        std::process::exit(2);
+    }
+
+    // Role scope (issue #238) narrows the per-file symbol listing AFTER row
+    // projection, order preserved — a scoped answer is a subsequence of the
+    // unscoped one. Unknown roles survive only `RoleFilter::All`.
+    results.retain(|r| role.matches(r.role.copied()));
+    if results.is_empty() {
+        eprintln!(
+            "error: no match found for file `{path}` with role `{}`",
+            role.as_str()
+        );
         std::process::exit(2);
     }
 
@@ -214,6 +237,7 @@ pub(crate) fn query_file_at_point(
     as_of: Option<&str>,
     selected_repo: Option<&str>,
     format: OutputFormat,
+    role: RoleFilter,
 ) -> Result<()> {
     let selector = match (at, as_of) {
         (Some(prefix), None) => query::FileAtPointSelector::At(prefix),
@@ -226,6 +250,25 @@ pub(crate) fn query_file_at_point(
             // A temporal selector is always in effect on this path, so the
             // corpus is the single-commit snapshot it pins (issue #427).
             let corpus_mode = query::CorpusMode::CommitPinned;
+            // Role scope (issue #238) narrows the reconstructed symbol set
+            // AFTER the point resolution, order preserved — a scoped answer
+            // is a subsequence of the unscoped one. `returned` tracks the
+            // narrowed set, and a filter that empties a non-empty set is
+            // surfaced as a diagnostic rather than a silent empty answer.
+            let mut result = result;
+            let unfiltered = result.symbols.len();
+            result.symbols.retain(|row| role.matches(row.role));
+            result.returned = result.symbols.len();
+            if result.symbols.is_empty() && unfiltered > 0 {
+                result.diagnostics.push(query::FileAtPointDiagnostic {
+                    code: "empty_role_set",
+                    detail: format!(
+                        "file {path} defined {unfiltered} symbols at commit {} but none with role `{}`",
+                        result.resolved_commit,
+                        role.as_str()
+                    ),
+                });
+            }
             match format {
                 OutputFormat::Json => {
                     #[derive(serde::Serialize)]
@@ -255,8 +298,13 @@ pub(crate) fn query_file_at_point(
                 OutputFormat::Text => {
                     for row in &result.symbols {
                         let line = row.span.map_or(0, |s| s.start_line);
+                        // Role rides along when known; absent on records that
+                        // predate issue #238, and then printed as nothing.
+                        let role_suffix = row
+                            .role
+                            .map_or(String::new(), |r| format!(" [{}]", r.as_str()));
                         println!(
-                            "{} (Symbol) @ {}:{line} [{}]",
+                            "{} (Symbol) @ {}:{line} [{}]{role_suffix}",
                             row.name, row.repo_relative_path, row.commit
                         );
                     }

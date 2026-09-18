@@ -16,8 +16,8 @@ use crate::{
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
     languages::cross_file::{
-        FileFacts, apply_out_of_line_test_scope, cross_file_call_records,
-        cross_file_implements_records, label_same_file_call_resolutions,
+        FileFacts, apply_out_of_line_test_roles, apply_out_of_line_test_scope,
+        cross_file_call_records, cross_file_implements_records, label_same_file_call_resolutions,
     },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
@@ -542,6 +542,9 @@ fn scan_repository_incremental_at_inner(
     // so a gating change in a parent file re-contexts an unchanged module
     // file's cached panic-risk sites correctly.
     apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238):
+    // recomputed over the whole assembled graph every scan — never cached.
+    apply_out_of_line_test_roles(graph.records_mut(), &facts_by_file);
 
     let mut tombstoned_files = Vec::new();
     for (removed, cached_file) in &previous_cache.files {

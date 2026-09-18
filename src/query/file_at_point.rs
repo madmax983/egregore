@@ -50,6 +50,11 @@ pub struct FileAtPointSymbol<'a> {
     /// Valid time (committer date) of the resolved commit, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_time: Option<&'a str>,
+    /// Test-vs-production role of the backing record (issue #238), resolved
+    /// as-of the selected point. Omitted for records that predate issue #238
+    /// (role unknown, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::ir::SymbolRole>,
 }
 
 /// One stable, machine-readable diagnostic on a *successful* file-at-point
@@ -418,6 +423,7 @@ pub fn file_symbols_at_point<'a>(
             absent_span_reason: span.is_none().then_some("no_span_module_level"),
             commit: resolved_sha,
             valid_time: Some(t.valid_time.as_str()),
+            role: r.role().copied(),
         });
     }
     symbols.sort_by(|a, b| {

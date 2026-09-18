@@ -12,7 +12,7 @@ use crate::{
     fs::SourceFile,
     ir::{
         DeprecationMark, EdgeLabel, EntryPointKind, EntryPointMark, Graph, GraphRecord,
-        MAX_DEPRECATION_STRING_LEN, NodeKind, RouteAnnotation, SourceSpan, stable_id,
+        MAX_DEPRECATION_STRING_LEN, NodeKind, RouteAnnotation, SourceSpan, SymbolRole, stable_id,
     },
     languages::{
         common::{
@@ -231,8 +231,9 @@ struct RustExtractor<'graph, 'source> {
     /// Depth of enclosing test scopes (`#[cfg(test)]` modules and `#[test]`
     /// functions). Non-zero means panic-risk call sites classify as `test`.
     test_scope_depth: usize,
-    /// `true` when the whole file lives under a top-level `tests/` directory.
-    file_in_tests_dir: bool,
+    /// `true` when the whole file lives under a top-level `tests/` or
+    /// `benches/` directory (Cargo's integration-test and bench roots).
+    file_in_test_root: bool,
     /// Per-function receiver-type environment (issue #441): a receiver binding
     /// identifier -> its reduced nominal type path, built from typed fn params
     /// and `let x: T` ascriptions whose binding is UNSHADOWED in the function
@@ -308,9 +309,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             inline_module_stack: Vec::new(),
             inline_path_override_depth: 0,
             test_scope_depth: 0,
-            file_in_tests_dir: path_segments(&file.repo_relative_path)
+            file_in_test_root: path_segments(&file.repo_relative_path)
                 .first()
-                .is_some_and(|segment| segment == "tests"),
+                .is_some_and(|segment| segment == "tests" || segment == "benches"),
             type_env: BTreeMap::new(),
             dispatch_trait_env: BTreeMap::new(),
             enclosing_fn_ids: Vec::new(),
@@ -1600,10 +1601,56 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     /// `true` when the cursor is inside any test scope: a file under a
-    /// top-level `tests/` directory, a `#[cfg(test)]` module, or a `#[test]`
-    /// function. The classification set is closed for issue #223.
+    /// top-level `tests/` or `benches/` directory, a `#[cfg(test)]` module,
+    /// or a `#[test]`-family function. The classification set is closed for
+    /// issue #223; issue #238 reuses it as signals (b) and (c).
     const fn in_test_context(&self) -> bool {
-        self.file_in_tests_dir || self.test_scope_depth > 0
+        self.file_in_test_root || self.test_scope_depth > 0
+    }
+
+    /// Derives the deterministic test-vs-production role for one symbol
+    /// (issue #238): `Test` when the item carries a test-family attribute
+    /// (signal a) or sits in a test context (signals b/c, composed by
+    /// [`Self::in_test_context`]); `Production` otherwise. A `mod` item
+    /// carrying `#[cfg(test)]` is itself `Test`: its declaration is the
+    /// lexical gate, even though the scope counter is entered only for its
+    /// children. A bare `#[cfg(test)] fn` is NOT test — the gate applies to
+    /// modules, not items. The full decision procedure is documented in
+    /// `docs/cli/test-production-roles.md`.
+    fn symbol_role(&self, node: Node<'_>) -> SymbolRole {
+        if self.has_test_family_attribute(node) || self.in_test_context() {
+            SymbolRole::Test
+        } else if node.kind() == "mod_item" && self.has_cfg_test_attribute(node) {
+            SymbolRole::Test
+        } else {
+            SymbolRole::Production
+        }
+    }
+
+    /// `true` when the item carries a test-family attribute in the attribute
+    /// items immediately preceding it: `#[test]`, `#[bench]`, or a path
+    /// attribute ending in `::test` / `::bench` (e.g. `#[tokio::test]`),
+    /// with or without arguments (issue #238 signal a). Reuses issue #240's
+    /// closed [`entry_point_kind_from_attribute`] vocabulary rather than
+    /// defining a second one; configuration attributes that merely mention
+    /// these tokens (`#[cfg(test)]`, `#[cfg_attr(test, ...)]`) never match.
+    fn has_test_family_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if entry_point_kind_from_attribute(self.node_text(sibling))
+                        == Some(EntryPointKind::Test)
+                    {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
     }
 
     /// `true` when the function carries a dedicated test attribute in the
@@ -1990,6 +2037,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if let Some(entry_point) = self.entry_point_mark(node, symbol_kind, qualified_name) {
             record = record.with_entry_point(entry_point);
         }
+        // Test-vs-production role (issue #238): stamped on EVERY symbol
+        // record — the classification is total, so there is no unknown case
+        // at extraction time. Additive, never an identity input.
+        record = record.with_role(self.symbol_role(node));
         self.graph.push(record);
         self.add_edge(
             EdgeLabel::Defines,
@@ -4807,6 +4858,158 @@ mod tests {
         assert_eq!(entry_attr("#[cfg_attr(test, no_mangle)]\nfn f() {}"), None);
         assert_eq!(entry_attr("#[allow(dead_code)]\nfn f() {}"), None);
         assert_eq!(entry_attr("#[inline]\nfn f() {}"), None);
+    }
+
+    // ── Test vs. production symbol roles (issue #238, RED) ────────────────
+
+    /// Extracts `source` as the repo-relative `path` and returns every
+    /// `Symbol` record's `(qualified_name, role)`.
+    fn symbol_roles_at(source: &str, path: &str) -> Vec<(String, Option<SymbolRole>)> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name: Some(name),
+                    ..
+                } => Some((name.clone(), r.role().copied())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn role_of(roles: &[(String, Option<SymbolRole>)], name: &str) -> Option<SymbolRole> {
+        roles
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, role)| *role)
+            .unwrap_or_else(|| panic!("symbol `{name}` should have been extracted"))
+    }
+
+    #[test]
+    fn role_test_attribute_fn_is_test() {
+        let roles = symbol_roles_at("#[test]\nfn check() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_test_family_attributes_are_test() {
+        let roles = symbol_roles_at(
+            "#[tokio::test]\nasync fn async_check() {}\n#[bench]\nfn bench_check() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "async_check"), Some(SymbolRole::Test));
+        assert_eq!(role_of(&roles, "bench_check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_cfg_test_module_members_are_test() {
+        // Ancestry composition (issue #238 signal b): a symbol nested in a
+        // `#[cfg(test)]` module is test, however deep the nesting.
+        let roles = symbol_roles_at(
+            "#[cfg(test)]\nmod tests {\n    fn helper() {}\n    mod inner {\n        fn deep() {}\n    }\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "tests::helper"), Some(SymbolRole::Test));
+        assert_eq!(
+            role_of(&roles, "tests::inner::deep"),
+            Some(SymbolRole::Test)
+        );
+    }
+
+    #[test]
+    fn role_cfg_test_module_declaration_is_test() {
+        // The gated module's OWN declaration is the lexical gate (issue
+        // #238): it is test even though the scope counter is entered only
+        // for its children.
+        let roles = symbol_roles_at(
+            "#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(role_of(&roles, "tests"), Some(SymbolRole::Test));
+        assert_eq!(role_of(&roles, "tests::helper"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_cfg_test_out_of_line_module_declaration_is_test() {
+        // Out-of-line form: the `mod name;` declaration carries the gate.
+        let roles = symbol_roles_at("#[cfg(test)]\nmod out;\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "out"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_ungated_module_declaration_is_production() {
+        // A module without the gate stays production — the gate is the
+        // `#[cfg(test)]` attribute, not module-hood.
+        let roles = symbol_roles_at("mod plain {\n    fn helper() {}\n}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "plain"), Some(SymbolRole::Production));
+        assert_eq!(
+            role_of(&roles, "plain::helper"),
+            Some(SymbolRole::Production)
+        );
+    }
+
+    #[test]
+    fn role_production_fn_is_production() {
+        let roles = symbol_roles_at("pub fn ship() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "ship"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_tests_dir_file_is_test() {
+        // Signal (c): a plain fn in an integration-test root is test.
+        let roles = symbol_roles_at("fn integration_check() {}\n", "tests/integration.rs");
+        assert_eq!(role_of(&roles, "integration_check"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_benches_dir_file_is_test() {
+        let roles = symbol_roles_at("fn bench_main() {}\n", "benches/bench.rs");
+        assert_eq!(role_of(&roles, "bench_main"), Some(SymbolRole::Test));
+    }
+
+    #[test]
+    fn role_windows_separators_still_classify_test_roots() {
+        // Separator-agnostic (issue #238): a Windows checkout reports
+        // `tests\integration.rs`; the first segment is still `tests`.
+        let roles = symbol_roles_at("fn integration_check() {}\n", "tests\\integration.rs");
+        assert_eq!(role_of(&roles, "integration_check"), Some(SymbolRole::Test));
+        let roles = symbol_roles_at("fn bench_main() {}\n", "benches\\bench.rs");
+        assert_eq!(role_of(&roles, "bench_main"), Some(SymbolRole::Test));
+        // ... and a production file keeps forward slashes working too.
+        let roles = symbol_roles_at("pub fn ship() {}\n", "src\\lib.rs");
+        assert_eq!(role_of(&roles, "ship"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_cfg_test_on_non_module_item_is_not_a_signal() {
+        // The closed signal set (issue #238): `#[cfg(test)]` on a bare fn is
+        // not a test-family attribute (a) and not module gating (b), so the
+        // symbol stays production. Documents the boundary; a later slice may
+        // extend the vocabulary.
+        let roles = symbol_roles_at("#[cfg(test)]\nfn helper() {}\n", "src/lib.rs");
+        assert_eq!(role_of(&roles, "helper"), Some(SymbolRole::Production));
+    }
+
+    #[test]
+    fn role_every_symbol_carries_a_role() {
+        let roles = symbol_roles_at(
+            "pub fn ship() {}\n#[test]\nfn check() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(roles.len(), 4, "all four symbols extracted");
+        assert!(
+            roles.iter().all(|(_, role)| role.is_some()),
+            "every Symbol record carries a role, got {roles:?}"
+        );
     }
 
     #[test]

@@ -1255,6 +1255,47 @@ pub(crate) enum OutputFormat {
     Text,
 }
 
+/// Test-vs-production role selector for the scopable code lanes
+/// (`query symbol`, `query file`; issue #238).
+///
+/// Filters rows by the deterministic `role` stamped on each `Symbol` record
+/// at scan time. `All` (the default) is a no-op: rows whose record predates
+/// issue #238 (role unknown) are returned only under `All` — they match
+/// neither `Production` nor `Test`, because an unknown role is not a
+/// `Production` fact.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum RoleFilter {
+    /// Return test and production rows (default); the only selector that
+    /// returns rows whose role is unknown (pre-#238 records).
+    #[default]
+    All,
+    /// Return only rows stamped `production`.
+    Production,
+    /// Return only rows stamped `test`.
+    Test,
+}
+
+impl RoleFilter {
+    /// Whether a row carrying `role` survives this selector. A `None` role
+    /// (record predates issue #238) survives only [`RoleFilter::All`].
+    pub(crate) fn matches(self, role: Option<crate::ir::SymbolRole>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Production => role == Some(crate::ir::SymbolRole::Production),
+            Self::Test => role == Some(crate::ir::SymbolRole::Test),
+        }
+    }
+
+    /// The stable CLI spelling: `"all"`, `"production"`, or `"test"`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Production => "production",
+            Self::Test => "test",
+        }
+    }
+}
+
 /// Which input sources `eg audit query-latency` measures (issue #255).
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum LatencySource {
@@ -1348,6 +1389,11 @@ pub(crate) enum QuerySubcommand {
         /// runtime with an `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Scope results by test-vs-production role (issue #238): `all`
+        /// (default), `production`, or `test`. Rows whose record predates
+        /// issue #238 carry no role and appear only under `all`.
+        #[arg(long, default_value = "all")]
+        role: RoleFilter,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1472,6 +1518,11 @@ pub(crate) enum QuerySubcommand {
         /// no freshness field. See `eg query symbol --help`.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Scope results by test-vs-production role (issue #238): `all`
+        /// (default), `production`, or `test`. Rows whose record predates
+        /// issue #238 carry no role and appear only under `all`.
+        #[arg(long, default_value = "all")]
+        role: RoleFilter,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -5331,6 +5382,16 @@ pub(crate) struct SymbolResult<'a> {
     /// `corpus_mode`.
     #[serde(skip_serializing_if = "Option::is_none")]
     corpus_disclaimer: Option<String>,
+    /// Test-vs-production role of the row's record (issue #238): `test` or
+    /// `production`, drawn from the AST and the file path (a
+    /// `TrustClass::SourceDerived` fact, never agent-authored).
+    ///
+    /// OMITTED entirely for a record produced before issue #238 — role
+    /// UNKNOWN, which is a different fact from a present `production` value
+    /// (computed, and provably not test-gated). The text render likewise
+    /// prints nothing for an absent role rather than fabricating one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a crate::ir::SymbolRole>,
 }
 
 /// Resolves the effective corpus mode for a current-state code lane and,
@@ -6196,6 +6257,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
             at_head,
             all_history,
+            role,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
@@ -6252,6 +6314,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         as_of.as_deref(),
                         repo.as_deref(),
                         format,
+                        role,
                     );
                 }
                 // Validate the temporal selectors before touching the local store
@@ -6285,6 +6348,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     format,
                     &index,
                     selected.as_deref(),
+                    role,
                 );
             }
             #[cfg(feature = "embedded-aletheiadb")]
@@ -6309,6 +6373,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     as_of.as_deref(),
                     repo.as_deref(),
                     format,
+                    role,
                 );
             }
             // Sidecar-index fast path (issue #447) for the plain current-state,
@@ -6408,6 +6473,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 freshness_code.as_ref(),
                                 corpus_mode,
                                 corpus_mode_source,
+                                role,
                             )
                         },
                         |prefix| {
@@ -6420,6 +6486,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 selected,
                                 package.as_deref(),
                                 freshness_code.as_ref(),
+                                role,
                             )
                         },
                     )
@@ -6434,6 +6501,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         selected,
                         package.as_deref(),
                         freshness_code.as_ref(),
+                        role,
                     )
                 },
             )
@@ -6608,6 +6676,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             tx_as_of,
             repo,
             repo_path,
+            role,
             format,
         } => {
             // Transaction-time file views are reserved: reject with the
@@ -6671,6 +6740,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     as_of.as_deref(),
                     selected.as_deref(),
                     format,
+                    role,
                 );
             }
             #[cfg(feature = "embedded-aletheiadb")]
@@ -6685,7 +6755,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_file_via_daemon(&path, dir, repo.as_deref(), format);
+                return query_file_via_daemon(&path, dir, repo.as_deref(), format, role);
             }
             // Sidecar-index fast path (issue #447): a file's defined-symbol set
             // is a `ByPath` closure. `--repo` (scope) and `--repo-path`
@@ -6711,6 +6781,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 freshness_code.as_ref(),
+                role,
             )
         }
         QuerySubcommand::Drift {

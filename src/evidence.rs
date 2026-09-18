@@ -637,6 +637,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
     GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id,
         kind: NodeKind::Agent,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -768,6 +769,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
     GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id,
         kind: NodeKind::AgentSession,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1044,6 +1046,7 @@ pub fn build_observation_records(
     let obs_node = GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id: obs_id.clone(),
         kind: NodeKind::Observation,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1296,6 +1299,7 @@ pub fn build_failure_records(
     let failure_node = GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id: failure_id.clone(),
         kind: NodeKind::Failure,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1552,6 +1556,7 @@ pub fn build_command_evidence_records(
     let cmd_node = GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id: cmd_id.clone(),
         kind: NodeKind::CommandEvidence,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
@@ -1808,6 +1813,7 @@ pub fn build_artifact_records(
     let art_node = GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id: art_id.clone(),
         kind: NodeKind::PatchArtifact,
         schema_version: ARTIFACT_SCHEMA_VERSION,
@@ -2037,6 +2043,7 @@ pub fn build_verification_records(
     let ver_node = GraphRecord::Node {
         deprecated: None,
         entry_point: None,
+        role: None,
         id: ver_id.clone(),
         kind: NodeKind::Verification,
         schema_version: VERIFICATION_SCHEMA_VERSION,

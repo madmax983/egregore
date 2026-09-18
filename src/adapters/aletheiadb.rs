@@ -21,7 +21,8 @@ use crate::{
     ir::{
         CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EntryPointMark, EvidenceLink,
         GraphRecord, IdentitySource, MetricKind, NodeKind, Producer, RouteAnnotation,
-        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
+        SelectionBasis, SemanticDriftMetadata, SourceSpan, SymbolRole, TemporalMetadata,
+        UserContextFields,
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
@@ -2675,6 +2676,7 @@ impl EmbeddedAletheiaSink {
             route,
             deprecated,
             entry_point,
+            role,
             crate_attribution,
             temporal,
             semantic_drift,
@@ -2820,6 +2822,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(mark)
         {
             builder = builder.insert("entry_point_json", json.as_str());
+        }
+        // Test-vs-production role (issue #238). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(role) = role
+            && let Ok(json) = serde_json::to_string(role)
+        {
+            builder = builder.insert("role_json", json.as_str());
         }
         // Owning-package attribution (issue #117). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3621,6 +3630,13 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<EntryPointMark>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("entry_point_json invalid: {e}")))?,
+            // Test-vs-production role (issue #238). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            role: optional_str_property(record_id, "role_json", node.get_property("role_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<SymbolRole>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("role_json invalid: {e}")))?,
             // Owning-package attribution (issue #117). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make
@@ -6611,6 +6627,49 @@ mod tests {
         };
         assert_eq!(span.start_column, None, "legacy span stays UNKNOWN");
         assert_eq!(span.end_column, None, "legacy span stays UNKNOWN");
+    }
+
+    #[test]
+    fn symbol_role_round_trips_through_the_embedded_store() {
+        // Issue #238: the test-vs-production role must persist through the
+        // embedded adapter and read back unchanged; a legacy role-less record
+        // must read back as UNKNOWN (None), never a fabricated production.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("role-round-trip-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let test_id = stable_id(&["node", "symbol", "src/lib.rs", "test_fn"]);
+        let prod_id = stable_id(&["node", "symbol", "src/lib.rs", "prod_fn"]);
+        let legacy_id = stable_id(&["node", "symbol", "src/lib.rs", "legacy_fn"]);
+        let test_sym =
+            current_symbol_record(&test_id, "test fn", 20).with_role(crate::ir::SymbolRole::Test);
+        let prod_sym = current_symbol_record(&prod_id, "prod fn", 20)
+            .with_role(crate::ir::SymbolRole::Production);
+        let legacy_sym = current_symbol_record(&legacy_id, "legacy fn", 20);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&test_sym)
+            .expect("test symbol should write");
+        sink.write_record(&prod_sym)
+            .expect("prod symbol should write");
+        sink.write_record(&legacy_sym)
+            .expect("legacy symbol should write");
+
+        for (id, expected) in [
+            (test_id.as_str(), Some(crate::ir::SymbolRole::Test)),
+            (prod_id.as_str(), Some(crate::ir::SymbolRole::Production)),
+            (legacy_id.as_str(), None),
+        ] {
+            let read_back = sink
+                .read_back(id)
+                .expect("read should succeed")
+                .expect("record should be found");
+            assert_eq!(
+                read_back.role().copied(),
+                expected,
+                "role must survive the embedded round trip for {id}"
+            );
+        }
     }
 
     #[test]

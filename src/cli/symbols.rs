@@ -8,6 +8,7 @@ pub(crate) fn query_symbol_via_daemon(
     as_of: Option<&str>,
     repo: Option<&str>,
     format: OutputFormat,
+    role: RoleFilter,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
@@ -29,14 +30,34 @@ pub(crate) fn query_symbol_via_daemon(
     if repo.is_none() && (at.is_some() || as_of.is_some()) {
         fail_on_unscoped_daemon_repo_collision(&records);
     }
+    // Role scope (issue #238) applies client-side: the daemon verbs predate
+    // the selector and return every matching record; the CLI narrows to the
+    // requested role. A record without a `role` field (store predates
+    // issue #238) matches only `RoleFilter::All`.
+    let records: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|rec| role.matches(daemon_record_role(rec)))
+        .collect();
     if records.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
         std::process::exit(2);
     }
-    for rec in &records {
+    for rec in records {
         print_daemon_symbol_record(rec, format)?;
     }
     Ok(())
+}
+
+/// Reads the test-vs-production role from a daemon-returned record
+/// (`serde_json::Value`). `None` when the record carries no `role` field —
+/// the daemon's store predates issue #238 — or the value is unrecognized.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn daemon_record_role(rec: &serde_json::Value) -> Option<crate::ir::SymbolRole> {
+    match rec.get("role").and_then(|v| v.as_str()) {
+        Some("test") => Some(crate::ir::SymbolRole::Test),
+        Some("production") => Some(crate::ir::SymbolRole::Production),
+        _ => None,
+    }
 }
 
 /// Prints a daemon symbol/file record (`serde_json::Value`) in the requested format.
@@ -55,7 +76,12 @@ pub(crate) fn print_daemon_symbol_record(
             let commit = rec["git_commit"]
                 .as_str()
                 .map_or(String::new(), |c| format!(" [{c}]"));
-            println!("{name} ({kind}) @ {path}:{line}{commit}");
+            // Test-vs-production role (issue #238); absent on records from a
+            // store that predates it, and then printed as nothing — never a
+            // fabricated value.
+            let role_suffix =
+                daemon_record_role(rec).map_or(String::new(), |r| format!(" [{}]", r.as_str()));
+            println!("{name} ({kind}) @ {path}:{line}{commit}{role_suffix}");
         }
     }
     Ok(())
@@ -76,6 +102,7 @@ pub(crate) fn query_symbol_all(
     freshness_code: Option<&(String, &'static str)>,
     corpus_mode: query::CorpusMode,
     corpus_mode_source: query::CorpusModeSource,
+    role: RoleFilter,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     // Issue #472: targets of ACTIVE repository-eviction tombstones are suppressed
@@ -166,6 +193,10 @@ pub(crate) fn query_symbol_all(
         results.retain(|r| r.repository_id == Some(repo));
     }
     retain_package_scope(&mut results, package);
+    // Role scope (issue #238) narrows AFTER row projection like the package
+    // scope above, and is likewise order-preserving. A row whose record
+    // predates issue #238 (role unknown) survives only `RoleFilter::All`.
+    results.retain(|r| role.matches(r.role.copied()));
 
     if results.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -289,6 +320,7 @@ pub(crate) fn symbol_row<'a>(
         corpus_mode: None,
         corpus_mode_source: None,
         corpus_disclaimer: None,
+        role: record.role(),
     })
 }
 
@@ -389,6 +421,7 @@ pub(crate) fn query_symbol_at(
     selected_repo: Option<&str>,
     package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    role: RoleFilter,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
     // across the repository boundary is unambiguous within the selected repo.
@@ -416,6 +449,10 @@ pub(crate) fn query_symbol_at(
     if let Some(selector) = package {
         matches.retain(|r| r.owning_package().map(|(name, _)| name) == Some(selector));
     }
+    // Role scope (issue #238) likewise narrows candidates before the winner
+    // is chosen: `--role test` must be able to select the test-named symbol
+    // when a production same-named symbol would otherwise sort first.
+    matches.retain(|r| role.matches(r.role().copied()));
     if let Some(repo) = selected_repo {
         matches.retain(|r| index.owner_of(r.id()) == Some(repo));
     } else {
@@ -491,6 +528,12 @@ impl PrintText for SymbolResult<'_> {
         }
         if let Some(doc) = self.doc {
             let _ = write!(text, "\n  doc: {doc}");
+        }
+        // Test-vs-production role (issue #238). An ABSENT field prints
+        // NOTHING: the record predates issue #238, so its role is unknown,
+        // and rendering "production" would fabricate a negative fact.
+        if let Some(role) = self.role {
+            let _ = write!(text, "\n  role: {}", role.as_str());
         }
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and

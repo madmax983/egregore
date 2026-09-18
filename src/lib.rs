@@ -152,7 +152,7 @@ pub use ir::{
     PatchHandle, Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, ScanCoveragePayload,
     SelectionBasis, SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan,
-    TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
+    SymbolRole, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
     VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, artifact_stable_id, log_stable_id,
     project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
     verification_stable_id,
@@ -416,6 +416,11 @@ fn scan_repository_at_with_override_inner(
     // module file is extracted with no view of the gating attribute, so the
     // repo-wide pass rewrites its panic-risk sites to test context.
     languages::cross_file::apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238):
+    // the module file's path-derived `Production` role is upgraded to `Test`
+    // by the same test-only-module resolution. Roles are re-stamped on every
+    // scan, never cached.
+    languages::cross_file::apply_out_of_line_test_roles(graph.records_mut(), &facts_by_file);
 
     // Declared Cargo dependencies (issue #180): every manifest's directly-
     // declared dependencies become deterministic, citable graph facts joined
@@ -807,6 +812,22 @@ pub(crate) fn scan_source_file_records(
     })
 }
 
+/// Derives the path-signal test-vs-production role for a `File` record
+/// (issue #238 signal c): `Test` when the repo-relative path's first segment
+/// is `tests` or `benches` (Cargo's integration-test and bench roots),
+/// `Production` otherwise. Segment comparison is separator-agnostic, so `\`
+/// checkouts classify identically to `/` ones.
+fn file_role_for_path(repo_relative_path: &str) -> SymbolRole {
+    let is_test_root = languages::common::path_segments(repo_relative_path)
+        .first()
+        .is_some_and(|segment| segment == "tests" || segment == "benches");
+    if is_test_root {
+        SymbolRole::Test
+    } else {
+        SymbolRole::Production
+    }
+}
+
 pub(crate) fn scan_source_text_records(
     source_file: &fs::SourceFile,
     source: &str,
@@ -832,17 +853,25 @@ pub(crate) fn scan_source_text_records(
         }
         languages::Language::Go => crate::languages::go::normalize_file_code(source),
     };
-    graph.push(GraphRecord::node(
-        file_id.clone(),
-        NodeKind::File,
-        Some(repo_relative_path.clone()),
-        None,
-        Some(repo_relative_path.clone()),
-        format!(
-            "{} source file {repo_relative_path}\nSource:\n{normalized}",
-            language.display_name()
-        ),
-    ));
+    graph.push(
+        GraphRecord::node(
+            file_id.clone(),
+            NodeKind::File,
+            Some(repo_relative_path.clone()),
+            None,
+            Some(repo_relative_path.clone()),
+            format!(
+                "{} source file {repo_relative_path}\nSource:\n{normalized}",
+                language.display_name()
+            ),
+        )
+        // Test-vs-production role, path signal (issue #238 signal c): a file
+        // under a top-level `tests/` or `benches/` root is test, everything else
+        // production. Out-of-line `#[cfg(test)] mod x;` targets are upgraded to
+        // test by the repo-wide `apply_out_of_line_test_roles` pass, which runs
+        // after all files are extracted.
+        .with_role(file_role_for_path(&repo_relative_path)),
+    );
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
     let facts =
         parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
@@ -878,8 +907,26 @@ pub(crate) fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphRecord, NodeKind, SourceFileScanOutcome, fs::SourceFile, scan_source_file_records,
+        GraphRecord, NodeKind, SourceFileScanOutcome, SymbolRole, file_role_for_path,
+        fs::SourceFile, scan_source_file_records,
     };
+
+    /// Issue #238: `File` path-signal roles classify `tests/` and `benches/`
+    /// roots as test, everything else as production, on either separator.
+    #[test]
+    fn file_role_for_path_classifies_test_roots() {
+        assert_eq!(file_role_for_path("tests/integration.rs"), SymbolRole::Test);
+        assert_eq!(file_role_for_path("benches/bench.rs"), SymbolRole::Test);
+        assert_eq!(
+            file_role_for_path("tests\\integration.rs"),
+            SymbolRole::Test
+        );
+        assert_eq!(file_role_for_path("benches\\bench.rs"), SymbolRole::Test);
+        assert_eq!(file_role_for_path("src/lib.rs"), SymbolRole::Production);
+        assert_eq!(file_role_for_path("src\\lib.rs"), SymbolRole::Production);
+        // A mere prefix is not a root: `testing/` is production.
+        assert_eq!(file_role_for_path("testing/foo.rs"), SymbolRole::Production);
+    }
 
     /// Issue #438: an unreadable source file (here the reader is pointed at a
     /// directory, so `std::fs::read` returns an io error deterministically and
