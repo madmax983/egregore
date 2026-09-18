@@ -58,6 +58,9 @@ Evidence-backed audit subcommands have their own pages:
   context** for the top-N semantic matches in one call
   ([semantic-search-guidance.md](semantic-search-guidance.md), issue #90).
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
+- `eg query bench` — the latest captured criterion **benchmark run** for a
+  benchmark id, symbol, or file, with a citable handle
+  ([query-bench.md](query-bench.md), issue #237).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
 - `eg query semantic-memory` — recall prior **agent memory by meaning** with

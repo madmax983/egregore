@@ -10,6 +10,9 @@ pub mod accuracy;
 pub mod adapters;
 /// Antigravity transcript JSONL importer.
 pub mod antigravity;
+/// Criterion benchmark capture as verification-domain `BenchmarkRun` records
+/// (issue #237).
+pub mod bench_capture;
 /// Evidence bundle export, verification, and inspection (issue #68).
 pub mod bundle;
 /// Citation-completeness audit over public query workflows (issue #65).

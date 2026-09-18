@@ -120,6 +120,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "bench",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived", "verification_evidence"],
+            citable_handles: true,
+            freshness: &["valid_time"],
+        },
+    ),
+    (
         "blind-spots",
         LaneStatic {
             store_mode: StoreMode::Structural,

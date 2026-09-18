@@ -7,6 +7,7 @@ mod at;
 mod audit;
 mod bundle;
 mod candidates;
+mod capture_bench;
 mod capture_tests;
 mod change_impact;
 mod changes;
@@ -58,6 +59,7 @@ mod producer_drift;
 mod protected;
 mod public_api;
 mod public_api_deltas;
+mod query_bench;
 mod recency;
 mod records;
 mod redaction_audit;
@@ -106,6 +108,7 @@ pub(crate) use at::*;
 pub(crate) use audit::*;
 pub(crate) use bundle::*;
 pub(crate) use candidates::*;
+pub(crate) use capture_bench::*;
 pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
@@ -154,6 +157,7 @@ pub(crate) use producer_drift::*;
 pub(crate) use protected::*;
 pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
+pub(crate) use query_bench::*;
 pub(crate) use recency::*;
 pub(crate) use records::*;
 pub(crate) use redaction_audit::*;
@@ -411,6 +415,63 @@ pub(crate) enum Commands {
         /// Config action.
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Capture a criterion benchmark run as citable verification-domain
+    /// `BenchmarkRun` records (issue #237).
+    ///
+    /// CAPTURE-ONLY: never executes a benchmark runner. The caller runs the
+    /// benchmarks; criterion's own `*/new/estimates.json` files (plus optional
+    /// `*/base/estimates.json` saved baselines) are handed here via `--input`
+    /// and parsed into one redaction-safe `BenchmarkRun` node per benchmark
+    /// (verification domain, `benchmark_run` kind). Each record carries the
+    /// benchmark id, the central estimate (`mean`, nanoseconds) and its
+    /// confidence interval, the baseline verdict (`regression | improvement |
+    /// unchanged | no_baseline`) plus the percentage delta, the captured
+    /// commit, and a `source_artifact_path`/`source_artifact_hash` pinning the
+    /// raw criterion artifact for later re-parsing. With `--graph` (a code
+    /// graph from `eg scan`) each benchmark whose final `/`-segment resolves
+    /// to exactly one `Symbol` mints `MENTIONS_SYMBOL` / `TOUCHED_FILE` edges;
+    /// zero or two-plus matches mint a `Diagnostic` and join the envelope's
+    /// `unresolved` section instead of a wrong edge. Re-capturing identical
+    /// input is a byte-identical no-op (issue #130).
+    ///
+    /// Exit codes: 0 success; 1 usage/provenance error; 4 empty input
+    /// (no `*/new/estimates.json` found); 5 unparseable estimates. See
+    /// `docs/cli/capture-bench.md`.
+    CaptureBench {
+        /// Path to the criterion output directory (`target/criterion`
+        /// shape: `<benchmark-id>/new/estimates.json`). Stored, never run.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session_id: String,
+        /// Commit handle / external identifier (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Suite name (part of the record ID and the node name).
+        #[arg(long)]
+        suite: String,
+        /// The exact command that produced the criterion output. Stored, never
+        /// executed.
+        #[arg(long)]
+        command: Option<String>,
+        /// Caller-supplied RFC 3339 timestamp. Validated.
+        #[arg(long)]
+        executed_at: String,
+        /// Optional repository identity (reserved for scoping).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional code graph (from `eg scan`) to resolve benchmark ids to
+        /// Symbol/File.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Input format. Only `criterion-estimates` (the default) is accepted.
+        #[arg(long, default_value = "criterion-estimates")]
+        format: String,
     },
     /// Capture a `cargo test` / libtest JSON run as a citable verification-domain
     /// `TestRun` record (issue #165).
@@ -1693,6 +1754,28 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+    },
+    /// Return the latest captured benchmark run for a benchmark id, symbol, or file.
+    Bench {
+        /// Benchmark id, symbol name, or file path to look up.
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to the run captured at this commit SHA or unique prefix.
+        /// Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Return the latest run at or before this RFC 3339 instant
+        /// (valid-time axis). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -4970,6 +5053,29 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             repo_id_override,
             format,
         } => verify_scan_cmd(&repo_path, repo_id_override.as_deref(), format),
+        Commands::CaptureBench {
+            input,
+            out,
+            session_id,
+            commit,
+            suite,
+            command,
+            executed_at,
+            repo,
+            graph,
+            format,
+        } => capture_bench(&CaptureBenchArgs {
+            input: &input,
+            out: &out,
+            session_id: &session_id,
+            commit: &commit,
+            suite: &suite,
+            command: command.as_deref(),
+            executed_at: &executed_at,
+            graph: graph.as_deref(),
+            format: &format,
+            repo: repo.as_deref(),
+        }),
         Commands::CaptureTests {
             input,
             out,
@@ -6920,6 +7026,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at_head,
                 all_history,
             )
+        }
+        QuerySubcommand::Bench {
+            target,
+            graph,
+            data_dir,
+            at,
+            as_of,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_bench_cmd(&records, &target, at.as_deref(), as_of.as_deref(), format)
         }
         QuerySubcommand::Task {
             id_or_handle,
