@@ -374,6 +374,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 format!("Rust module {qualified_name}"),
             )
             .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
+            // Test-vs-production role (issue #238): a `#[cfg(test)] mod`
+            // declaration is itself the lexical gate, so the Module record
+            // carries the same role its member symbols get. Stamped before
+            // the scope counter is entered for the module's children.
+            .with_role(self.symbol_role(node))
             // The module summary is name-only, so a body change with an
             // unchanged name would hash identically. Stamp a compact BLAKE3
             // handle over the normalized body so evidence-freshness drift stays
@@ -1618,9 +1623,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// modules, not items. The full decision procedure is documented in
     /// `docs/cli/test-production-roles.md`.
     fn symbol_role(&self, node: Node<'_>) -> SymbolRole {
-        if self.has_test_family_attribute(node) || self.in_test_context() {
-            SymbolRole::Test
-        } else if node.kind() == "mod_item" && self.has_cfg_test_attribute(node) {
+        if self.has_test_family_attribute(node)
+            || self.in_test_context()
+            || (node.kind() == "mod_item" && self.has_cfg_test_attribute(node))
+        {
             SymbolRole::Test
         } else {
             SymbolRole::Production
@@ -4863,7 +4869,9 @@ mod tests {
     // ── Test vs. production symbol roles (issue #238, RED) ────────────────
 
     /// Extracts `source` as the repo-relative `path` and returns every
-    /// `Symbol` record's `(qualified_name, role)`.
+    /// `Symbol` and `Module` record's `(qualified_name, role)`. Module
+    /// declarations are included because a `#[cfg(test)] mod` declaration is
+    /// itself the lexical gate (issue #238): its record carries the role.
     fn symbol_roles_at(source: &str, path: &str) -> Vec<(String, Option<SymbolRole>)> {
         let file = SourceFile {
             path: PathBuf::from(path),
@@ -4877,7 +4885,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 GraphRecord::Node {
-                    kind: NodeKind::Symbol,
+                    kind: NodeKind::Symbol | NodeKind::Module,
                     name: Some(name),
                     ..
                 } => Some((name.clone(), r.role().copied())),
@@ -4887,11 +4895,10 @@ mod tests {
     }
 
     fn role_of(roles: &[(String, Option<SymbolRole>)], name: &str) -> Option<SymbolRole> {
-        roles
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, role)| *role)
-            .unwrap_or_else(|| panic!("symbol `{name}` should have been extracted"))
+        roles.iter().find(|(n, _)| n == name).map_or_else(
+            || panic!("symbol `{name}` should have been extracted"),
+            |(_, role)| *role,
+        )
     }
 
     #[test]

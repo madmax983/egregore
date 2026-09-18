@@ -34,7 +34,7 @@ fn egregore() -> Command {
 ///   `tests/integration.rs` File record is `test`.
 /// - `bench_main`: `benches/bench.rs` → `test` (signal c).
 /// - `production_api`: ordinary fn → `production`; `src/lib.rs` File → `production`.
-const LIB_RS: &str = r#"pub fn production_api() -> usize {
+const LIB_RS: &str = r"pub fn production_api() -> usize {
     1
 }
 
@@ -64,20 +64,20 @@ mod tests {
 
 #[cfg(test)]
 mod test_helpers;
-"#;
+";
 
-const TEST_HELPERS_RS: &str = r#"pub fn assist() -> usize {
+const TEST_HELPERS_RS: &str = r"pub fn assist() -> usize {
     4
 }
-"#;
+";
 
-const INTEGRATION_RS: &str = r#"fn integration_check() {
+const INTEGRATION_RS: &str = r"fn integration_check() {
     assert_eq!(2 + 2, 4);
 }
-"#;
+";
 
-const BENCH_RS: &str = r#"fn bench_main() {}
-"#;
+const BENCH_RS: &str = r"fn bench_main() {}
+";
 
 fn write_fixture(dir: &Path) {
     fs::create_dir_all(dir.join("src")).expect("src dir");

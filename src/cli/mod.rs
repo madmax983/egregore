@@ -1348,7 +1348,7 @@ impl RoleFilter {
     }
 
     /// The stable CLI spelling: `"all"`, `"production"`, or `"test"`.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Production => "production",

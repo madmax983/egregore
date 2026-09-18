@@ -1086,7 +1086,11 @@ mod tests {
         let view = benchmark_summary_of(&outcome.records[0]).expect("summary must parse");
         assert_eq!(view.benchmark_id, "unit_bench");
         assert_eq!(view.suite, "benches");
-        assert_eq!(view.mean_ns, 1250.0);
+        assert!(
+            (view.mean_ns - 1250.0).abs() < f64::EPSILON,
+            "mean_ns should be exactly 1250.0, got {}",
+            view.mean_ns
+        );
         assert_eq!(view.unit, "ns");
         assert_eq!(view.verdict, "regression");
         assert_eq!(view.delta_pct, Some(25.0));

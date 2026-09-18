@@ -543,20 +543,32 @@ mod tests {
 
     #[test]
     fn called_fn_is_not_a_candidate() {
-        // `caller`/`callee` are intentionally parallel names for the two ends
-        // of the call edge under test.
+        // `callee` has an incoming `Resolved` call, so rule (a) never fires
+        // for it; its caller `caller` is itself called by a live binary entry
+        // point, so the one-hop dead-cluster rule (issue #240 AC6) does not
+        // promote it either. (With `caller` unreferenced this shape IS the
+        // AC6 dead cluster covered by `one_hop_dead_cluster_reports_both_a_and_b`.)
         #![allow(clippy::similar_names)]
+        let entry_id = "codegraph:v6:entry";
         let caller_id = "codegraph:v6:caller";
         let callee_id = "codegraph:v6:callee";
         let records = vec![
-            sym(caller_id, "caller", "src/lib.rs", 10),
-            sym(callee_id, "callee", "src/lib.rs", 20),
+            entry_sym(
+                entry_id,
+                "entry",
+                "src/main.rs",
+                5,
+                EntryPointKind::BinaryEntry,
+            ),
+            sym(caller_id, "caller", "src/main.rs", 10),
+            sym(callee_id, "callee", "src/main.rs", 20),
+            calls(entry_id, caller_id, CallResolution::Resolved),
             calls(caller_id, callee_id, CallResolution::Resolved),
         ];
         let index = RepositoryIndex::build(&records);
         let result = dead_code_candidates(&records, &index, None, 100);
-        assert_eq!(candidate_names(&result), vec!["caller"]);
-        assert_eq!(result.counts.referenced, 1);
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.counts.referenced, 2);
     }
 
     #[test]
@@ -773,19 +785,38 @@ mod tests {
 
     #[test]
     fn ambiguous_calls_count_as_references() {
-        // `caller`/`callee` are intentionally parallel names for the two ends
-        // of the call edge under test.
+        // An `Ambiguous` call edge still counts as a reference: `callee` is
+        // called by the live `caller`, so neither is a candidate, and no
+        // `unresolved_call` diagnostic is raised for the ambiguous edge.
+        // (`caller` must be live here — with `caller` unreferenced this shape
+        // is the AC6 dead cluster, which reports both.)
         #![allow(clippy::similar_names)]
+        let entry_id = "codegraph:v6:entry";
         let caller_id = "codegraph:v6:caller";
         let callee_id = "codegraph:v6:callee";
         let records = vec![
-            sym(caller_id, "caller", "src/lib.rs", 10),
-            sym(callee_id, "callee", "src/lib.rs", 20),
+            entry_sym(
+                entry_id,
+                "entry",
+                "src/main.rs",
+                5,
+                EntryPointKind::BinaryEntry,
+            ),
+            sym(caller_id, "caller", "src/main.rs", 10),
+            sym(callee_id, "callee", "src/main.rs", 20),
+            calls(entry_id, caller_id, CallResolution::Resolved),
             calls(caller_id, callee_id, CallResolution::Ambiguous),
         ];
         let index = RepositoryIndex::build(&records);
         let result = dead_code_candidates(&records, &index, None, 100);
-        assert_eq!(candidate_names(&result), vec!["caller"]);
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.counts.referenced, 2);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|d| d.code != "unresolved_call")
+        );
     }
 
     #[test]

@@ -106,7 +106,10 @@ fn bench_runs(records: &[GraphRecord]) -> Vec<&GraphRecord> {
 
 #[test]
 fn verdict_boundaries() {
-    assert_eq!(BENCH_NOISE_THRESHOLD_PCT, 1.0);
+    assert!(
+        (BENCH_NOISE_THRESHOLD_PCT - 1.0).abs() < f64::EPSILON,
+        "noise threshold should be 1.0, got {BENCH_NOISE_THRESHOLD_PCT}"
+    );
     let (v, d) = benchmark_verdict(1250.0, Some(1000.0));
     assert_eq!(v, BenchmarkVerdict::Regression);
     assert_eq!(d, Some(25.0));
@@ -185,7 +188,11 @@ fn parse_estimates_carries_measurement_and_verdict() {
         .iter()
         .find(|b| b.id == "parse_scan")
         .expect("parse_scan should be parsed");
-    assert_eq!(parse_scan.mean_ns, 1250.0);
+    assert!(
+        (parse_scan.mean_ns - 1250.0).abs() < f64::EPSILON,
+        "mean_ns should be 1250.0, got {}",
+        parse_scan.mean_ns
+    );
     assert_eq!(parse_scan.median_ns, Some(1242.0));
     assert_eq!(parse_scan.ci_lower_ns, Some(1235.2));
     assert_eq!(parse_scan.ci_upper_ns, Some(1268.7));
@@ -401,7 +408,7 @@ fn symbol_resolution_mints_edges_or_diagnostics_never_silently() {
         .map(|(id, _)| id.clone())
         .expect("parse_scan record id");
 
-    let mentions: Vec<&GraphRecord> = outcome
+    let mentions = outcome
         .records
         .iter()
         .filter(|r| {
@@ -415,10 +422,10 @@ fn symbol_resolution_mints_edges_or_diagnostics_never_silently() {
                 } if source == &parse_scan_id && target == "codegraph:v6:sym-parse_scan"
             )
         })
-        .collect();
-    assert_eq!(mentions.len(), 1, "exactly one MENTIONS_SYMBOL edge");
+        .count();
+    assert_eq!(mentions, 1, "exactly one MENTIONS_SYMBOL edge");
 
-    let touched: Vec<&GraphRecord> = outcome
+    let touched = outcome
         .records
         .iter()
         .filter(|r| {
@@ -432,8 +439,8 @@ fn symbol_resolution_mints_edges_or_diagnostics_never_silently() {
                 } if source == &parse_scan_id && target == "codegraph:v6:file-mini"
             )
         })
-        .collect();
-    assert_eq!(touched.len(), 1, "exactly one TOUCHED_FILE edge");
+        .count();
+    assert_eq!(touched, 1, "exactly one TOUCHED_FILE edge");
 
     let diagnostics: Vec<&GraphRecord> = outcome
         .records

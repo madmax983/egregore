@@ -188,17 +188,14 @@ pub(crate) fn query_symbol_tx_as_of(
         }
         Ok(result) => {
             let deleted = current_deleted_ids(records);
-            let rows: Vec<TxSymbolRow<'_>> = result
-                .records
-                .iter()
-                .filter_map(|r| tx_symbol_row(r, index, records, &deleted))
-                .collect();
             // Role scope (issue #238) narrows the projected rows, order
             // preserved; unknown roles survive only `RoleFilter::All`. A
             // filter that empties the answer is the lane's no-match, reported
             // through the same error envelope the resolver uses (exit 1).
-            let rows: Vec<TxSymbolRow<'_>> = rows
-                .into_iter()
+            let rows: Vec<TxSymbolRow<'_>> = result
+                .records
+                .iter()
+                .filter_map(|r| tx_symbol_row(r, index, records, &deleted))
                 .filter(|row| role.matches(row.role.copied()))
                 .collect();
             if rows.is_empty() {
@@ -308,10 +305,27 @@ pub(crate) fn query_symbol_tx_via_daemon(
             std::process::exit(1);
         }
     };
-    // `query_verb_raw_with_as_of` returns only the daemon `result` object, whose
-    // record rows already carry the tx handles. Reconstruct the same CLI
-    // `--tx-as-of` envelope the non-daemon path emits (top-level `ok`, `verb`,
-    // `name`, `as_of`, `snapshot`) so JSON consumers see one shape regardless of
+    print_symbol_tx_daemon_result(&result, name, tx_as_of, as_of, format, role)
+}
+
+/// Builds the `--tx-as-of` response envelope for the daemon path and prints it.
+///
+/// Split from `query_symbol_tx_via_daemon` (`too_many_lines`): the daemon verb
+/// predates the role selector, so role scope and the envelope shape are applied
+/// client-side here, mirroring the non-daemon path.
+#[cfg(feature = "embedded-aletheiadb")]
+fn print_symbol_tx_daemon_result(
+    result: &serde_json::Value,
+    name: &str,
+    tx_as_of: &str,
+    as_of: Option<&str>,
+    format: OutputFormat,
+    role: RoleFilter,
+) -> Result<()> {
+    // The daemon verb returns only its `result` object, whose record rows
+    // already carry the tx handles. Reconstruct the same CLI `--tx-as-of`
+    // envelope the non-daemon path emits (top-level `ok`, `verb`, `name`,
+    // `as_of`, `snapshot`) so JSON consumers see one shape regardless of
     // `--daemon`.
     let empty_records = serde_json::json!([]);
     let records = result.get("records").unwrap_or(&empty_records);

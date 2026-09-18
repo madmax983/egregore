@@ -2,7 +2,10 @@
 
 **Status:** Active. This document is the single source of truth for the
 `role` field's classification rule — the deterministic `test` / `production`
-label stamped on every `Symbol` and `File` record the Rust extractor emits.
+label stamped on every `Symbol` and `File` record the Rust extractor emits,
+plus every `Module` record: a `#[cfg(test)] mod` declaration is itself the
+lexical gate, so the `Module` record carries the same role its member symbols
+get (trunk repair, 2026-09-18).
 
 ## The rule
 

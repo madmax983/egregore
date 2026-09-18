@@ -1028,7 +1028,7 @@ fn known_file_paths(
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> BTreeSet<String> {
     let mut known_paths: BTreeSet<String> = facts_by_file.keys().cloned().collect();
-    for record in records.iter() {
+    for record in records {
         if let GraphRecord::Node {
             repo_relative_path: Some(path),
             ..
@@ -6549,9 +6549,9 @@ mod tests {
         GraphRecord::node(
             format!("symbol:{path}#{name}"),
             NodeKind::Symbol,
-            Some(name.to_owned()),
-            None,
             Some(path.to_owned()),
+            None,
+            Some(name.to_owned()),
             format!("summary for {name}"),
         )
         .with_role(role)
