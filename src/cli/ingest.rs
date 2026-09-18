@@ -122,6 +122,8 @@ pub(crate) fn ingest(
     #[cfg(feature = "embeddings")] embed: bool,
     #[cfg(feature = "embeddings")] embed_model: Option<String>,
     #[cfg(feature = "embedded-aletheiadb")] force: bool,
+    // Dangling cross-domain evidence citation policy (issue #241).
+    dangling_citation_policy: DanglingCitationPolicy,
 ) -> Result<()> {
     // Resolve the data directory: explicit `--data-dir` > `egregore.toml` >
     // `.egregore` (issue #261). Discovery fails fast on a malformed config
@@ -145,7 +147,7 @@ pub(crate) fn ingest(
     let report = match adapter {
         IngestAdapter::DryRun => {
             let mut sink = DryRunSink::default();
-            ingest_records(&records, &mut sink)
+            ingest_records_with_policy(&records, &mut sink, dangling_citation_policy)
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
@@ -196,7 +198,7 @@ pub(crate) fn ingest(
             #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .map_err(|error| embedded_write_open_error(&data_dir, error))?;
-            let report = ingest_records(&records, &mut sink);
+            let report = ingest_records_with_policy(&records, &mut sink, dangling_citation_policy);
             // A capacity overflow surfaced as a per-record write failure is
             // fatal (never a generic exit-1 failure): a partial store whose
             // interner is at the cap cannot be persisted.
@@ -239,8 +241,13 @@ pub(crate) fn ingest(
                 idempotency_key.context("--idempotency-key is required for --adapter daemon")?;
             let client = DaemonClient::from_data_dir(&data_dir)
                 .with_context(|| format!("failed to load daemon for {}", data_dir.display()))?;
-            let response =
-                client.ingest_records(&records, agent_id, session_id, idempotency_key)?;
+            let response = client.ingest_records(
+                &records,
+                agent_id,
+                session_id,
+                idempotency_key,
+                dangling_citation_policy,
+            )?;
             println!("attempted: {}", response.attempted);
             println!("succeeded: {}", response.succeeded);
             println!("failed: {}", response.failed);

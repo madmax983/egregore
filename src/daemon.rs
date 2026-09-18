@@ -25,7 +25,8 @@ use serde_json::json;
 
 use crate::{
     adapters::{
-        AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
+        AdapterError, DanglingCitationPolicy, EmbeddedAletheiaSink, ExpectedRecordState,
+        IngestReport, ingest_records_with_policy,
     },
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
@@ -449,6 +450,8 @@ struct WriteCommand {
     idempotency_key: String,
     payload_hash: String,
     records: Vec<GraphRecord>,
+    /// Dangling-citation policy for this write (issue #241).
+    dangling_citation_policy: DanglingCitationPolicy,
     response_tx: mpsc::Sender<WriteResult>,
 }
 
@@ -1316,6 +1319,10 @@ struct RequestEnvelope {
 #[derive(Debug, Deserialize)]
 struct IngestPayload {
     records: Vec<GraphRecord>,
+    /// Optional dangling-citation policy (issue #241): `"quarantine"` (default)
+    /// or `"reject-batch"`. Unknown values are a 400.
+    #[serde(default)]
+    dangling_citation_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1715,6 +1722,7 @@ impl DaemonClient {
         agent_id: &str,
         session_id: &str,
         idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
     ) -> Result<DaemonIngestResponse> {
         self.health()
             .context("daemon health validation failed before ingest")?;
@@ -1725,7 +1733,10 @@ impl DaemonClient {
             "idempotency_key": idempotency_key,
             "domain": "codegraph",
             "created_at": chrono::Utc::now().to_rfc3339(),
-            "payload": { "records": records },
+            "payload": {
+                "records": records,
+                "dangling_citation_policy": dangling_citation_policy.as_str(),
+            },
         });
         let (status, body) = self.request(
             "POST",
@@ -2252,7 +2263,8 @@ fn apply_write(
         let mut sink = sink
             .write()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        let report = ingest_records(&all_records, &mut *sink);
+        let report =
+            ingest_records_with_policy(&all_records, &mut *sink, command.dangling_citation_policy);
         if report.succeeded > 0 {
             sink.persist_indexes()
                 .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -7336,8 +7348,19 @@ fn validate_and_synthesize_evidence_edges(
                 }
                 for (link_index, link) in links.iter().enumerate() {
                     let was_triple_resolved = link.target_record_id.is_none();
+                    // Issue #241: an unresolved evidence target is not a hard
+                    // 422 here; the dangling-citation policy
+                    // (quarantine/reject-batch) in ingest_records_with_policy
+                    // handles it. Other validation errors (bad domain,
+                    // non-node target, etc.) still fail fast.
                     let (target_id, routing_commit) =
-                        resolve_evidence_target(link, &sink_guard, records)?;
+                        match resolve_evidence_target(link, &sink_guard, records) {
+                            Ok(resolved) => resolved,
+                            Err(e) if e.code == ErrorCode::UnresolvedEvidenceTarget => {
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                     if link.confidence.is_empty() {
                         return Err(ApiError::missing_field("evidence_links[].confidence"));
                     }
@@ -8546,7 +8569,26 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         );
     }
     let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
-    match enqueue_write(state, scoped_key, payload.records, &request_id) {
+    let citation_policy = match payload.dangling_citation_policy.as_deref() {
+        None => DanglingCitationPolicy::default(),
+        Some("quarantine") => DanglingCitationPolicy::Quarantine,
+        Some("reject-batch") => DanglingCitationPolicy::RejectBatch,
+        Some(other) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request(format!(
+                    "dangling_citation_policy must be 'quarantine' or 'reject-batch'; got '{other}'"
+                )),
+            );
+        }
+    };
+    match enqueue_write(
+        state,
+        scoped_key,
+        payload.records,
+        &request_id,
+        citation_policy,
+    ) {
         Ok(response) => HttpResponse::success(Some(&request_id), 200, json!(response)),
         Err(error) => HttpResponse::error_with_id(&request_id, error),
     }
@@ -11361,7 +11403,13 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     };
     let records = agent_registration_records(&reg);
     let idempotency_key = stable_pair_key("agent-register", &reg.agent_id, &reg.session_id);
-    match enqueue_write(state, idempotency_key, records, &request_id) {
+    match enqueue_write(
+        state,
+        idempotency_key,
+        records,
+        &request_id,
+        DanglingCitationPolicy::default(),
+    ) {
         Ok(response) => HttpResponse::success(
             Some(&request_id),
             200,
@@ -11576,6 +11624,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                         scoped_key_thread,
                         records_clone,
                         &request_id_thread,
+                        DanglingCitationPolicy::default(),
                     );
                     match response {
                         Ok(report) => update_job(
@@ -11647,7 +11696,13 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
     let request_id_for_thread = request_id.clone();
     thread::spawn(move || {
         update_job(&state, &job_id_for_thread, "running", "started", None);
-        let response = enqueue_write(&state, scoped_key, payload.records, &request_id_for_thread);
+        let response = enqueue_write(
+            &state,
+            scoped_key,
+            payload.records,
+            &request_id_for_thread,
+            DanglingCitationPolicy::default(),
+        );
         match response {
             Ok(report) => update_job(
                 &state,
@@ -11715,6 +11770,7 @@ fn enqueue_write(
     idempotency_key: String,
     records: Vec<GraphRecord>,
     request_id: &str,
+    dangling_citation_policy: DanglingCitationPolicy,
 ) -> WriteResult {
     let payload_hash =
         records_hash(&records).map_err(|error| ApiError::internal(error.to_string()))?;
@@ -11723,6 +11779,7 @@ fn enqueue_write(
         idempotency_key,
         payload_hash,
         records,
+        dangling_citation_policy,
         response_tx,
     };
     // Count the in-flight write before the worker can observe it, so the
@@ -12769,6 +12826,7 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::ingest_records;
 
     /// Builds a same-id (`n:task`) Task record batch from a forward sequence of
     /// per-record importer attributions: `Some(kind)` mints a Task carrying that
@@ -13353,6 +13411,7 @@ mod tests {
             idempotency_key: "committed-key".to_owned(),
             payload_hash,
             records: vec![record],
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         };
 
@@ -13922,6 +13981,7 @@ mod tests {
                 idempotency_key: idempotency_key.to_owned(),
                 payload_hash: records_hash(std::slice::from_ref(&record))?,
                 records: vec![record.clone()],
+                dangling_citation_policy: DanglingCitationPolicy::default(),
                 response_tx,
             };
             let response = apply_write(&command, &sink, &idempotency)
@@ -13988,6 +14048,7 @@ mod tests {
                 idempotency_key: idempotency_key.to_owned(),
                 payload_hash: records_hash(&records)?,
                 records: records.clone(),
+                dangling_citation_policy: DanglingCitationPolicy::default(),
                 response_tx,
             };
             let response = apply_write(&command, &sink, &idempotency)
@@ -14046,6 +14107,7 @@ mod tests {
             idempotency_key: "queue-filler".to_owned(),
             payload_hash: "queue-filler-hash".to_owned(),
             records: Vec::new(),
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         }
     }
@@ -14209,6 +14271,7 @@ mod tests {
             "pressure-overflow-key".to_owned(),
             vec![record],
             "req-overload",
+            DanglingCitationPolicy::default(),
         )
         .expect_err("overloaded write must be rejected");
         assert_eq!(rejection.code, ErrorCode::QueueFull);
@@ -14372,8 +14435,14 @@ mod tests {
                 .try_send(dummy_write_command())
                 .map_err(|_| anyhow!("queue filler should buffer"))?;
         }
-        let rejection = enqueue_write(&state, "overflow-key".to_owned(), Vec::new(), "req-oflow")
-            .expect_err("overloaded write must be rejected");
+        let rejection = enqueue_write(
+            &state,
+            "overflow-key".to_owned(),
+            Vec::new(),
+            "req-oflow",
+            DanglingCitationPolicy::default(),
+        )
+        .expect_err("overloaded write must be rejected");
         assert_eq!(rejection.code, ErrorCode::QueueFull);
 
         // (timeout) Real rendered envelope from the timeout constructor.
@@ -14521,8 +14590,14 @@ mod tests {
                 .try_send(dummy_write_command())
                 .map_err(|_| anyhow!("queue filler should buffer"))?;
         }
-        enqueue_write(&state, "compose-key".to_owned(), Vec::new(), "req-compose")
-            .expect_err("overloaded write must be rejected");
+        enqueue_write(
+            &state,
+            "compose-key".to_owned(),
+            Vec::new(),
+            "req-compose",
+            DanglingCitationPolicy::default(),
+        )
+        .expect_err("overloaded write must be rejected");
 
         let body = handle_status(&state).body;
         assert_eq!(body["pressure"]["state"], "saturated");
@@ -14637,6 +14712,7 @@ mod tests {
             idempotency_key: key.to_owned(),
             payload_hash,
             records: records.to_vec(),
+            dangling_citation_policy: DanglingCitationPolicy::default(),
             response_tx,
         })
     }

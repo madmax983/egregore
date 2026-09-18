@@ -97,7 +97,11 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
 /// forces a conscious classification decision at compile time — the completeness
 /// invariant. The partition mirrors `query::evidence_path::is_evidence_path_edge`
 /// (issue #247): TRAVERSED there == CHECKED here.
-const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool {
+///
+/// `pub(crate)`: the ingest-time dangling-citation gate (issue #241,
+/// `crate::adapters`) reuses this exact partition so ingest and the #217 audit
+/// can never disagree on which edges are evidence citations.
+pub(crate) const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
         Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
@@ -172,7 +176,11 @@ fn edge_classes() -> (Vec<String>, Vec<String>) {
 
 /// Resolves a wire relation string (`"OBSERVES"`) to its [`EdgeLabel`], or `None`
 /// when it names no known variant (unknown vocabulary is out of the closed set).
-fn edge_label_from_wire(wire: &str) -> Option<EdgeLabel> {
+///
+/// `pub(crate)`: the ingest-time dangling-citation gate (issue #241,
+/// `crate::adapters`) reuses this so ingest and the #217 audit agree on the
+/// checked vocabulary.
+pub(crate) fn edge_label_from_wire(wire: &str) -> Option<EdgeLabel> {
     ALL_EDGE_LABELS
         .iter()
         .copied()

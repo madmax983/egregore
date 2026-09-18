@@ -155,5 +155,3 @@ mod validate;
 mod watch;
 // Appended (issue #246); kept at the end to minimize cross-lane merge conflicts.
 mod query_diagnostics;
-// Appended (issue #240); kept at the end to minimize cross-lane merge conflicts.
-mod query_dead_code;

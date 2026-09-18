@@ -21,10 +21,10 @@ use aletheia_egregore::{
     },
     import_traj,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
-        PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, agent_memory_stable_id,
-        stable_id, user_context_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
+        NodeKind, PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION,
+        SEMANTIC_SCHEMA_VERSION, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
+        agent_memory_stable_id, stable_id, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -2080,6 +2080,214 @@ fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
     assert!(
         read_response.contains("\"record\":null"),
         "record should not commit when receipt reservation fails, got {read_response}"
+    );
+
+    daemon.stop();
+}
+
+/// Builds an observation node carrying one inline `OBSERVES` evidence link
+/// (issue #241).
+fn dangling_citation_observation(id: &str, target: &str, body: &str) -> GraphRecord {
+    let link = EvidenceLink {
+        target_record_id: Some(target.to_owned()),
+        target_domain: "codegraph".to_owned(),
+        relation: "OBSERVES".to_owned(),
+        confidence: "0.9".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    let mut record = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        evidence_links,
+        text,
+        schema_version,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        ingested_at,
+        confidence,
+        ..
+    } = &mut record
+    {
+        *evidence_links = Some(vec![link]);
+        *text = Some(body.to_owned());
+        // Agent-memory observations validate against
+        // AGENT_MEMORY_SCHEMA_VERSION, not the codegraph SCHEMA_VERSION
+        // that GraphRecord::node stamps.
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // The daemon requires these fields on agent-memory Observation nodes.
+        *agent_id = Some("test-agent".to_owned());
+        *agent_kind = Some("codex".to_owned());
+        *session_id = Some("test-session".to_owned());
+        *observed_at = Some("2026-09-17T00:00:00Z".to_owned());
+        *ingested_at = Some("2026-09-17T00:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+    record
+}
+
+#[test]
+fn daemon_ingest_applies_dangling_citation_policy() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let observation = dangling_citation_observation(
+        "agent_memory:v1:daemon-obs1",
+        "codegraph:v1:ghost",
+        "SENTINEL_SECRET_BODY",
+    );
+    let mut agent = GraphRecord::node(
+        "agent_memory:v1:daemon-agent1".to_owned(),
+        NodeKind::Agent,
+        None,
+        None,
+        None,
+        "agent".to_owned(),
+    );
+    // Agent-memory nodes validate against AGENT_MEMORY_SCHEMA_VERSION, not
+    // the codegraph SCHEMA_VERSION that GraphRecord::node stamps. The daemon
+    // also requires agent_id/agent_kind/name on agent-memory Agent nodes.
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        agent_kind,
+        name,
+        ..
+    } = &mut agent
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("test-agent".to_owned());
+        *agent_kind = Some("codex".to_owned());
+        *name = Some("test-agent".to_owned());
+    }
+
+    // Default policy (no field): quarantine — the citing record is skipped
+    // with a machine-readable diagnostic, the rest of the batch ingests.
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-quarantine",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-quarantine",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": { "records": [observation.clone(), agent.clone()] }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "quarantine ingest should succeed, got {response}"
+    );
+    let result = &response_json(&response)["result"];
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["succeeded"], 1);
+    assert_eq!(result["failed"], 1);
+    let failure = &result["failures"][0];
+    assert_eq!(failure["record_id"], "agent_memory:v1:daemon-obs1");
+    let message = failure["message"]
+        .as_str()
+        .expect("failure message should be text");
+    assert!(
+        !message.contains("SENTINEL_SECRET_BODY"),
+        "diagnostic must never echo payload text"
+    );
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
+    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
+    assert_eq!(
+        diagnostic["citing_record_id"],
+        "agent_memory:v1:daemon-obs1"
+    );
+    assert_eq!(diagnostic["target_record_id"], "codegraph:v1:ghost");
+    assert_eq!(diagnostic["relation"], "OBSERVES");
+    assert_eq!(diagnostic["target_domain"], "codegraph");
+
+    // The citing record never entered the store; the valid one did.
+    let missing = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/agent_memory:v1:daemon-obs1 HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        missing.contains("\"record\":null"),
+        "quarantined record must be absent, got {missing}"
+    );
+    let present = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/agent_memory:v1:daemon-agent1 HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        !present.contains("\"record\":null"),
+        "valid record must persist, got {present}"
+    );
+
+    // Explicit reject-batch: nothing is written.
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-reject",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": {
+                "records": [observation, agent],
+                "dangling_citation_policy": "reject-batch",
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "reject-batch ingest should succeed, got {response}"
+    );
+    let result = &response_json(&response)["result"];
+    assert_eq!(result["succeeded"], 0);
+    assert_eq!(result["failed"], 2);
+
+    // Unknown policy value is a 400.
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-bogus",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-bogus",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": {
+                "records": [],
+                "dangling_citation_policy": "bogus",
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unknown policy should be a 400, got {response}"
     );
 
     daemon.stop();

@@ -114,6 +114,40 @@ case, and `--force` is the escape hatch for a false refusal.
 - Query the JSONL directly with the `--graph` query path, which needs no
   embedded store at all.
 
+## Dangling cross-domain evidence citations (issue #241)
+
+At ingest — dry-run, embedded, and daemon adapters — every cross-domain
+evidence citation (`OBSERVES`, `VALIDATED_BY`, and the other
+agent/verification→target edges in the closed evidence vocabulary shared with
+the `evidence-link-audit`) is resolved against the union of the destination
+store and the batch itself, order-independently: a forward reference to a
+target defined later in the same batch resolves. A citation whose target
+resolves to nothing (never existed, or only a tombstone — tombstones are
+non-resolving, so ingest and the audit agree on what "dangling" means) never
+enters the store as a live, backed claim.
+
+`--dangling-citation-policy` selects what happens to the citing record:
+
+- `quarantine` (default): the citing record is skipped with a machine-readable
+  diagnostic and the rest of the batch ingests. Quarantine cascades: a record
+  citing a quarantined record is itself quarantined, so no dangling edge can
+  enter through a chain of in-batch citations. The default never corrupts an
+  otherwise-valid batch.
+- `reject-batch`: the whole batch fails and nothing is written.
+
+The diagnostic is JSON under the stable code `dangling_evidence_citation` and
+names exactly the `(citing_record_id, target_record_id, relation,
+target_domain)` tuple — it never echoes observation text or payload values:
+
+```json
+{"code":"dangling_evidence_citation","citing_record_id":"agent_memory:v1:obs1","target_record_id":"codegraph:v1:ghost","relation":"OBSERVES","target_domain":"codegraph"}
+```
+
+For `--adapter daemon` the flag is forwarded to the daemon in the ingest
+request (`dangling_citation_policy` payload field; unknown values are a 400).
+The offline `eg write` step is unchanged: it cannot see the store, so
+enforcement lives at the ingest boundary, which can see both batch and store.
+
 ## Exit codes
 
 | Code | Meaning |

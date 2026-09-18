@@ -19,9 +19,9 @@ use crate::{
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EntryPointMark, EvidenceLink,
-        GraphRecord, IdentitySource, MetricKind, NodeKind, Producer, RouteAnnotation,
-        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
+        CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord,
+        IdentitySource, MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis,
+        SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
@@ -2674,7 +2674,6 @@ impl EmbeddedAletheiaSink {
             content_signature,
             route,
             deprecated,
-            entry_point,
             crate_attribution,
             temporal,
             semantic_drift,
@@ -2813,13 +2812,6 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(mark)
         {
             builder = builder.insert("deprecated_json", json.as_str());
-        }
-        // Entry-point facts (issue #240). Paired with the read at
-        // `read_node_record_internal`; the two MUST stay symmetric.
-        if let Some(mark) = entry_point
-            && let Ok(json) = serde_json::to_string(mark)
-        {
-            builder = builder.insert("entry_point_json", json.as_str());
         }
         // Owning-package attribution (issue #117). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3608,19 +3600,6 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<DeprecationMark>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("deprecated_json invalid: {e}")))?,
-            // Entry-point facts (issue #240). The read MUST mirror the
-            // write: `compare_node_record` is full structural equality of the
-            // reconstructed record, so a written-but-unread property would make
-            // every re-ingest write a new physical version forever.
-            entry_point: optional_str_property(
-                record_id,
-                "entry_point_json",
-                node.get_property("entry_point_json"),
-            )?
-            .as_deref()
-            .map(serde_json::from_str::<EntryPointMark>)
-            .transpose()
-            .map_err(|e| read_back_error(record_id, format!("entry_point_json invalid: {e}")))?,
             // Owning-package attribution (issue #117). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make
