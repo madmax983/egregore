@@ -226,8 +226,10 @@ fn diagnostics_returns_every_persisted_gap_and_nothing_else() {
         }
         // The span must land on the flagged source region.
         let source = fs::read(repo.join(path)).expect("flagged file should read");
-        let start = span["start_byte"].as_u64().expect("start_byte") as usize;
-        let end = span["end_byte"].as_u64().expect("end_byte") as usize;
+        let start = usize::try_from(span["start_byte"].as_u64().expect("start_byte"))
+            .expect("start_byte fits in usize");
+        let end = usize::try_from(span["end_byte"].as_u64().expect("end_byte"))
+            .expect("end_byte fits in usize");
         assert!(
             start < end && end <= source.len(),
             "span should slice the file"

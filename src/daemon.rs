@@ -8480,6 +8480,48 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
     )
 }
 
+/// Parses the optional `dangling_citation_policy` ingest payload field
+/// (issue #241): `"quarantine"` (default) or `"reject-batch"`.
+/// Unknown values are a 400.
+fn parse_dangling_citation_policy(
+    raw: Option<&str>,
+    request_id: &str,
+) -> Result<DanglingCitationPolicy, HttpResponse> {
+    match raw {
+        None => Ok(DanglingCitationPolicy::default()),
+        Some("quarantine") => Ok(DanglingCitationPolicy::Quarantine),
+        Some("reject-batch") => Ok(DanglingCitationPolicy::RejectBatch),
+        Some(other) => Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request(format!(
+                "dangling_citation_policy must be 'quarantine' or 'reject-batch'; got '{other}'"
+            )),
+        )),
+    }
+}
+
+/// Rejects the batch when any record ID is inconsistent with the ingest
+/// domain.
+fn ensure_record_ids_match_domain(
+    records: &[GraphRecord],
+    domain: &str,
+    request_id: &str,
+) -> Result<(), HttpResponse> {
+    if let Some(bad) = records
+        .iter()
+        .find(|r| !record_id_matches_domain(r.id(), domain))
+    {
+        return Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request(format!(
+                "record '{}' has ID inconsistent with domain '{domain}'",
+                bad.id()
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let envelope = match parse_json::<RequestEnvelope>(&request.body) {
         Ok(envelope) => envelope,
@@ -8555,32 +8597,16 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    if let Some(bad) = payload
-        .records
-        .iter()
-        .find(|r| !record_id_matches_domain(r.id(), &domain))
-    {
-        return HttpResponse::error_with_id(
-            &request_id,
-            ApiError::bad_request(format!(
-                "record '{}' has ID inconsistent with domain '{domain}'",
-                bad.id()
-            )),
-        );
+    if let Err(response) = ensure_record_ids_match_domain(&payload.records, &domain, &request_id) {
+        return response;
     }
     let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
-    let citation_policy = match payload.dangling_citation_policy.as_deref() {
-        None => DanglingCitationPolicy::default(),
-        Some("quarantine") => DanglingCitationPolicy::Quarantine,
-        Some("reject-batch") => DanglingCitationPolicy::RejectBatch,
-        Some(other) => {
-            return HttpResponse::error_with_id(
-                &request_id,
-                ApiError::bad_request(format!(
-                    "dangling_citation_policy must be 'quarantine' or 'reject-batch'; got '{other}'"
-                )),
-            );
-        }
+    let citation_policy = match parse_dangling_citation_policy(
+        payload.dangling_citation_policy.as_deref(),
+        &request_id,
+    ) {
+        Ok(policy) => policy,
+        Err(response) => return response,
     };
     match enqueue_write(
         state,
@@ -11314,6 +11340,35 @@ fn query_sink_read(
     }
 }
 
+/// Records the agent's heartbeat in the session table.
+fn insert_agent_status(
+    state: &ServerState,
+    request_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    agent_kind: &str,
+    project_scope: &str,
+) -> Result<(), HttpResponse> {
+    let agent_status = AgentStatus {
+        agent_id: agent_id.to_owned(),
+        session_id: session_id.to_owned(),
+        agent_kind: agent_kind.to_owned(),
+        project_scope: project_scope.to_owned(),
+        last_seen_unix_ms: unix_ms(),
+    };
+    let Ok(mut agents) = state.agents.lock() else {
+        return Err(HttpResponse::error_with_id(
+            request_id,
+            ApiError::internal("agents lock poisoned"),
+        ));
+    };
+    agents.insert(
+        AgentSessionKey::new(agent_id.to_owned(), session_id.to_owned()),
+        agent_status,
+    );
+    Ok(())
+}
+
 fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let registration = match parse_json::<AgentRegisterRequest>(&request.body) {
         Ok(registration) => registration,
@@ -11375,23 +11430,15 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         }
     };
 
-    let agent_status = AgentStatus {
-        agent_id: agent_id.clone(),
-        session_id: session_id.clone(),
-        agent_kind: agent_kind.clone(),
-        project_scope: project_scope.clone(),
-        last_seen_unix_ms: unix_ms(),
-    };
-    if let Ok(mut agents) = state.agents.lock() {
-        agents.insert(
-            AgentSessionKey::new(agent_id.clone(), session_id.clone()),
-            agent_status,
-        );
-    } else {
-        return HttpResponse::error_with_id(
-            &request_id,
-            ApiError::internal("agents lock poisoned"),
-        );
+    if let Err(response) = insert_agent_status(
+        state,
+        &request_id,
+        &agent_id,
+        &session_id,
+        &agent_kind,
+        &project_scope,
+    ) {
+        return response;
     }
 
     let reg = AgentRegisterFull {

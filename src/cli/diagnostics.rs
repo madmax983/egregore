@@ -111,6 +111,54 @@ fn diagnostic_gap_row<'a>(
     })
 }
 
+/// Validates the `--file` scope for `query diagnostics`: a path with no live
+/// `File` node in the selected store slice is a scope error (exit 2,
+/// machine-readable) — a typo is never a silent "clean". Mirrors `query
+/// file`'s existence check, including the repository-scope gate so a
+/// colliding path in another repository does not read as present.
+fn check_file_scope(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    file: Option<&str>,
+    deleted: &std::collections::BTreeSet<&str>,
+) -> Result<()> {
+    let Some(path) = file else {
+        return Ok(());
+    };
+    let file_exists = records.iter().any(|record| {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::File,
+            repo_relative_path,
+            temporal,
+            ..
+        } = record
+        else {
+            return false;
+        };
+        repo_relative_path.as_deref() == Some(path)
+            && (temporal.is_some() || !deleted.contains(id.as_str()))
+            && repo_scope.is_none_or(|repo| index.owner_of(id) == Some(repo))
+    });
+    if !file_exists {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "unknown_file",
+                "file": path,
+                "message": format!("no file `{path}` in the selected store slice"),
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&envelope).context("failed to serialize scope error")?
+        );
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn query_diagnostics_cmd(
     records: &[GraphRecord],
@@ -133,38 +181,7 @@ pub(crate) fn query_diagnostics_cmd(
     // silent "clean". Mirrors `query file`'s existence check, including the
     // repository-scope gate so a colliding path in another repository does not
     // read as present.
-    if let Some(path) = file {
-        let file_exists = records.iter().any(|record| {
-            let GraphRecord::Node {
-                id,
-                kind: NodeKind::File,
-                repo_relative_path,
-                temporal,
-                ..
-            } = record
-            else {
-                return false;
-            };
-            repo_relative_path.as_deref() == Some(path)
-                && (temporal.is_some() || !deleted.contains(id.as_str()))
-                && repo_scope.is_none_or(|repo| index.owner_of(id) == Some(repo))
-        });
-        if !file_exists {
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "code": "unknown_file",
-                    "file": path,
-                    "message": format!("no file `{path}` in the selected store slice"),
-                },
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&envelope).context("failed to serialize scope error")?
-            );
-            std::process::exit(2);
-        }
-    }
+    check_file_scope(records, index, repo_scope, file, &deleted)?;
 
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store so a gap resolved before HEAD does not reappear;

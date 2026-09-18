@@ -47,12 +47,12 @@ fn with_domain(mut record: GraphRecord, domain: &str) -> GraphRecord {
     record
 }
 
-fn inline_handle(inline: &str) -> Box<OutputHandle> {
-    Box::new(OutputHandle {
+fn inline_handle(inline: &str) -> OutputHandle {
+    OutputHandle {
         inline: Some(inline.to_owned()),
         hash: "00".to_owned(),
         bytes: inline.len() as u64,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,9 +92,9 @@ fn planted_records() -> Vec<GraphRecord> {
         arguments_handle, ..
     } = &mut r
     {
-        *arguments_handle = Some(inline_handle(
+        *arguments_handle = Some(Box::new(inline_handle(
             "callback=whsec_FAKEAUDIT0123456789abcdefXYZ123",
-        ));
+        )));
     }
     records.push(with_domain(r, "artifact"));
 
@@ -108,9 +108,9 @@ fn planted_records() -> Vec<GraphRecord> {
         "fixture command run".to_owned(),
     );
     if let GraphRecord::Node { stdout_handle, .. } = &mut r {
-        *stdout_handle = Some(inline_handle(
+        *stdout_handle = Some(Box::new(inline_handle(
             "connecting to postgres://audit:FAKEAUDITPASS0123456789@db.internal:5432/app",
-        ));
+        )));
     }
     records.push(with_domain(r, "verification"));
 
@@ -168,6 +168,16 @@ fn planted_records() -> Vec<GraphRecord> {
     }
     records.push(with_domain(r, "log"));
 
+    records.extend(planted_records_tail());
+    records
+}
+
+/// Plants the last two fixture records for the redaction-audit test:
+/// a codegraph `Symbol` (exempt from the write gate) and a high-entropy
+/// `LogEvent` with no known secret pattern.
+fn planted_records_tail() -> Vec<GraphRecord> {
+    let mut records = Vec::new();
+
     // 7. codegraph — Symbol summary (body) — ssh_private_key.
     //    Code-graph records are exempt from the write gate: the prime
     //    unredacted-at-rest risk this lane exists to catch.
@@ -207,8 +217,8 @@ fn planted_records() -> Vec<GraphRecord> {
     records
 }
 
-/// The expected (record_id, field_path, classification) triples, in the
-/// canonical output order (record_id, field_path, classification).
+/// The expected `(record_id, field_path, classification)` triples, in the
+/// canonical output order `(record_id, field_path, classification)`.
 const EXPECTED: &[(&str, &str, &str)] = &[
     ("audit:agent-memory:1", "text", "api_token"),
     (

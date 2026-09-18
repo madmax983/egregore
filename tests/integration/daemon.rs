@@ -2136,6 +2136,70 @@ fn dangling_citation_observation(id: &str, target: &str, body: &str) -> GraphRec
     record
 }
 
+/// Asserts the quarantine diagnostic shape for a dangling citation (issue #241).
+fn assert_dangling_diagnostic(
+    result: &serde_json::Value,
+    citing_record_id: &str,
+    target_record_id: &str,
+) {
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["succeeded"], 1);
+    assert_eq!(result["failed"], 1);
+    let failure = &result["failures"][0];
+    assert_eq!(failure["record_id"], citing_record_id);
+    let message = failure["message"]
+        .as_str()
+        .expect("failure message should be text");
+    assert!(
+        !message.contains("SENTINEL_SECRET_BODY"),
+        "diagnostic must never echo payload text"
+    );
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
+    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
+    assert_eq!(diagnostic["citing_record_id"], citing_record_id);
+    assert_eq!(diagnostic["target_record_id"], target_record_id);
+    assert_eq!(diagnostic["relation"], "OBSERVES");
+    assert_eq!(diagnostic["target_domain"], "codegraph");
+}
+
+/// Fetches a record by ID through the daemon's record GET endpoint.
+fn fetch_record(metadata: &DaemonMetadata, record_id: &str) -> String {
+    http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/{record_id} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    )
+}
+
+/// Asserts an unknown dangling-citation policy value is rejected with a 400.
+fn assert_unknown_policy_is_rejected(metadata: &DaemonMetadata) {
+    // Unknown policy value is a 400.
+    let response = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "dangling-bogus",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "dangling-bogus",
+            "domain": "agent_memory",
+            "created_at": "2026-09-17T00:00:00Z",
+            "payload": {
+                "records": [],
+                "dangling_citation_policy": "bogus",
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unknown policy should be a 400, got {response}"
+    );
+}
+
 #[test]
 fn daemon_ingest_applies_dangling_citation_policy() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -2186,7 +2250,7 @@ fn daemon_ingest_applies_dangling_citation_policy() {
             "idempotency_key": "dangling-quarantine",
             "domain": "agent_memory",
             "created_at": "2026-09-17T00:00:00Z",
-            "payload": { "records": [observation.clone(), agent.clone()] }
+            "payload": { "records": [observation, agent] }
         }),
     );
     assert!(
@@ -2194,48 +2258,15 @@ fn daemon_ingest_applies_dangling_citation_policy() {
         "quarantine ingest should succeed, got {response}"
     );
     let result = &response_json(&response)["result"];
-    assert_eq!(result["attempted"], 2);
-    assert_eq!(result["succeeded"], 1);
-    assert_eq!(result["failed"], 1);
-    let failure = &result["failures"][0];
-    assert_eq!(failure["record_id"], "agent_memory:v1:daemon-obs1");
-    let message = failure["message"]
-        .as_str()
-        .expect("failure message should be text");
-    assert!(
-        !message.contains("SENTINEL_SECRET_BODY"),
-        "diagnostic must never echo payload text"
-    );
-    let diagnostic: serde_json::Value =
-        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
-    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
-    assert_eq!(
-        diagnostic["citing_record_id"],
-        "agent_memory:v1:daemon-obs1"
-    );
-    assert_eq!(diagnostic["target_record_id"], "codegraph:v1:ghost");
-    assert_eq!(diagnostic["relation"], "OBSERVES");
-    assert_eq!(diagnostic["target_domain"], "codegraph");
+    assert_dangling_diagnostic(result, "agent_memory:v1:daemon-obs1", "codegraph:v1:ghost");
 
     // The citing record never entered the store; the valid one did.
-    let missing = http_request(
-        &metadata.address,
-        &format!(
-            "GET /v1/records/agent_memory:v1:daemon-obs1 HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-            metadata.token
-        ),
-    );
+    let missing = fetch_record(&metadata, "agent_memory:v1:daemon-obs1");
     assert!(
         missing.contains("\"record\":null"),
         "quarantined record must be absent, got {missing}"
     );
-    let present = http_request(
-        &metadata.address,
-        &format!(
-            "GET /v1/records/agent_memory:v1:daemon-agent1 HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-            metadata.token
-        ),
-    );
+    let present = fetch_record(&metadata, "agent_memory:v1:daemon-agent1");
     assert!(
         !present.contains("\"record\":null"),
         "valid record must persist, got {present}"
@@ -2267,28 +2298,7 @@ fn daemon_ingest_applies_dangling_citation_policy() {
     assert_eq!(result["succeeded"], 0);
     assert_eq!(result["failed"], 2);
 
-    // Unknown policy value is a 400.
-    let response = http_json(
-        &metadata,
-        "POST",
-        "/v1/records/ingest",
-        &serde_json::json!({
-            "request_id": "dangling-bogus",
-            "agent_id": "test-agent",
-            "session_id": "test-session",
-            "idempotency_key": "dangling-bogus",
-            "domain": "agent_memory",
-            "created_at": "2026-09-17T00:00:00Z",
-            "payload": {
-                "records": [],
-                "dangling_citation_policy": "bogus",
-            }
-        }),
-    );
-    assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "unknown policy should be a 400, got {response}"
-    );
+    assert_unknown_policy_is_rejected(&metadata);
 
     daemon.stop();
 }
@@ -8343,10 +8353,14 @@ fn agent_registration_produces_agent_memory_ids() {
 }
 
 // (d) An evidence link whose target_record_id does not exist in the store
-// is rejected with the documented unresolved_evidence_target error code.
+// is quarantined under the default dangling-citation policy (issue #241):
+// the batch returns 200, the citing record is skipped with a
+// machine-readable `dangling_evidence_citation` diagnostic, and it never
+// enters the store. (Before #241 this was a hard non-200
+// `unresolved_evidence_target` rejection; the policy now owns the decision.)
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn evidence_link_with_missing_target_is_rejected() {
+fn evidence_link_with_missing_target_is_quarantined() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let mut daemon = start_daemon(&data_dir);
@@ -8389,14 +8403,41 @@ fn evidence_link_with_missing_target_is_rejected() {
     );
 
     assert!(
-        !response.starts_with("HTTP/1.1 200"),
-        "ingest with unresolved evidence link target should be rejected, got {response}"
+        response.starts_with("HTTP/1.1 200"),
+        "quarantine ingest should succeed with the record skipped, got {response}"
     );
 
     let body = response_json(&response);
+    let result = &body["result"];
+    assert_eq!(result["attempted"], 1);
+    assert_eq!(result["succeeded"], 0);
+    assert_eq!(result["failed"], 1);
+    let message = result["failures"][0]["message"]
+        .as_str()
+        .expect("failure message should be text");
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(message).expect("diagnostic should be machine-readable JSON");
+    assert_eq!(diagnostic["code"], "dangling_evidence_citation");
     assert_eq!(
-        body["error"]["code"], "unresolved_evidence_target",
-        "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+        diagnostic["citing_record_id"],
+        "agent_memory:v1:evidence-link-test-obs"
+    );
+    assert_eq!(
+        diagnostic["target_record_id"],
+        "codegraph:v3:nonexistent-symbol-xyzzy"
+    );
+
+    // The quarantined record never entered the store.
+    let missing = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/agent_memory:v1:evidence-link-test-obs HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        missing.contains("\"record\":null"),
+        "quarantined record must be absent, got {missing}"
     );
 
     daemon.stop();

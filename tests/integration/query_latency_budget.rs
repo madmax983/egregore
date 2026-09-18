@@ -14,7 +14,7 @@ fn manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/query_latency_corpus.json")
 }
 
-/// Runs the latency benchmark gate and returns (exit_code, parsed report).
+/// Runs the latency benchmark gate and returns `(exit_code, parsed report)`.
 ///
 /// `extra_args` selects the measurement profile: the full two-source gate is
 /// expensive (an embedded ingest plus 22 cold processes), so only the
@@ -76,12 +76,17 @@ fn gate_passes_on_reference_corpus() {
     // The embedded source is measured when the feature is enabled and
     // explicitly skipped (never silently dropped) when it is not.
     let data_dir = source(&report, "data_dir");
-    if data_dir["skipped"].as_bool().unwrap_or(false) {
-        assert!(
-            cfg!(not(feature = "embedded-aletheiadb")),
-            "data_dir skipped with the embedded feature enabled"
-        );
-    } else {
+    #[cfg(feature = "embedded-aletheiadb")]
+    assert!(
+        !data_dir["skipped"].as_bool().unwrap_or(false),
+        "data_dir skipped with the embedded feature enabled"
+    );
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    assert!(
+        data_dir["skipped"].as_bool().unwrap_or(false),
+        "data_dir measured without the embedded feature"
+    );
+    if !data_dir["skipped"].as_bool().unwrap_or(false) {
         assert_eq!(data_dir["pass"], true);
         let p50 = data_dir["p50_ms"].as_f64().expect("data_dir p50");
         assert!(

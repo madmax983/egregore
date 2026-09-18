@@ -1284,6 +1284,71 @@ fn sample_query_latency(
     samples_ms
 }
 
+/// Measures the `--data-dir` (embedded store) source for `audit query-latency`
+/// (issue #255) and inserts the result into `sources`. When the
+/// `embedded-aletheiadb` feature is disabled, inserts an explicit skip record
+/// instead of silently dropping the source.
+fn measure_data_dir_latency(
+    exe: &Path,
+    graph_path: &Path,
+    work: &tempfile::TempDir,
+    corpus: &crate::query_latency::QueryLatencyCorpus,
+    sources: &mut std::collections::BTreeMap<String, crate::query_latency::SourceLatency>,
+) {
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    use crate::query_latency::skipped_source;
+    use crate::query_latency::summarize;
+
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        let data_dir = work.path().join("data-dir");
+        let data_dir_str = data_dir.display().to_string();
+        let ingest_status = std::process::Command::new(exe)
+            .args(["ingest"])
+            .arg(graph_path)
+            .args(["--adapter", "embedded", "--data-dir"])
+            .arg(&data_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()
+            .unwrap_or_else(|error| {
+                query_latency_exit("ingest_spawn_error", &data_dir_str, &error.to_string())
+            });
+        if !ingest_status.success() {
+            query_latency_exit(
+                "ingest_error",
+                &data_dir_str,
+                &format!("`eg ingest` exited with {ingest_status}"),
+            );
+        }
+        let data_dir_args = vec![
+            "query".to_owned(),
+            "symbol".to_owned(),
+            corpus.query_symbol.clone(),
+            "--data-dir".to_owned(),
+            data_dir_str,
+            "--format".to_owned(),
+            "text".to_owned(),
+        ];
+        let data_dir_samples =
+            sample_query_latency(exe, &data_dir_args, corpus.samples, "data_dir");
+        let data_dir_latency = summarize("data_dir", data_dir_samples, corpus.budget_p50_ms)
+            .unwrap_or_else(|| query_latency_exit("no_samples", "data_dir", "no samples measured"));
+        sources.insert("data_dir".to_owned(), data_dir_latency);
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        sources.insert(
+            "data_dir".to_owned(),
+            skipped_source(
+                "data_dir",
+                corpus.budget_p50_ms,
+                "embedded-aletheiadb feature not enabled",
+            ),
+        );
+    }
+}
+
 /// Handles `eg audit query-latency` (issue #255).
 pub(crate) fn audit_query_latency_cmd(
     corpus_path: &Path,
@@ -1292,8 +1357,6 @@ pub(crate) fn audit_query_latency_cmd(
     source: LatencySource,
     format: OutputFormat,
 ) -> Result<()> {
-    #[cfg(not(feature = "embedded-aletheiadb"))]
-    use crate::query_latency::skipped_source;
     use crate::query_latency::{LatencyReport, SourceLatency, machine_info, summarize};
 
     let corpus = load_query_latency_corpus(corpus_path, samples_override, budget_override);
@@ -1305,7 +1368,7 @@ pub(crate) fn audit_query_latency_cmd(
     let manifest_dir = corpus_path.parent().unwrap_or_else(|| Path::new("."));
     let source_dir = manifest_dir.join(&corpus.source_dir);
 
-    let (_work, graph_path, record_count) = build_query_latency_corpus(&corpus, &source_dir);
+    let (work, graph_path, record_count) = build_query_latency_corpus(&corpus, &source_dir);
     let graph_path_str = graph_path.display().to_string();
 
     let exe = std::env::current_exe()
@@ -1336,56 +1399,7 @@ pub(crate) fn audit_query_latency_cmd(
     // embedded feature is enabled; explicitly skipped (never silently
     // dropped) when selected without the feature.
     if measure_data_dir {
-        #[cfg(feature = "embedded-aletheiadb")]
-        {
-            let data_dir = _work.path().join("data-dir");
-            let data_dir_str = data_dir.display().to_string();
-            let ingest_status = std::process::Command::new(&exe)
-                .args(["ingest"])
-                .arg(&graph_path)
-                .args(["--adapter", "embedded", "--data-dir"])
-                .arg(&data_dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .status()
-                .unwrap_or_else(|error| {
-                    query_latency_exit("ingest_spawn_error", &data_dir_str, &error.to_string())
-                });
-            if !ingest_status.success() {
-                query_latency_exit(
-                    "ingest_error",
-                    &data_dir_str,
-                    &format!("`eg ingest` exited with {ingest_status}"),
-                );
-            }
-            let data_dir_args = vec![
-                "query".to_owned(),
-                "symbol".to_owned(),
-                corpus.query_symbol.clone(),
-                "--data-dir".to_owned(),
-                data_dir_str,
-                "--format".to_owned(),
-                "text".to_owned(),
-            ];
-            let data_dir_samples =
-                sample_query_latency(&exe, &data_dir_args, corpus.samples, "data_dir");
-            let data_dir_latency = summarize("data_dir", data_dir_samples, corpus.budget_p50_ms)
-                .unwrap_or_else(|| {
-                    query_latency_exit("no_samples", "data_dir", "no samples measured")
-                });
-            sources.insert("data_dir".to_owned(), data_dir_latency);
-        }
-        #[cfg(not(feature = "embedded-aletheiadb"))]
-        {
-            sources.insert(
-                "data_dir".to_owned(),
-                skipped_source(
-                    "data_dir",
-                    corpus.budget_p50_ms,
-                    "embedded-aletheiadb feature not enabled",
-                ),
-            );
-        }
+        measure_data_dir_latency(&exe, &graph_path, &work, &corpus, &mut sources);
     }
 
     let ok = sources.values().all(|source| source.pass);

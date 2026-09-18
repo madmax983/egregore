@@ -26,6 +26,7 @@
 //! no store — so it works on a fresh clone with an empty data dir.
 
 use clap::Subcommand;
+use std::fmt::Write as _;
 
 use super::*;
 
@@ -208,6 +209,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
     ),
     (
         "cycles",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
+        "dead-code",
         LaneStatic {
             store_mode: StoreMode::Structural,
             trust_classes: &["source_derived"],
@@ -799,8 +809,7 @@ fn required_inputs(cmd: &clap::Command) -> Vec<String> {
         .filter(|arg| arg.get_id() != "help" && arg.get_id() != "version")
         .map(|arg| {
             arg.get_long()
-                .map(|long| format!("--{long}"))
-                .unwrap_or_else(|| format!("<{}>", arg.get_id()))
+                .map_or_else(|| format!("<{}>", arg.get_id()), |long| format!("--{long}"))
         })
         .collect();
     inputs.sort();
@@ -824,8 +833,7 @@ fn classify(id: &str) -> LaneStatic {
     LANE_TABLE
         .iter()
         .find(|(key, _)| *key == id)
-        .map(|(_, meta)| *meta)
-        .unwrap_or_else(LaneStatic::unclassified)
+        .map_or_else(LaneStatic::unclassified, |(_, meta)| *meta)
 }
 
 /// The `query` command with all subcommands augmented, for introspection.
@@ -879,15 +887,17 @@ fn render_text() -> String {
         .unwrap_or(4)
         .max("LANE".len());
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<lane_w$}  {:<PURPOSE_WIDTH$}  {:<10}  {:<22}  {:<7}  FRESHNESS\n",
+    // `write!` to a `String` is infallible; the result is ignored.
+    let _ = writeln!(
+        out,
+        "{:<lane_w$}  {:<PURPOSE_WIDTH$}  {:<10}  {:<22}  {:<7}  FRESHNESS",
         "LANE",
         "PURPOSE",
         "STORE",
         "TRUST",
         "CITABLE",
         lane_w = lane_w
-    ));
+    );
     for lane in &manifest.lanes {
         let purpose = truncate(&lane.purpose, PURPOSE_WIDTH);
         let store = match lane.store_mode {
@@ -897,15 +907,17 @@ fn render_text() -> String {
         let trust = lane.trust_classes.join(",");
         let citable = if lane.citable_handles { "yes" } else { "no" };
         let freshness = lane.freshness.join(",");
-        out.push_str(&format!(
-            "{:<lane_w$}  {:<PURPOSE_WIDTH$}  {:<10}  {:<22}  {:<7}  {freshness}\n",
+        // `write!` to a `String` is infallible; the result is ignored.
+        let _ = writeln!(
+            out,
+            "{:<lane_w$}  {:<PURPOSE_WIDTH$}  {:<10}  {:<22}  {:<7}  {freshness}",
             lane.id,
             purpose,
             store,
             trust,
             citable,
             lane_w = lane_w
-        ));
+        );
     }
     out
 }

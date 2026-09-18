@@ -35,6 +35,7 @@ eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
+eg query dead-code        --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query deprecated-symbols --graph <PATH> [--repo <SELECTOR>] [--file <PATH>] [--format json|text]
 eg query redaction-audit --graph <PATH> [--repo <SELECTOR>] [--format json|text]
 eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
@@ -120,6 +121,12 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query unreferenced` — symbols with **no recorded inbound reference
   edges**, as prune-triage leads with citable handles — never proof of dead
   code ([unreferenced.md](unreferenced.md), issue #113).
+- `eg query dead-code` — **dead-code triage candidates**: symbols with **zero
+  incoming `CALLS` edges** (plus one-hop dead clusters), excluding recognized
+  non-call entry points (`#[test]`/`#[bench]`, `#[no_mangle]`/`#[export_name]`,
+  binary `fn main`) and the externally-reachable public surface — every row
+  labeled `candidate` with the soundness boundary in the response metadata
+  ([dead-code.md](dead-code.md), issue #240).
 - `eg query deprecated-symbols` — **`#[deprecated]` symbols with their
   still-resolvable `CALLS` call sites** as a migration worklist: verbatim
   bounded `deprecated_since`/`deprecated_note` payloads, citable handles on every row and call

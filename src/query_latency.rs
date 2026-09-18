@@ -77,7 +77,7 @@ pub fn machine_info() -> MachineInfo {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         parallelism: std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get())
+            .map(std::num::NonZeroUsize::get)
             .unwrap_or(0),
     }
 }
@@ -138,11 +138,18 @@ pub struct LatencyReport {
 /// Linear-interpolation percentile over ascending samples (numpy `linear`
 /// method). Returns `None` for empty input or `p` outside `[0, 100]`.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn percentile(sorted_samples: &[f64], p: f64) -> Option<f64> {
     if sorted_samples.is_empty() || !(0.0..=100.0).contains(&p) {
         return None;
     }
     let last = sorted_samples.len() - 1;
+    // SAFETY: `last` is a sample count (small); `rank` is in `[0, last]`, so the
+    // float→usize casts below cannot truncate or lose sign in practice.
     let rank = p / 100.0 * last as f64;
     let low = rank.floor() as usize;
     let high = rank.ceil() as usize;
@@ -207,6 +214,11 @@ pub fn skipped_source(source: &str, budget_p50_ms: f64, reason: &str) -> SourceL
 /// when the child emits no stdout line — a query that answers nothing has no
 /// time-to-first-answer, and the benchmark fails closed instead of timing an
 /// empty result.
+///
+/// # Errors
+///
+/// Returns an error if the child process cannot be spawned, if stdout was not
+/// piped, or if the child emits no stdout line before exiting.
 pub fn measure_cold_query(exe: &Path, args: &[&str]) -> Result<f64, String> {
     let start = Instant::now();
     let mut child = Command::new(exe)
@@ -287,7 +299,7 @@ mod tests {
     fn summarize_sorts_and_gates_p50() {
         let summary = summarize("graph", vec![300.0, 100.0, 200.0], 250.0).expect("samples");
         assert_eq!(summary.samples_ms, vec![100.0, 200.0, 300.0]);
-        assert_eq!(summary.p50_ms, 200.0);
+        assert!((summary.p50_ms - 200.0).abs() < f64::EPSILON);
         assert!(summary.pass);
         assert!(!summary.skipped);
 
