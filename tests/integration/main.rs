@@ -57,6 +57,7 @@ mod ingest;
 mod inspect_store;
 mod lane_manifest;
 mod line_ending_determinism;
+mod line_ending_stability;
 mod link_evidence;
 mod link_logs;
 mod local_project;

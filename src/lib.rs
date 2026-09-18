@@ -810,7 +810,13 @@ pub(crate) fn scan_source_text_records(
     source: &str,
     repository_id: &str,
 ) -> Result<(Vec<GraphRecord>, languages::cross_file::FileFacts)> {
-    let source_lf = source.replace("\r\n", "\n");
+    // Normalize line endings at the scan funnel (issue #242): CRLF and lone
+    // CR both become LF up front so the File-node summary text below is
+    // canonical, and the parse boundary (`extract_file_source`) normalizes
+    // idempotently again before Tree-sitter. A CRLF checkout and an LF
+    // checkout of the same commit therefore yield byte-identical spans,
+    // symbol text, signatures, summaries, and content hashes.
+    let source_lf = languages::normalize_line_endings(source);
     let source = &source_lf;
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();

@@ -30,6 +30,10 @@ use crate::{
 
 /// Extracts Rust syntax records from one source file.
 ///
+/// Line endings are normalized to LF at the parse boundary
+/// (`extract_file_source`, issue #242), so this file-read entry point agrees
+/// with the scan funnel's canonical text.
+///
 /// Returns the file's cross-file resolution facts (issue #152) for the
 /// repo-wide `CALLS` resolution pass.
 ///
@@ -53,6 +57,13 @@ pub fn extract_file(
 
 /// Extracts Rust syntax records from supplied source text.
 ///
+/// Line endings are normalized to LF at this parse boundary (issue #242):
+/// CRLF and lone CR both become LF before Tree-sitter sees the source, so
+/// every caller — the scan funnel, the file-read entry point, history
+/// replay, and direct API users — gets byte-stable spans, symbol text,
+/// signatures, summaries, and content hashes. Idempotent: already-normalized
+/// text passes through unchanged.
+///
 /// Returns the file's cross-file resolution facts (issue #152) for the
 /// repo-wide `CALLS` resolution pass.
 ///
@@ -67,6 +78,14 @@ pub fn extract_file_source(
     repository_id: &str,
     graph: &mut Graph,
 ) -> Result<FileFacts> {
+    // Normalize line endings at the parse boundary (issue #242): CRLF and
+    // lone CR both become LF before Tree-sitter sees the source, so byte
+    // spans and content-derived fields are canonical no matter which line
+    // endings the checkout used. `normalize_line_endings` is idempotent, so
+    // callers that already normalized (the scan funnel, `extract_file`) pay
+    // only the fast path.
+    let source_lf = super::normalize_line_endings(source);
+    let source = source_lf.as_str();
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())

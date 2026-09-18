@@ -19,6 +19,10 @@ use crate::{
 
 /// Extracts TypeScript syntax records from one source file.
 ///
+/// Line endings are normalized to LF at the parse boundary
+/// (`extract_file_source`, issue #242), so this file-read entry point agrees
+/// with the scan funnel's canonical text.
+///
 /// # Errors
 ///
 /// Returns an error when the file cannot be read, the TypeScript grammar cannot
@@ -39,6 +43,12 @@ pub fn extract_file(
 
 /// Extracts TypeScript syntax records from supplied source text.
 ///
+/// Line endings are normalized to LF at this parse boundary (issue #242):
+/// CRLF and lone CR both become LF before Tree-sitter sees the source, so
+/// every caller — the scan funnel, the file-read entry point, history
+/// replay, and direct API users — gets byte-stable spans and content
+/// fields. Idempotent: already-normalized text passes through unchanged.
+///
 /// # Errors
 ///
 /// Returns an error when the TypeScript grammar cannot be loaded, or
@@ -50,6 +60,14 @@ pub fn extract_file_source(
     repository_id: &str,
     graph: &mut Graph,
 ) -> Result<()> {
+    // Normalize line endings at the parse boundary (issue #242): CRLF and
+    // lone CR both become LF before Tree-sitter sees the source, so byte
+    // spans and content-derived fields are canonical no matter which line
+    // endings the checkout used. `normalize_line_endings` is idempotent, so
+    // callers that already normalized (the scan funnel, `extract_file`) pay
+    // only the fast path.
+    let source_lf = super::normalize_line_endings(source);
+    let source = source_lf.as_str();
     let mut parser = Parser::new();
     // Use the TSX grammar for .tsx files, TypeScript grammar otherwise.
     let is_tsx = Path::new(&file.repo_relative_path)
