@@ -98,6 +98,8 @@ mod blind_spots;
 mod track_record;
 // Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
 mod session_retrospective;
+// Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
+mod verify_scan;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -196,6 +198,8 @@ pub(crate) use session_retrospective::*;
 pub(crate) use dep_usage::*;
 // Appended (issue #249); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use deprecated_symbols::*;
+// Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use verify_scan::*;
 
 use std::{
     collections::BTreeMap,
@@ -365,6 +369,36 @@ pub(crate) enum Commands {
         /// time. Not part of the handle identity.
         #[arg(long)]
         captured_at: Option<String>,
+    },
+    /// Re-scan a repository twice and verify byte-for-byte stability (issue #239).
+    ///
+    /// Scans the target twice within one invocation, pinning the transaction
+    /// time and repository identity for both scans so wall-clock and
+    /// checkout-directory differences never cause a false mismatch, then
+    /// reports whether the two canonical JSONL outputs are byte-for-byte
+    /// identical. Exits 0 with `stable: true` on a deterministic repository;
+    /// exits 1 with `stable: false` plus the differing record handle(s),
+    /// first differing field, and first differing JSONL line when the scans
+    /// disagree.
+    ///
+    /// Determinism is guaranteed only relative to a fixed producer (this
+    /// binary) plus the pinned time and identity; cross-version extraction
+    /// drift is the complementary `eg query producer-drift` check (#234).
+    /// See `docs/cli/verify-scan.md`.
+    VerifyScan {
+        /// Repository path to scan.
+        repo_path: PathBuf,
+        /// Override the auto-detected repository identity.
+        ///
+        /// Forces `identity_source = operator_override`. Recommended when the
+        /// two scans being compared run in different checkout directories
+        /// (e.g. CRLF vs LF checkouts of the same commit), where
+        /// path-derived identity would otherwise differ.
+        #[arg(long)]
+        repo_id_override: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Inspect the checked-in project configuration (issue #261).
     ///
@@ -4880,6 +4914,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
                 captured_at.as_deref(),
             )
         }
+        Commands::VerifyScan {
+            repo_path,
+            repo_id_override,
+            format,
+        } => verify_scan_cmd(&repo_path, repo_id_override.as_deref(), format),
         Commands::CaptureTests {
             input,
             out,

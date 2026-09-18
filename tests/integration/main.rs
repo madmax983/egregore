@@ -153,6 +153,7 @@ mod transitive_callers;
 mod trust_class;
 mod typescript_scan;
 mod validate;
+mod verify_scan;
 mod watch;
 // Appended (issue #246); kept at the end to minimize cross-lane merge conflicts.
 mod query_diagnostics;

@@ -127,6 +127,8 @@ pub mod traj;
 pub mod validate;
 /// Evidence-freshness verdicts for verification records (issue #111).
 pub mod verification_freshness;
+/// Byte-for-byte scan reproducibility comparison (issue #239).
+pub mod verify_scan;
 /// Transcripts watcher.
 pub mod watch;
 

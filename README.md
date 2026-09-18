@@ -279,6 +279,7 @@ Implemented surfaces:
 
 - `scan` — current-tree JSONL extraction (Rust, Python, TypeScript, Go via Tree-sitter)
 - `scan-history` — commit-by-commit temporal extraction
+- `verify-scan` — re-scan twice with pinned time/identity and verify byte-for-byte stability (issue #239); see [docs/cli/verify-scan.md](docs/cli/verify-scan.md)
 - `inspect` — graph summary over a JSONL file, an embedded store (`--data-dir`, no daemon), or a running daemon
 - `ingest` — dry-run, embedded AletheiaDB, and daemon adapters
 - `import-codex` — Codex session/rollout JSONL → agent-memory graph records (M3)
