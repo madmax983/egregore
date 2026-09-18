@@ -11,8 +11,8 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     ir::{
-        DeprecationMark, EdgeLabel, Graph, GraphRecord, MAX_DEPRECATION_STRING_LEN, NodeKind,
-        RouteAnnotation, SourceSpan, stable_id,
+        DeprecationMark, EdgeLabel, EntryPointKind, EntryPointMark, Graph, GraphRecord,
+        MAX_DEPRECATION_STRING_LEN, NodeKind, RouteAnnotation, SourceSpan, stable_id,
     },
     languages::{
         common::{
@@ -1681,6 +1681,51 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         None
     }
 
+    /// Collects the non-call entry-point facts on the item at `node` (issue
+    /// #240): `#[test]` / `#[bench]` (or a path attribute ending in
+    /// `::test` / `::bench`, e.g. `#[tokio::test]`), `#[no_mangle]` /
+    /// `#[export_name = "..."]`, and a free `fn main` in a binary crate
+    /// root. Attribute siblings are walked exactly like
+    /// [`Self::deprecation_attribute`]; the nearest matching attribute
+    /// wins. Returns `None` when the item is not a recognized entry point.
+    fn entry_point_mark(
+        &self,
+        node: Node<'_>,
+        symbol_kind: &str,
+        qualified_name: &str,
+    ) -> Option<EntryPointMark> {
+        // A free `fn main` in `src/main.rs` / `src/bin/**` is the binary's
+        // entry point. `enclosing_fn_ids` holds only lexically-enclosing
+        // functions here (the item's own id is pushed after `add_symbol`),
+        // so a non-empty stack means a nested `fn main`, not the entry.
+        // Trait-method signatures and default-bodied trait methods also
+        // arrive with `symbol_kind == "function"` but are not free items: a
+        // `trait_item` ancestor disqualifies them.
+        if symbol_kind == "function"
+            && self.enclosing_fn_ids.is_empty()
+            && qualified_name.rsplit("::").next() == Some("main")
+            && is_binary_crate_path(&self.file.repo_relative_path)
+            && !has_trait_item_ancestor(node)
+        {
+            return Some(EntryPointMark {
+                kind: EntryPointKind::BinaryEntry,
+            });
+        }
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if let Some(kind) = entry_point_kind_from_attribute(self.node_text(sibling)) {
+                        return Some(EntryPointMark { kind });
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        None
+    }
     /// Collects route-registration references from a `macro_invocation` when its
     /// macro name is in the closed registration set (`routes`) (issue #445).
     /// Each bare `identifier` token inside the macro's `token_tree` is recorded
@@ -1918,6 +1963,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if let Some(deprecation) = self.deprecation_attribute(node) {
             record = record.with_deprecated(deprecation);
             record = record.with_redaction_policy_version(REDACTION_POLICY_VERSION);
+        }
+        // Entry-point facts (issue #240): the mark's presence is the fact —
+        // a recognized non-call entry point is excluded from dead-code
+        // triage candidacy downstream. Pure attribute/path signal, never
+        // an identity input.
+        if let Some(entry_point) = self.entry_point_mark(node, symbol_kind, qualified_name) {
+            record = record.with_entry_point(entry_point);
         }
         self.graph.push(record);
         self.add_edge(
@@ -3648,6 +3700,57 @@ fn deprecation_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<
     Some(DeprecationMark { since, note })
 }
 
+/// Maps one attribute item's source text onto a closed entry-point class
+/// (issue #240): `#[test]` / `#[bench]`, or a path attribute ending in
+/// `::test` / `::bench` (e.g. `#[tokio::test]`), marks a test-harness
+/// entry; `#[no_mangle]` / `#[export_name]` marks an FFI export.
+/// Configuration attributes that merely mention these tokens —
+/// `#[cfg(test)]`, `#[cfg_attr(test, ...)]` — never match: only the
+/// attribute's own name is compared, exactly like [`attribute_is_test`].
+fn entry_point_kind_from_attribute(text: &str) -> Option<EntryPointKind> {
+    let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let inner = stripped.strip_prefix("#[")?.strip_suffix(']')?;
+    let name = inner.split(['(', '=']).next().unwrap_or(inner);
+    if name == "test" || name.ends_with("::test") || name == "bench" || name.ends_with("::bench") {
+        Some(EntryPointKind::Test)
+    } else if name == "no_mangle" || name == "export_name" {
+        Some(EntryPointKind::FfiExport)
+    } else {
+        None
+    }
+}
+
+/// `true` when one of `node`'s ancestors is a `trait_item` (issue #240).
+/// Trait-method signatures and default-bodied trait methods arrive at
+/// `add_symbol` with `symbol_kind == "function"`, but a `fn main` declared
+/// in a trait is not the binary's entry point.
+fn has_trait_item_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "trait_item" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+/// `true` when the repo-relative path is a binary crate root: `src/main.rs`
+/// or anything under `src/bin/`. A free `fn main` there is the binary's
+/// entry point; a `fn main` in a library root (`src/lib.rs`) is an ordinary
+/// function, not an entry point. Mirrors the `src/`-rooted scope of the
+/// issue #213 library-crate rule — workspace-member prefixes are out of
+/// this slice's scope.
+fn is_binary_crate_path(path: &str) -> bool {    let mut segments = path.split(['/', '\\']).filter(|s| !s.is_empty());
+    if segments.next() != Some("src") {
+        return false;
+    }
+    match segments.next() {
+        Some("main.rs") => segments.next().is_none(),
+        Some("bin") => true,
+        _ => false,
+    }
+}
+/// `#[test]` or a path attribute whose name ends in `::test` (such as
 /// `true` when one attribute item's source text is a dedicated test attribute:
 /// `#[test]` or a path attribute whose name ends in `::test` (such as
 /// `#[tokio::test]`), with or without arguments. Configuration attributes that
@@ -4636,6 +4739,66 @@ mod tests {
         let tree = parse_tree(source);
         let attribute_item = first_descendant_of_kind(tree.root_node(), "attribute_item")?;
         deprecation_from_attribute(attribute_item, source)
+    }
+
+    /// Runs `entry_point_kind_from_attribute` over one attribute item's
+    /// source text, mirroring the extractor's prev-sibling walk input shape
+    /// (issue #240).
+    fn entry_attr(source: &str) -> Option<EntryPointKind> {
+        let tree = parse_tree(source);
+        let attribute_item = first_descendant_of_kind(tree.root_node(), "attribute_item")?;
+        entry_point_kind_from_attribute(&source[attribute_item.byte_range()])
+    }
+
+    #[test]
+    fn entry_point_test_attributes_are_recognized() {
+        assert_eq!(
+            entry_attr("#[test]\nfn check() {}"),
+            Some(EntryPointKind::Test)
+        );
+        assert_eq!(
+            entry_attr("#[tokio::test]\nasync fn check() {}"),
+            Some(EntryPointKind::Test),
+            "path attributes ending in ::test are test-harness entries"
+        );
+        assert_eq!(
+            entry_attr("#[bench]\nfn check() {}"),
+            Some(EntryPointKind::Test)
+        );
+    }
+
+    #[test]
+    fn entry_point_ffi_attributes_are_recognized() {
+        assert_eq!(
+            entry_attr("#[no_mangle]\npub extern \"C\" fn f() {}"),
+            Some(EntryPointKind::FfiExport)
+        );
+        assert_eq!(
+            entry_attr("#[export_name = \"real_name\"]\nfn f() {}"),
+            Some(EntryPointKind::FfiExport)
+        );
+    }
+
+    #[test]
+    fn entry_point_config_attributes_are_not_entry_points() {
+        // Configuration attributes that merely mention the tokens — never
+        // the attribute's own name — must not mark the item.
+        assert_eq!(entry_attr("#[cfg(test)]\nfn check() {}"), None);
+        assert_eq!(entry_attr("#[cfg_attr(test, no_mangle)]\nfn f() {}"), None);
+        assert_eq!(entry_attr("#[allow(dead_code)]\nfn f() {}"), None);
+        assert_eq!(entry_attr("#[inline]\nfn f() {}"), None);
+    }
+
+    #[test]
+    fn binary_crate_paths_are_recognized() {
+        assert!(is_binary_crate_path("src/main.rs"));
+        assert!(is_binary_crate_path("src/bin/tool.rs"));
+        assert!(is_binary_crate_path("src/bin/nested/tool.rs"));
+        assert!(!is_binary_crate_path("src/lib.rs"));
+        assert!(!is_binary_crate_path("src/main.rs.bak"));
+        assert!(!is_binary_crate_path("tests/main.rs"));
+        // Workspace-member prefixes are out of this slice's scope.
+        assert!(!is_binary_crate_path("crates/foo/src/main.rs"));
     }
 
     #[test]

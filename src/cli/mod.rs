@@ -16,6 +16,7 @@ mod context;
 mod coupling;
 mod cycles;
 mod daemon;
+mod dead_code;
 mod debt_markers;
 mod decide;
 mod deltas;
@@ -111,6 +112,7 @@ pub(crate) use context::*;
 pub(crate) use coupling::*;
 pub(crate) use cycles::*;
 pub(crate) use daemon::*;
+pub(crate) use dead_code::*;
 pub(crate) use debt_markers::*;
 pub(crate) use decide::*;
 pub(crate) use deltas::*;
@@ -2466,6 +2468,47 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Dead-code triage candidates: symbols with no live in-graph callers (issue #240).
+    ///
+    /// Lists indexed symbols that have **zero recorded direct incoming
+    /// `CALLS` edges**, plus symbols whose every recorded direct caller is
+    /// itself such a candidate (the one-hop dead-cluster rule: if `a` is
+    /// called only by `b` and `b` is unreferenced, both are reported).
+    ///
+    /// Excluded from candidacy (counted, never silently dropped):
+    /// recognized non-call entry points (`#[test]` / `#[bench]` harness
+    /// entries, `#[no_mangle]` / `#[export_name]` FFI exports, binary-crate
+    /// `fn main`) and externally-reachable symbols under the issue #213
+    /// public-surface rule (top-level `pub`, visibility-widening `pub use`
+    /// re-exports) — an unused-internally `pub fn` may be a real external
+    /// entry point.
+    ///
+    /// Every row is a **candidate** (suspected dead code), never proof: the
+    /// response metadata states the soundness boundary — the graph cannot
+    /// observe dynamic dispatch via trait objects, macro-generated callers,
+    /// reflection-like usage, FFI consumers, or cross-crate consumers.
+    /// Deletion stays a human/agent decision; transitive whole-program
+    /// reachability pruning is out of scope.
+    ///
+    /// Documented in `docs/cli/dead-code.md`.
+    DeadCode {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the candidate set to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum candidate rows returned (default 100, max 500). Values
+        /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::DEAD_CODE_DEFAULT_LIMIT)]
+        limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7292,6 +7335,51 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 format,
             )
+        }
+        QuerySubcommand::DeadCode {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::DEAD_CODE_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::DEAD_CODE_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::DEAD_CODE_MAX_LIMIT,
+                        query::DEAD_CODE_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #240): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_dead_code_cmd(&records, &index, selected.as_deref(), limit, format)
         }
         QuerySubcommand::Orient {
             graph,

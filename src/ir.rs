@@ -1273,6 +1273,17 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deprecated: Option<DeprecationMark>,
+        // ── Entry-point facts (issue #240) ────────────────────────────────
+        /// Non-call entry-point facts on a `Symbol` node (issue #240):
+        /// presence means the item is a recognized non-call entry point — a
+        /// `#[test]` / `#[bench]` harness entry, an FFI export
+        /// (`#[no_mangle]` / `#[export_name]`), or a binary-crate `fn main`.
+        /// The mark's *presence* is the fact; the closed `kind` vocabulary
+        /// names which one. Additive per `docs/schema/schema-versioning.md`
+        /// §2 and never an identity input: stamping entry-point facts never
+        /// moves a record ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_point: Option<EntryPointMark>,
         // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
         /// The Cargo package that owns this code fact, resolved from the
         /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
@@ -1847,6 +1858,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            entry_point: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -1978,6 +1990,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            entry_point: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2108,6 +2121,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            entry_point: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2243,6 +2257,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            entry_point: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2726,6 +2741,27 @@ impl GraphRecord {
     pub const fn deprecated(&self) -> Option<&DeprecationMark> {
         match self {
             Self::Node { deprecated, .. } => deprecated.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches non-call entry-point facts to a `Symbol` node (issue #240).
+    /// The value is additive metadata per `docs/schema/schema-versioning.md`
+    /// §2 and MUST NOT contribute to stable ID composition. No-op on
+    /// non-node records.
+    #[must_use]
+    pub fn with_entry_point(mut self, mark: EntryPointMark) -> Self {
+        if let Self::Node { entry_point, .. } = &mut self {
+            *entry_point = Some(mark);
+        }
+        self
+    }
+
+    /// Returns the non-call entry-point facts when present (issue #240).
+    #[must_use]
+    pub const fn entry_point(&self) -> Option<&EntryPointMark> {
+        match self {
+            Self::Node { entry_point, .. } => entry_point.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -4074,6 +4110,36 @@ pub struct DeprecationMark {
     /// Absent when the attribute did not carry a note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// Non-call entry-point classification for one `Symbol` node (issue #240).
+///
+/// The mark's *presence* is the entry-point fact: the item is a recognized
+/// non-call entry point, so the dead-code triage lane excludes it from the
+/// candidate set. The closed [`EntryPointKind`] vocabulary names which one.
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping entry-point
+/// facts never moves a record ID.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct EntryPointMark {
+    /// Which closed entry-point class the item belongs to.
+    pub kind: EntryPointKind,
+}
+
+/// Closed vocabulary of recognized non-call entry points (issue #240).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryPointKind {
+    /// `#[test]` / `#[bench]`, or a path attribute ending in `::test` /
+    /// `::bench` (e.g. `#[tokio::test]`): a test-harness entry point.
+    Test,
+    /// `#[no_mangle]` / `#[export_name = "..."]`: an FFI export reachable
+    /// from outside the crate without a recorded call edge.
+    FfiExport,
+    /// A free `fn main` in a binary crate root (`src/main.rs`,
+    /// `src/bin/**`): the binary's entry point.
+    BinaryEntry,
 }
 
 /// Owning-Cargo-package attribution for one code-graph node (issue #117).
