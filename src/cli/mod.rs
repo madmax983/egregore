@@ -5,6 +5,7 @@
 mod as_of;
 mod at;
 mod audit;
+mod belief_timeline;
 mod bundle;
 mod candidates;
 mod capture_bench;
@@ -109,6 +110,7 @@ mod trust_audit;
 pub(crate) use as_of::*;
 pub(crate) use at::*;
 pub(crate) use audit::*;
+pub(crate) use belief_timeline::*;
 pub(crate) use bundle::*;
 pub(crate) use candidates::*;
 pub(crate) use capture_bench::*;
@@ -1872,6 +1874,49 @@ pub(crate) enum QuerySubcommand {
         /// Exclude unverified observations; report each as an `excluded` diagnostic.
         #[arg(long)]
         verified_only: bool,
+    },
+    /// Trace the agent-belief timeline for one code target (issue #235).
+    ///
+    /// Resolves `<TARGET>` (a symbol record ID, a repo-relative `path`,
+    /// a `path:line`, or an exact symbol name) to one `Symbol`/`File` record,
+    /// then returns every live agent-authored `Observation`, `Decision`, and
+    /// `Failure` citing it — oldest to newest by `observed_at` (falling back
+    /// to `ingested_at`, record ID tiebreaker) — each carrying a
+    /// machine-readable status (`current` | `superseded` | `contradicted` —
+    /// closed vocabulary), the forward record that overrode or disputed it,
+    /// and citation provenance. Output is metadata only: record IDs, handles,
+    /// timestamps, confidence, and statuses — never record bodies.
+    ///
+    /// Statuses derive solely from author-written `superseded_by` /
+    /// `SUPERSEDES` / `CONTRADICTS` data already in the store, resolved
+    /// through the shared temporal resolver. Contradiction is not truth
+    /// arbitration: both sides of a dispute stay visible.
+    ///
+    /// Exit codes:
+    ///   0 — timeline returned (possibly an explicit empty `entries: []`).
+    ///   1 — malformed handle or flag combination (JSON diagnostic, stderr).
+    ///   2 — target handle unknown, stale, or ambiguous, or a `path:line`
+    ///       with no enclosing symbol (JSON diagnostic on stderr; the
+    ///       `error.code` distinguishes `no_match`, `stale_handle`,
+    ///       `ambiguous`, and `no_symbol_at_line`).
+    ///
+    /// Documented in `docs/cli/belief-timeline.md` and `docs/cli/query.md`.
+    BeliefTimeline {
+        /// Symbol record ID, repo-relative file path, `path:line`, or exact
+        /// symbol name.
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict target handle resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format: `json` (default, machine-readable) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     /// Find changes and trust-separated evidence over a commit range.
     Changes {
@@ -7347,6 +7392,34 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_memory_cmd(&records, &id_or_handle, verified_only)
+        }
+        QuerySubcommand::BeliefTimeline {
+            target,
+            graph,
+            data_dir,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #235): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_belief_timeline_cmd(&records, &target, &index, selected.as_deref(), format)
         }
         QuerySubcommand::Changes {
             base,

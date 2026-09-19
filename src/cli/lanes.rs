@@ -138,6 +138,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "belief-timeline",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["agent_verified", "agent_unverified", "agent_contradicted"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
+    (
         "candidates",
         LaneStatic {
             store_mode: StoreMode::Structural,

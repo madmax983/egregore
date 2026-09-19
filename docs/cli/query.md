@@ -77,6 +77,13 @@ Evidence-backed audit subcommands have their own pages:
   agent-failure density** across all imported runs, the store-wide complement
   to `eg query failures` ([failure-hotspots.md](failure-hotspots.md), issue
   #254).
+- `eg query belief-timeline` — the **agent-belief timeline for one code
+  target**: every live agent-authored `Observation`/`Decision`/`Failure`
+  citing it, oldest to newest, each carrying a machine-readable status
+  (`current` | `superseded` | `contradicted`) and its forward
+  record — statuses replayed from author-written supersession/contradiction
+  data, never a judgment about which belief is true
+  ([belief-timeline.md](belief-timeline.md), issue #235).
 - `eg query diagnostics` — **extractor-coverage-gap diagnostics** — the
   extractor's self-declared blind spots (unsupported macro invocations,
   unresolved call/dispatch stubs) as citable `Diagnostic` rows, one per gap,
