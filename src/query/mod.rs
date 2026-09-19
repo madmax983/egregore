@@ -68,6 +68,8 @@ mod who_constructs;
 mod sessions;
 // Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
 mod trust;
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+mod trust_audit;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 mod blind_spots;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
@@ -146,3 +148,5 @@ pub(crate) use trust::{
     is_closure_target_kind, is_verification_domain_kind, is_verification_domain_record,
     verification_outcome,
 };
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+pub use trust_audit::*;

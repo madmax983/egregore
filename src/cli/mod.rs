@@ -102,6 +102,8 @@ mod track_record;
 mod session_retrospective;
 // Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
 mod verify_scan;
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+mod trust_audit;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -204,6 +206,8 @@ pub(crate) use dep_usage::*;
 pub(crate) use deprecated_symbols::*;
 // Appended (issue #239); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use verify_scan::*;
+// Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use trust_audit::*;
 
 use std::{
     collections::BTreeMap,
@@ -3229,6 +3233,42 @@ pub(crate) enum QuerySubcommand {
         /// Restrict the sweep to one repository in a multi-repo store.
         #[arg(long)]
         repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Audit producer trust-class consistency across every persisted record (issue #236).
+    ///
+    /// Read-only: scans every persisted node, edge, and tombstone and verifies
+    /// that each record's `producer_kind` is consistent with the trust class
+    /// its node kind implies. Deterministic code-fact kinds may only be written
+    /// by deterministic producers; agent-authored kinds may only be written by
+    /// agent producers. Each violation is a citable JSON record (`record_id`,
+    /// `kind`, `producer_kind`, the repo-relative handle/span where applicable,
+    /// and the broken rule) — never synthesized prose. A clean store returns an
+    /// explicit `ok:true` with counted totals.
+    ///
+    /// Edges are audited against their source node's kind and tombstones against
+    /// their target record's kind (resolved in-batch, last-write-wins — the same
+    /// semantics as the daemon's `lookup_node_kind`); unresolvable endpoints are
+    /// skipped, not flagged. `producer_kind: other` fails closed. Legacy records
+    /// without a producer envelope are exempt.
+    ///
+    /// Exit codes:
+    ///   0 — audit ran (violations reported, or clean with
+    ///       `empty_reason: "no_trust_violations"`).
+    ///   1 — malformed input (unreadable graph, both/neither
+    ///       `--graph`/`--data-dir`).
+    ///
+    /// Documented in `docs/cli/trust-audit.md`; the rule set in
+    /// `docs/schema/producer-version.md` §10.
+    TrustAudit {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -8049,6 +8089,30 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_redaction_audit_cmd(&records, &index, selected.as_deref(), format)
+        }
+        QuerySubcommand::TrustAudit {
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Strictly read-only lane (issue #236): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            query_trust_audit_cmd(&records, format)
         }
         QuerySubcommand::UnsafeSites {
             path,

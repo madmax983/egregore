@@ -104,6 +104,7 @@ mod query_subsystem;
 mod query_symbol_roles;
 mod query_symbols;
 mod query_track_record;
+mod query_trust_audit;
 mod query_undocumented;
 mod query_unreferenced;
 mod query_unsafe_sites;

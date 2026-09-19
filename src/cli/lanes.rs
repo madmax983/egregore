@@ -655,6 +655,24 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "trust-audit",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &[
+                "source_derived",
+                "verification_evidence",
+                "agent_verified",
+                "agent_unverified",
+                "agent_contradicted",
+                "project_state",
+                "artifact",
+                "runtime_observation",
+            ],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
+    (
         "transitive-callers",
         LaneStatic {
             store_mode: StoreMode::Structural,

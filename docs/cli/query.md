@@ -40,6 +40,7 @@ eg query deprecated-symbols --graph <PATH> [--repo <SELECTOR>] [--file <PATH>] [
 eg query redaction-audit --graph <PATH> [--repo <SELECTOR>] [--format json|text]
 eg query blind-spots      --graph <PATH>   [--repo <SELECTOR>] [--kind symbol|file] [--format json|text]
 eg query track-record     --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query trust-audit      --graph <PATH>   [--format json|text]
 eg query session <ID>     --graph <PATH>   [--format json|text]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
@@ -142,6 +143,13 @@ Evidence-backed audit subcommands have their own pages:
   advisory findings citing (`record_id`, `field_path`,
   `classification`, `hash_prefix`) — never raw values; exit 3 on findings,
   0 clean ([redaction-audit.md](redaction-audit.md), issue #244).
+- `eg query trust-audit` — producer **trust-class audit**: every persisted
+  node, edge, and tombstone checked against the node-kind → producer-trust-class
+  contract — deterministic code-fact kinds may only be written by deterministic
+  producers, agent-authored kinds only by agent producers; each violation is a
+  citable JSON record (`record_id`, `kind`, `producer_kind`, handle/span, the
+  broken rule), a clean store is an explicit `ok:true` with counted totals;
+  exit 0 either way ([trust-audit.md](trust-audit.md), issue #236).
 - `eg query blind-spots` — code targets (symbols and/or files) with **zero
   cross-domain evidence** into the agent-memory, verification, or project
   domains, ranked riskiest-first by inbound structural reference count —
