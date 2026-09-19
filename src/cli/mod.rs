@@ -9,6 +9,8 @@ mod belief_timeline;
 mod bundle;
 mod candidates;
 mod capture_bench;
+mod capture_coverage;
+mod capture_lanes;
 mod capture_tests;
 mod change_impact;
 mod changes;
@@ -537,6 +539,82 @@ pub(crate) enum Commands {
         graph: Option<PathBuf>,
         /// Input format. Only `libtest-json` (the default) is accepted.
         #[arg(long, default_value = "libtest-json")]
+        format: String,
+        /// Capture the raw input bytes into the protected store (issue #60).
+        /// Requires `--protected-store` and `--producer`.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Producer identity for the captured blob (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        producer: Option<String>,
+    },
+    /// Capture a `cargo llvm-cov` run as a citable verification-domain
+    /// `CoverageReport` record (issue #230).
+    ///
+    /// CAPTURE-ONLY: never executes a coverage tool. The caller runs the
+    /// coverage tool, captures its machine-readable artefact (`cargo llvm-cov
+    /// --json` or `--lcov`) to a file, and hands that file plus the run
+    /// metadata here. Parses it into a redaction-safe `CoverageReport` node
+    /// (verification domain, `coverage_report` kind) with overall and per-file
+    /// line coverage (branch/region/function figures when the artefact has
+    /// them); raw report text never enters the graph. With `--graph` (a code
+    /// graph from `eg scan`) each measured file that resolves to a `File`
+    /// mints a `TOUCHED_FILE` edge, and each named function (LCOV) whose final
+    /// `::`-segment resolves to exactly one `Symbol` mints a
+    /// `MENTIONS_SYMBOL` edge; files that do not resolve join a distinct
+    /// `unresolved` set with a `Diagnostic` instead of a wrong edge.
+    ///
+    /// Exit codes: 0 success; 1 usage/provenance error; 3 protected-store I/O
+    /// failure; 4 empty input; 5 unparseable input or missing coverage tool (a
+    /// `coverage_tool_missing` diagnostic when the artefact carries the tool's
+    /// own not-installed error text). A captured coverage number is a recorded
+    /// observation of one run — lines executed by some test, never proof the
+    /// behavior is correct. See `docs/cli/capture-coverage.md`.
+    CaptureCoverage {
+        /// Path to the file holding the coverage artefact (stored, never run).
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session_id: String,
+        /// Commit handle / external identifier (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Optional suite/target name (node `name`; not part of the record ID).
+        #[arg(long)]
+        suite: Option<String>,
+        /// The exact command that produced the artefact. Stored, never executed.
+        #[arg(long)]
+        command: String,
+        /// The coverage command's exit status.
+        #[arg(long)]
+        exit_code: i64,
+        /// Caller-supplied RFC 3339 timestamp. Validated.
+        #[arg(long)]
+        executed_at: String,
+        /// Coverage tool identity (part of the record ID).
+        #[arg(long, default_value = "cargo-llvm-cov")]
+        tool: String,
+        /// Optional coverage tool version.
+        #[arg(long)]
+        tool_version: Option<String>,
+        /// Optional repository identity (reserved for scoping).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional repository root used to relativize absolute artefact paths.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Optional code graph (from `eg scan`) to resolve files/functions to File/Symbol.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Input format. `llvm-cov-json` (the default) or `llvm-cov-lcov`.
+        #[arg(long, default_value = "llvm-cov-json")]
         format: String,
         /// Capture the raw input bytes into the protected store (issue #60).
         /// Requires `--protected-store` and `--producer`.
@@ -5236,6 +5314,43 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             runner: runner.as_deref(),
             runner_version: runner_version.as_deref(),
             repo: repo.as_deref(),
+            graph: graph.as_deref(),
+            format: &format,
+            protected_raw_artifacts,
+            protected_store: protected_store.as_deref(),
+            producer: producer.as_deref(),
+        }),
+        Commands::CaptureCoverage {
+            input,
+            out,
+            session_id,
+            commit,
+            suite,
+            command,
+            exit_code,
+            executed_at,
+            tool,
+            tool_version,
+            repo,
+            repo_root,
+            graph,
+            format,
+            protected_raw_artifacts,
+            protected_store,
+            producer,
+        } => capture_coverage::capture_coverage(&capture_coverage::CaptureCoverageArgs {
+            input: &input,
+            out: &out,
+            session_id: &session_id,
+            commit: &commit,
+            suite: suite.as_deref(),
+            command: &command,
+            exit_code,
+            executed_at: &executed_at,
+            tool: &tool,
+            tool_version: tool_version.as_deref(),
+            repo: repo.as_deref(),
+            repo_root: repo_root.as_deref(),
             graph: graph.as_deref(),
             format: &format,
             protected_raw_artifacts,

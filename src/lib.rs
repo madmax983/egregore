@@ -23,6 +23,9 @@ pub mod claude_code;
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
 pub mod codex;
+/// Capture `cargo llvm-cov` runs as citable verification-domain
+/// `CoverageReport` records (issue #230).
+pub mod coverage_capture;
 /// Owning-Cargo-package attribution for code-graph facts (issue #117).
 pub mod crate_attribution;
 /// Acceptance-criterion verification-coverage census (issue #115).
