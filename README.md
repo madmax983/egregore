@@ -24,118 +24,57 @@ cargo build --release
 
 The release binary lands at `target/release/egregore.exe` (and `eg.exe` as a short alias). During development, substitute `cargo run --` for `egregore`.
 
-### 3. Scan your codebase
+### 3. Bootstrap your repository with `eg init` (recommended)
 
-Point `scan` at any repository. It parses every supported source file — `.rs` (Rust), `.py` (Python), `.ts`/`.tsx` (TypeScript), and `.go` (Go) — with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, REFERENCES, CONTAINS). (`MENTIONS` is a reserved edge label that no current language extractor emits; resolved usage is recorded as `REFERENCES`. See [PRD schema](docs/prd/0001-codebase-knowledge-graph.md).)
-
-For Rust, `CALLS` edges are resolved **across files inside the scanned repository** by a
-deterministic repo-wide resolution pass (issue #152): a call site whose name matches exactly
-one in-repo definition gets a `"resolution":"resolved"` edge, a name matching several in-repo
-definitions gets an edge to every candidate labeled `"ambiguous"`, and a call with no in-repo
-definition is recorded against a `Diagnostic` node labeled `"unresolved"` rather than dropped
-or bound to an invented symbol. The resolution boundary is a documented contract: in-repo
-cross-file resolution **yes**; cross-crate targets, trait dynamic dispatch, macro-expanded
-call sites, and generic monomorphization **no** (see
-[docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)).
+One command takes you from a fresh clone to a fully queryable structural +
+semantic index:
 
 ```powershell
-egregore scan . --out graph.jsonl
-egregore inspect graph.jsonl
-# records: 4386   nodes: 1353   edges: 3033   tombstones: 0   diagnostics: 599
+egregore init . --data-dir .egregore
 ```
 
-#### Scoping and Ignore Rules
+`eg init` runs the whole capture pipeline in-process and prints a
+machine-readable JSON bootstrap report:
 
-When run in a Git repository root, `eg scan` automatically scopes the scan to **Git-tracked files only** (both committed and staged changes in the Git index). It honors `.gitignore` rules (including nested gitignores and negation `!`) by ignoring any untracked or ignored files.
-
-If there are unsupported, untracked, or ignored files, the scan reports the count of skipped files for each supported language to `stderr`:
-```
-Skipped 3 .rs, 1 .py, 1 .ts/.tsx, 1 .go files by ignore rules
-```
-
-To list the skipped files in your repository, you can use Git:
-- **Ignored files:** `git ls-files --others --ignored --exclude-standard`
-- **Untracked files:** `git ls-files --others --exclude-standard`
-
-If the target path is not a Git repository root, `eg scan` falls back to a filesystem walk that walks all files under the directory but hardcodes skipping `.git` and `target` directories.
-
-
-### 4. Ingest into AletheiaDB (structural index)
+1. **`scan_tree`** — parses the current working tree with Tree-sitter
+   (`.rs`, `.py`, `.ts`/`.tsx`, `.go`) into a deterministic JSONL graph
+2. **`ingest_tree`** — ingests it into the embedded store **with semantic
+   embeddings by default** (384-dimensional vectors for every file and
+   symbol node)
+3. **`scan_history`** — replays Git history **read-only**; your working
+   tree, `HEAD`, and Git state are never mutated
+4. **`ingest_history`** — ingests the history graph into the same store
 
 ```powershell
-egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
+egregore init . --data-dir .egregore
+# {
+#   "command": "init",
+#   "status": "rebuilt",
+#   "stages": [ {"name": "scan_tree", "status": "completed", ...}, ... ],
+#   "records": { "total": 1801, "per_domain": { "code": 1801 } },
+#   "semantics": { "present": true, "model": { "name": "sentence-transformers/all-MiniLM-L6-v2", ... } },
+#   "snapshot": { "head": "a1b2c3d4…", "dirty": false },
+#   "store_state": "complete"
+# }
 ```
 
-This writes the graph into a local AletheiaDB store. The store is self-contained in `.egregore/` and does not require a running server.
+Notes:
 
-To confirm what landed — totals plus per-domain, per-kind, and per-schema-version
-counts grouped by trust class — inspect the store directly, with no daemon
-(issue #125, the daemon-free analog of `eg inspect --daemon`):
+- **Embeddings are on by default.** The model (~90 MB) downloads automatically
+  on first use. If generation is unavailable, `init` continues structurally
+  and says so loudly in the report (`semantics.skipped_reason`,
+  `store_state: "structural_only"`) — pass `--no-embed` to skip deliberately.
+- **Idempotent.** A second `init` on an unchanged repository converges to a
+  no-op: exit code 3, `status: "already_current"`, nothing rebuilt.
+- **History is optional.** In a non-Git directory the history stages are
+  skipped with recorded reasons and the tree store stays fully queryable.
 
-```powershell
-egregore inspect --data-dir .egregore
-# {"records":4386,"nodes":1353,"edges":3033,...,"source":{"data_dir":".egregore","mode":"embedded"}}
-egregore inspect --data-dir .egregore --format text
-```
+See [docs/cli/init.md](docs/cli/init.md) for the stage sequence, exit codes
+(0/1/2/3), the full report schema, and the partial-store guarantees.
 
-The read is strictly read-only and the JSON line is byte-identical across runs
-on an unchanged store. See [docs/cli/inspect.md](docs/cli/inspect.md) for the
-documented JSON contract.
+### 4. Query
 
-### 5. Verify setup before semantic work (`eg doctor`)
-
-Before the semantic embedding step, run the setup preflight to confirm this machine
-has the tools and permissions needed for the next steps:
-
-```powershell
-egregore doctor .
-```
-
-Exit 0 means the structural workflow (scan, ingest) is ready. `semantic_ready: true`
-in the JSON output means Python and the embedding model cache are also in place and
-you can skip to step 7. Consult the `next_command` field in the output for the
-shortest path forward.
-
-```powershell
-# Human-readable version
-egregore doctor . --format text
-```
-
-> **Note:** `eg doctor` is a _setup_ preflight — it runs before ingest and checks
-> whether your local tools and permissions are correct. It is distinct from the
-> post-ingest semantic index readiness report (issue #71), which checks whether an
-> already-ingested store has adequate embedding coverage. See
-> [docs/cli/doctor.md](docs/cli/doctor.md) for the full check matrix, exit codes,
-> and the distinction between the two reports.
-
-### 6. Download the embedding model (first time only)
-
-The semantic search feature uses `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, ~90 MB). Rust's TLS stack may not share your OS certificate store, so the most reliable way to prime the cache is via Python:
-
-```powershell
-pip install -U sentence-transformers
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
-```
-
-This downloads the model to `~/.cache/huggingface/hub/`, where Rust's `hf-hub` will find it on subsequent runs. You only need to do this once per machine.
-
-### 7. Ingest with semantic embeddings
-
-```powershell
-egregore ingest graph.jsonl --adapter embedded --data-dir .egregore-semantic --embed
-# Generating embeddings for 650 file/symbol nodes…
-# attempted: 4386   succeeded: 4386   failed: 0
-```
-
-The `--embed` flag generates a 384-dimensional dense vector for every file and symbol node and stores it in AletheiaDB's HNSW vector index. The store at `.egregore-semantic/` supports both structural and semantic queries.
-
-`--embed` also records **which model produced the index** (provider, name, version, dimension, content hash). `eg query semantic` refuses to answer when the query embedder's identity does not match it — two different models can share a dimension, so a dimension check alone would let a model swap or a version bump return a cosine ranking computed across incompatible vector spaces as a confident answer. Read the recorded identity with `eg inspect --data-dir .egregore-semantic`; the refusal contract and the re-ingest workflow are in [`docs/cli/semantic-index-identity.md`](docs/cli/semantic-index-identity.md).
-
-> **Tip:** Use a separate `--data-dir` for the embedded store so you can keep a fast structural-only store alongside the larger semantic one.
-
-### 8. Query
-
-**Structural queries** (exact name, file, or drift — works with or without `--embed`):
+**Structural queries** (exact name, file, or drift — work with or without embeddings):
 
 ```powershell
 # Find a symbol by fully-qualified name
@@ -154,13 +93,13 @@ egregore query symbol daemon::handle_query --data-dir .egregore --at <commit-sha
 egregore query symbol handle_query --data-dir .egregore --repo owner/name
 ```
 
-**Semantic queries** (natural language — requires `--embed` store):
+**Semantic queries** (natural language — needs the embedded store):
 
 ```powershell
 # Default output is JSON; pass --format text for human-readable lines
-egregore query semantic "write nodes to database storage" --data-dir .egregore-semantic
-egregore query semantic "error handling and budget limits" --data-dir .egregore-semantic --limit 5
-egregore query semantic "temporal history git commit tracking" --data-dir .egregore-semantic --format text
+egregore query semantic "write nodes to database storage" --data-dir .egregore
+egregore query semantic "error handling and budget limits" --data-dir .egregore --limit 5
+egregore query semantic "temporal history git commit tracking" --data-dir .egregore --format text
 ```
 
 Agent-citable JSON result (stable fields: `record_id`, `score`, `name`, `repo_relative_path`, `span`):
@@ -179,9 +118,98 @@ history::git_output score=0.4610 @ src/history.rs:312
 
 The semantic index finds code by **meaning**, not by name. Querying `"write nodes to database storage"` surfaces `EmbeddedAletheiaSink::write_record` even though none of those words appear in the function name.
 
+The embedding step also records **which model produced the index** (provider, name, version, dimension, content hash). `eg query semantic` refuses to answer when the query embedder's identity does not match it — two different models can share a dimension, so a dimension check alone would let a model swap or a version bump return a cosine ranking computed across incompatible vector spaces as a confident answer. Read the recorded identity with `eg inspect --data-dir .egregore`; the refusal contract and the re-ingest workflow are in [`docs/cli/semantic-index-identity.md`](docs/cli/semantic-index-identity.md).
+
 See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no-result exit codes, and operator actions.
 
-### 9. Wire the MCP server into your agent
+### 5. Manual alternative (multi-step)
+
+`eg init` is the recommended path. The multi-step sequence below builds the
+identical store when you need finer control — inspecting an intermediate
+graph, skipping history, or passing flags `init` does not expose:
+
+```powershell
+egregore scan . --out graph.jsonl
+egregore ingest graph.jsonl --adapter embedded --data-dir .egregore --embed
+egregore scan-history . --out history.graph.jsonl
+egregore ingest history.graph.jsonl --adapter embedded --data-dir .egregore
+```
+
+To confirm what landed — totals plus per-domain, per-kind, and per-schema-version
+counts grouped by trust class — inspect the store directly, with no daemon
+(issue #125, the daemon-free analog of `eg inspect --daemon`):
+
+```powershell
+egregore inspect --data-dir .egregore
+# {"records":4386,"nodes":1353,"edges":3033,...,"source":{"data_dir":".egregore","mode":"embedded"}}
+egregore inspect --data-dir .egregore --format text
+```
+
+The read is strictly read-only and the JSON line is byte-identical across runs
+on an unchanged store. See [docs/cli/inspect.md](docs/cli/inspect.md) for the
+documented JSON contract.
+
+#### Scoping and Ignore Rules
+
+When run in a Git repository root, `eg scan` automatically scopes the scan to **Git-tracked files only** (both committed and staged changes in the Git index). It honors `.gitignore` rules (including nested gitignores and negation `!`) by ignoring any untracked or ignored files.
+
+If there are unsupported, untracked, or ignored files, the scan reports the count of skipped files for each supported language to `stderr`:
+```
+Skipped 3 .rs, 1 .py, 1 .ts/.tsx, 1 .go files by ignore rules
+```
+
+To list the skipped files in your repository, you can use Git:
+- **Ignored files:** `git ls-files --others --ignored --exclude-standard`
+- **Untracked files:** `git ls-files --others --exclude-standard`
+
+If the target path is not a Git repository root, `eg scan` falls back to a filesystem walk that walks all files under the directory but hardcodes skipping `.git` and `target` directories.
+
+For Rust, `CALLS` edges are resolved **across files inside the scanned repository** by a
+deterministic repo-wide resolution pass (issue #152): a call site whose name matches exactly
+one in-repo definition gets a `"resolution":"resolved"` edge, a name matching several in-repo
+definitions gets an edge to every candidate labeled `"ambiguous"`, and a call with no in-repo
+definition is recorded against a `Diagnostic` node labeled `"unresolved"` rather than dropped
+or bound to an invented symbol. The resolution boundary is a documented contract: in-repo
+cross-file resolution **yes**; cross-crate targets, trait dynamic dispatch, macro-expanded
+call sites, and generic monomorphization **no** (see
+[docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)).
+
+### 6. Setup preflight (`eg doctor`) and the embedding model
+
+Before the semantic embedding step — or when `init` reports that embedding
+generation was skipped — run the setup preflight to confirm this machine
+has the tools and permissions needed:
+
+```powershell
+egregore doctor .
+```
+
+Exit 0 means the structural workflow (scan, ingest) is ready. `semantic_ready: true`
+in the JSON output means Python and the embedding model cache are also in place.
+Consult the `next_command` field in the output for the shortest path forward.
+
+```powershell
+# Human-readable version
+egregore doctor . --format text
+```
+
+> **Note:** `eg doctor` is a _setup_ preflight — it runs before ingest and checks
+> whether your local tools and permissions are correct. It is distinct from the
+> post-ingest semantic index readiness report (issue #71), which checks whether an
+> already-ingested store has adequate embedding coverage. See
+> [docs/cli/doctor.md](docs/cli/doctor.md) for the full check matrix, exit codes,
+> and the distinction between the two reports.
+
+The semantic search feature uses `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, ~90 MB). `eg init` and `eg ingest --embed` download it automatically on first use. If the download fails, `eg init` continues structurally and says so in the report (`semantics.present: false`, `store_state: "structural_only"`); `eg ingest --embed` instead fails the ingest — re-run it once the model is cached, or bootstrap with `eg init`. Rust's TLS stack may not share your OS certificate store, so the most reliable way to prime the cache ahead of time is via Python:
+
+```powershell
+pip install -U sentence-transformers
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+```
+
+This downloads the model to `~/.cache/huggingface/hub/`, where Rust's `hf-hub` will find it on subsequent runs. You only need to do this once per machine.
+
+### 7. Wire the MCP server into your agent
 
 `eg mcp` is the agent integration path: a stdio MCP server exposing three
 read-only, citation-bearing tools (`inspect_store`, `symbol_context`,

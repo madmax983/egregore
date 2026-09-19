@@ -517,7 +517,16 @@ impl EmbeddedAletheiaSink {
                 {
                     continue;
                 }
-                if self.node_lookup.latest_node(&record_id) != Some(node_id) {
+                // The HNSW vector index is keyed by the physical node version
+                // that carried the vector (the tree batch's non-temporal
+                // versions). History ingest appends temporal versions that
+                // supersede in `latest_node`, which would orphan every vector
+                // and break semantic search after `eg init` (issue #229).
+                // Accept the hit when it is the latest version OR the
+                // non-temporal (working-tree) version of the record.
+                let is_current = self.node_lookup.latest_node(&record_id) == Some(node_id)
+                    || self.node_lookup.non_temporal.get(&record_id).copied() == Some(node_id);
+                if !is_current {
                     continue;
                 }
                 if !seen_record_ids.insert(record_id.clone()) {
@@ -2485,22 +2494,23 @@ impl GraphSink for EmbeddedAletheiaSink {
 
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
         let Some(handle) = self.record_handles.get(record.id()).copied() else {
-            // Write was skipped (Matched); use cleared comparison to stay consistent with the Matched check.
-            return match self.read_back(record.id())? {
-                Some(read_back)
-                    if read_back.with_cleared_producer_started_at()
-                        == record.with_cleared_producer_started_at() =>
-                {
-                    Ok(())
+            // The write was skipped because `expected_record_state` reported
+            // `Matched`. Re-check that exact condition instead of comparing
+            // against `read_back`: one stable ID can name several physical
+            // versions — the history batch re-emits tree edges with temporal
+            // metadata under the same IDs — and `read_back` prefers the
+            // temporal variant, which is not necessarily the version that
+            // matched. Comparing against it spuriously failed verification
+            // for correctly skipped writes on every tree re-ingest that
+            // followed a history ingest.
+            return match self.expected_record_state(record)? {
+                ExpectedRecordState::Matched => Ok(()),
+                ExpectedRecordState::Mismatched | ExpectedRecordState::Missing => {
+                    Err(AdapterError::ReadBack {
+                        record_id: record.id().to_owned(),
+                        message: "record missing after write".to_owned(),
+                    })
                 }
-                Some(_) => Err(AdapterError::ReadBack {
-                    record_id: record.id().to_owned(),
-                    message: "record mismatch".to_owned(),
-                }),
-                None => Err(AdapterError::ReadBack {
-                    record_id: record.id().to_owned(),
-                    message: "record missing after write".to_owned(),
-                }),
             };
         };
 
@@ -7256,6 +7266,71 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_finds_non_temporal_version_after_temporal_reemit() {
+        // Issue #229: `eg init` ingests the tree with embeddings, then replays
+        // history which re-emits the same nodes with temporal metadata. The
+        // HNSW index keys vectors by the tree (non-temporal) versions; the
+        // temporal re-emit must not orphan them from semantic search.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-reemit-semantic-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "reemit"]);
+        let tree_symbol = GraphRecord::symbol(
+            symbol_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 1,
+                start_column: None,
+                end_column: None,
+            },
+            "stable".to_owned(),
+            "reemitted semantic symbol".to_owned(),
+        );
+        let history_symbol = symbol_record(
+            &symbol_id,
+            "reemitted semantic symbol",
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+        );
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&tree_symbol).expect("symbol should be embeddable"),
+            vec![1.0, 0.0],
+        );
+
+        // Tree batch: embedded.
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            sink.write_record(&tree_symbol)
+                .expect("tree symbol should write with an embedding");
+        }
+        // History batch: structural re-emit with temporal metadata, no vectors.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+            sink.write_record(&history_symbol)
+                .expect("temporal re-emit should write");
+        }
+        // Semantic search must still find the symbol via its tree version.
+        {
+            let sink =
+                EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+            let matches = sink
+                .semantic_search(&[1.0, 0.0], 10)
+                .expect("semantic search should succeed");
+            assert!(
+                matches.iter().any(|m| m.record_id == symbol_id),
+                "semantic search should find the symbol after temporal re-emit, got {:?}",
+                matches.iter().map(|m| &m.record_id).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn read_back_until_honors_expired_deadline_before_edge_scan() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -8592,5 +8667,78 @@ mod tests {
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
         assert_eq!(unknown.version.version, future);
+    }
+
+    /// Regression test: re-ingesting the tree batch after a history ingest
+    /// must verify cleanly. The history batch re-emits tree edges (DEFINES,
+    /// CONTAINS) with temporal metadata under the same stable IDs, so a
+    /// store holds two physical versions of one edge ID. On re-ingest the
+    /// tree edge's write is correctly skipped as `Matched`, and verification
+    /// must re-check that `Matched` condition — not compare the tree record
+    /// against `read_back`, which prefers the temporal history version and
+    /// used to fail every such re-ingest with "record mismatch" (this broke
+    /// `eg init` rebuilds and any `eg ingest` of a changed tree after a
+    /// history ingest).
+    #[test]
+    fn tree_reingest_after_history_ingest_verifies_skipped_edges() {
+        use crate::adapters::ingest_records;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tree-history-reingest-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+
+        let tree_edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "defines edge".to_owned(),
+        );
+        let history_edge = tree_edge.clone().with_temporal(temporal_observed(
+            "deadbeef",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+        ));
+        assert_eq!(
+            tree_edge.id(),
+            history_edge.id(),
+            "history replay re-emits tree edges under the same stable ID"
+        );
+
+        let tree_batch = vec![
+            file_record(&file_id, "file"),
+            current_symbol_record(&symbol_id, "symbol", 10),
+            tree_edge,
+        ];
+        // The history batch re-emits the same edge with temporal metadata.
+        let history_batch = vec![history_edge];
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let tree_report = ingest_records(&tree_batch, &mut sink);
+        assert_eq!(
+            tree_report.failed, 0,
+            "tree batch should ingest cleanly: {:?}",
+            tree_report.failures
+        );
+        let history_report = ingest_records(&history_batch, &mut sink);
+        assert_eq!(
+            history_report.failed, 0,
+            "history batch should ingest cleanly: {:?}",
+            history_report.failures
+        );
+
+        // Re-ingest the unchanged tree batch, as `eg init` does on rebuild:
+        // the edge write is skipped as Matched and verification must pass.
+        // Drop the first sink to release the exclusive write lease.
+        drop(sink);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+        let reingest_report = ingest_records(&tree_batch, &mut sink);
+        assert_eq!(
+            reingest_report.failed, 0,
+            "tree re-ingest after history ingest should verify cleanly: {:?}",
+            reingest_report.failures
+        );
+        assert_eq!(reingest_report.succeeded, tree_batch.len());
     }
 }

@@ -46,6 +46,8 @@ mod implementors;
 mod import;
 mod index;
 mod ingest;
+#[cfg(feature = "embedded-aletheiadb")]
+mod init;
 mod inspect;
 mod lanes;
 mod lifeline;
@@ -148,6 +150,8 @@ pub(crate) use implementors::*;
 pub(crate) use import::*;
 pub(crate) use index::*;
 pub(crate) use ingest::*;
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) use init::*;
 pub(crate) use inspect::*;
 pub(crate) use lanes::*;
 pub(crate) use lifeline::*;
@@ -715,7 +719,7 @@ pub(crate) enum Commands {
     /// verification) completely untouched.
     ///
     /// Shortest workflow (`docs/cli/refresh.md`):
-    ///   1. `eg scan <repo> --out g.jsonl && eg ingest g.jsonl --adapter embedded --data-dir .egregore`
+    ///   1. `eg init <repo> --data-dir .egregore`
     ///   2. (edit source files …)
     ///   3. `eg refresh <repo> --data-dir .egregore`
     ///   4. `eg query symbol <name> --data-dir .egregore`
@@ -859,6 +863,59 @@ pub(crate) enum Commands {
     Index {
         /// Graph JSONL path to index.
         graph: PathBuf,
+    },
+    /// Bootstrap a repository into an embedded store in one command (issue #229).
+    ///
+    /// Runs the current-tree scan, embedded ingest with semantic embeddings
+    /// (on by default; pass `--no-embed` to skip loudly), Git history replay,
+    /// and history ingest end-to-end into a single embedded `AletheiaDB` data
+    /// directory, then prints a machine-readable bootstrap report. This is
+    /// the one-command equivalent of the manual onboarding sequence:
+    /// `eg scan` → `eg ingest --embed` → `eg scan-history` → `eg ingest`.
+    /// Fully offline except for the one-time embedding-model download.
+    ///
+    /// History replay reads Git objects read-only and never mutates the
+    /// working tree or Git state. Intermediate graph JSONL lives in a system
+    /// temporary directory, never in the repository being bootstrapped.
+    ///
+    /// Idempotent: a second `init` on an unchanged repository converges to a
+    /// no-op, exits with code 3, and reports `status: "already_current"`.
+    /// Optional stages (embeddings, history) may be skipped or partially
+    /// fail — the report names every stage and the store stays non-corrupt —
+    /// while required-stage failures print the report before exiting 1.
+    /// A refusal before any write (capacity preflight, embedding-index
+    /// identity conflict) exits 2 and leaves the store untouched.
+    ///
+    /// See `docs/cli/init.md`.
+    Init {
+        /// Working-tree path of the repository to bootstrap.
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Embedded `AletheiaDB` data directory to bootstrap into.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format for the bootstrap report.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+        /// Skip semantic embedding generation (loudly reported in the report).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        no_embed: bool,
+        /// Embedding model identifier.
+        ///
+        /// Precedence: `--embed-model` \> `[embeddings].model` in
+        /// `egregore.toml` \> built-in default. The resolved model is recorded
+        /// in the store's vector-index identity; a store whose index was
+        /// built by a different model refuses the bootstrap (issue #104).
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed_model: Option<String>,
+        /// Override the auto-detected repository identity.
+        #[arg(long)]
+        repo_id_override: Option<String>,
+        /// Include raw literal values in scanned records.
+        #[arg(long)]
+        raw_literals: bool,
     },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
@@ -5413,6 +5470,32 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
         ),
         Commands::Validate { graph, format } => validate_cmd(&graph, format),
         Commands::Index { graph } => index_cmd(&graph),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Init {
+            repo_path,
+            data_dir,
+            format,
+            #[cfg(feature = "embeddings")]
+            no_embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
+            repo_id_override,
+            raw_literals,
+        } => init_cmd(&InitArgs {
+            repo_path,
+            data_dir,
+            format,
+            #[cfg(feature = "embeddings")]
+            no_embed,
+            #[cfg(feature = "embeddings")]
+            embed_model,
+            repo_id_override,
+            raw_literals,
+        }),
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        Commands::Init { .. } => anyhow::bail!(
+            "eg init requires the embedded-aletheiadb feature (re-run without --no-default-features)"
+        ),
         Commands::Ingest {
             graph,
             adapter,
