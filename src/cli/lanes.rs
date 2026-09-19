@@ -182,6 +182,21 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "conflicts",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &[
+                "verification_evidence",
+                "agent_verified",
+                "agent_unverified",
+                "agent_contradicted",
+                "other",
+            ],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
+    (
         "diagnostics",
         LaneStatic {
             store_mode: StoreMode::Structural,

@@ -13,6 +13,7 @@ mod change_impact;
 mod changes;
 mod churn;
 mod config;
+mod conflicts;
 mod context;
 mod coupling;
 mod cycles;
@@ -115,6 +116,7 @@ pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
 pub(crate) use config::*;
+pub(crate) use conflicts::*;
 pub(crate) use context::*;
 pub(crate) use coupling::*;
 pub(crate) use cycles::*;
@@ -3545,6 +3547,50 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Surface recorded contradicting observations on a shared code target (issue #232).
+    ///
+    /// Returns the pairs of records joined by a recorded `CONTRADICTS` edge —
+    /// agent-authored claims (`Observation` / `Decision` / `Failure`), recorded
+    /// verification executions (`TestRun` / `CommandRun` / …), and user-context
+    /// records (`Preference` / `WorkflowRule` / …) — that share a cited code
+    /// target within the resolved scope. Deterministic code facts are never a
+    /// party; a `CONTRADICTS` edge touching one is skipped whole.
+    ///
+    /// The scope resolves in precedence order: exact record ID, exact symbol
+    /// name, repo-relative file path (covering the symbols the file defines),
+    /// or a segment-aware subsystem path prefix. A conflict where any party
+    /// was superseded by a later record is marked `resolved` and excluded
+    /// unless `--include-resolved` is passed. This lane only *surfaces*
+    /// recorded disagreements — it never infers them and never adjudicates;
+    /// a passing verification shown as a `verification` party against a
+    /// recorded `Failure` belief is the operator's adjudication lead.
+    ///
+    /// Output is deterministic and byte-stable across repeated runs on an
+    /// unchanged store. Exit 0 with an empty `conflicts` list when the scope
+    /// is valid but has no recorded conflicts; exit 2 (`no_match`) when the
+    /// scope resolves to nothing; exit 1 on malformed input.
+    ///
+    /// Documented in `docs/cli/conflicts.md` and `docs/cli/query.md`.
+    Conflicts {
+        /// Symbol name / record ID, repo-relative file path, or subsystem
+        /// path prefix the conflicts are scoped to.
+        scope: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict scope resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Include conflicts where a party was superseded by a later record.
+        #[arg(long)]
+        include_resolved: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Partition the public API surface into verification-covered / uncovered (issue #109).
     ///
     /// Joins the issue #213 externally-reachable public surface with the
@@ -6317,6 +6363,149 @@ pub(crate) struct FailureHistoryResponse<'a> {
 }
 
 // ---------------------------------------------------------------------------
+/// One side of a recorded disagreement, projected to a bounded payload-safe
+/// view (issue #232). A party is an agent-authored claim, a verification
+/// execution, or a user-context record — never a deterministic code fact.
+#[derive(Serialize)]
+pub(crate) struct ConflictPartyJson<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    /// Lane provenance class: `agent_authored` / `verification` / `user_context`.
+    party_class: &'static str,
+    /// Derived trust class label (issue #114 vocabulary).
+    trust_class: &'static str,
+    /// Which end of the `CONTRADICTS` edge the party sits on: `source` / `target`.
+    edge_role: &'static str,
+    /// The record's own ID first, then its evidence-link target IDs (sorted,
+    /// deduplicated). Non-empty by construction.
+    citation_handles: Vec<&'a str>,
+    /// Non-empty author label (`agent_id[:session_id]`, the deciding user for
+    /// user-context records, else a stable `unknown_agent` marker).
+    author: String,
+    /// Verification `executed_at`, else agent `observed_at`, else a stable
+    /// `unknown_time` marker — never an invented timestamp.
+    observed_at: &'a str,
+    /// Recorded confidence, else a stable `unspecified` marker.
+    confidence: &'a str,
+    /// The shared scope target handle both parties were filtered by.
+    target_handle: &'a str,
+    /// Bounded payload-safe summary (agent-authored text is hashed, AC9).
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
+}
+
+/// One recorded disagreement: the unordered party pair joined by recorded
+/// `CONTRADICTS` edge(s) (issue #232).
+#[derive(Serialize)]
+pub(crate) struct ConflictJson<'a> {
+    /// Unordered pair key `[min_record_id, max_record_id]` — the stable
+    /// conflict identity.
+    conflict_id: [&'a str; 2],
+    /// Recorded `CONTRADICTS` edge IDs joining the pair, sorted.
+    edge_ids: Vec<&'a str>,
+    /// The two parties, in record-ID order.
+    parties: Vec<ConflictPartyJson<'a>>,
+    /// True when any party was superseded by a later live record.
+    resolved: bool,
+    /// Superseding record IDs (sorted); empty when unresolved.
+    resolved_by: Vec<&'a str>,
+}
+
+/// One stable machine-readable conflicts diagnostic.
+#[derive(Serialize)]
+pub(crate) struct ConflictDiagnosticJson<'a> {
+    code: &'a str,
+    detail: &'a str,
+}
+
+/// Deterministic tallies for a conflicts answer.
+#[derive(Serialize)]
+pub(crate) struct ConflictsCountsJson {
+    contradicts_edges_considered: usize,
+    conflicts_found: usize,
+    conflicts_returned: usize,
+    conflicts_resolved_excluded: usize,
+    edges_skipped_ineligible_party: usize,
+}
+
+impl From<&query::ConflictsCounts> for ConflictsCountsJson {
+    fn from(counts: &query::ConflictsCounts) -> Self {
+        Self {
+            contradicts_edges_considered: counts.contradicts_edges_considered,
+            conflicts_found: counts.conflicts_found,
+            conflicts_returned: counts.conflicts_returned,
+            conflicts_resolved_excluded: counts.conflicts_resolved_excluded,
+            edges_skipped_ineligible_party: counts.edges_skipped_ineligible_party,
+        }
+    }
+}
+
+/// Full conflicts response envelope (issue #232).
+#[derive(Serialize)]
+pub(crate) struct ConflictsResponse<'a> {
+    ok: bool,
+    scope: &'a str,
+    /// `symbol` / `file` / `subsystem`.
+    scope_kind: &'static str,
+    target_handle: &'a str,
+    /// Every code record ID the scope resolved to (sorted).
+    target_ids: Vec<&'a str>,
+    include_resolved: bool,
+    conflicts: Vec<ConflictJson<'a>>,
+    /// Number of conflicts returned (mirrors `conflicts.len()`).
+    count: usize,
+    counts: ConflictsCountsJson,
+    diagnostics: Vec<ConflictDiagnosticJson<'a>>,
+}
+
+impl PrintText for ConflictsResponse<'_> {
+    fn as_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "conflicts for scope '{}' ({}): {} conflict(s)",
+            self.scope, self.scope_kind, self.count
+        );
+        for conflict in &self.conflicts {
+            let _ = writeln!(
+                out,
+                "conflict [{}, {}] resolved: {}",
+                conflict.conflict_id[0], conflict.conflict_id[1], conflict.resolved
+            );
+            if !conflict.resolved_by.is_empty() {
+                let _ = writeln!(out, "  resolved_by: {}", conflict.resolved_by.join(", "));
+            }
+            let _ = writeln!(out, "  edges: {}", conflict.edge_ids.join(", "));
+            for party in &conflict.parties {
+                let _ = writeln!(
+                    out,
+                    "  - {} [{}, {}] {}",
+                    party.edge_role, party.party_class, party.trust_class, party.record_id
+                );
+                let _ = writeln!(
+                    out,
+                    "    kind: {} author: {} observed_at: {} confidence: {}",
+                    party.kind, party.author, party.observed_at, party.confidence
+                );
+                let _ = writeln!(
+                    out,
+                    "    target: {} citations: {}",
+                    party.target_handle,
+                    party.citation_handles.join(", ")
+                );
+                let _ = writeln!(out, "    summary: {}", party.summary);
+            }
+        }
+        for diagnostic in &self.diagnostics {
+            let _ = writeln!(out, "note: {}: {}", diagnostic.code, diagnostic.detail);
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
 
@@ -6359,6 +6548,26 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_churn_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Conflicts {
+            scope,
+            graph,
+            data_dir,
+            repo,
+            include_resolved,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_conflicts_cmd(
+                &records,
+                &scope,
+                &index,
+                selected.as_deref(),
+                include_resolved,
+                format,
+            )
         }
         QuerySubcommand::Recency {
             graph,

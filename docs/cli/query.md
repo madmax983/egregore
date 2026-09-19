@@ -49,6 +49,8 @@ eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query conflicts <SCOPE> --graph <PATH>   [--repo <SELECTOR>] [--include-resolved] [--format json|text]
+eg query conflicts <SCOPE> --data-dir <DIR> [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 ```
 
@@ -164,6 +166,12 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+- `eg query conflicts` — surface **recorded contradicting observations on a
+  shared code target**: the pairs of agent claims, verification executions,
+  and user-context records joined by `CONTRADICTS` edges within a symbol /
+  file / subsystem scope. Code facts are never a party; superseded conflicts
+  are marked `resolved` and excluded unless `--include-resolved` is passed
+  ([conflicts.md](conflicts.md), issue #232).
 - `eg query session` — **retrace one agent session's** deterministic footprint
   (files/symbols touched), agent-authored claims (observations, failures),
   produced artifacts, and linked verification evidence, with a
