@@ -73,6 +73,7 @@ mod repair_cmd;
 mod resolve_frames;
 mod scan;
 mod scan_logs;
+mod schema;
 mod schema_constraints;
 mod semantic;
 mod subsystem;
@@ -179,6 +180,7 @@ pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
+pub(crate) use schema::*;
 pub(crate) use schema_constraints::*;
 pub(crate) use semantic::*;
 pub(crate) use subsystem::*;
@@ -1412,6 +1414,23 @@ pub(crate) enum Commands {
         #[arg(long)]
         embed: bool,
     },
+    /// Emit JSON Schemas for the persisted graph record contracts (issue #226).
+    ///
+    /// `eg schema export` prints draft 2020-12 documents derived from the Rust
+    /// types in `src/ir.rs`, one per addressable `(domain, kind,
+    /// schema_version)` tuple. `eg schema list` lists the addressable tuples.
+    /// See `docs/cli/schema.md`.
+    ///
+    /// Exit codes:
+    ///   0 — schemas emitted.
+    ///   1 — I/O error writing `--out` files.
+    ///   2 — unknown domain/kind/version tuple (machine-readable JSON error on
+    ///       stderr).
+    Schema {
+        /// Schema action.
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
 }
 
 /// Subcommands for `import`.
@@ -1523,6 +1542,41 @@ pub(crate) enum ConfigAction {
     /// `egregore.toml` (or `null` when absent), every value, and where each
     /// value came from (`"config"` or `"default"`). See `docs/cli/config.md`.
     Show,
+}
+
+/// Subcommands for `schema` (issue #226).
+#[derive(Debug, Subcommand)]
+pub(crate) enum SchemaAction {
+    /// Emit JSON Schema (draft 2020-12) documents for persisted record contracts.
+    ///
+    /// With `--domain`/`--kind`/`--schema-version`, emits only the matching
+    /// contracts; a single matching document prints as one JSON object,
+    /// several print as a JSON array. Without filters, emits every
+    /// addressable `(domain, kind, schema_version)` tuple as a JSON array.
+    /// With `--out <dir>`, writes one
+    /// `<domain>.<record_type>.<kind>.v<version>.schema.json` file per tuple
+    /// and prints a JSON summary instead of the documents.
+    Export {
+        /// Restrict to one domain (e.g. `codegraph`).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Restrict to one node kind or edge label (e.g. `Symbol`, `CALLS`).
+        /// `"Tombstone"` selects tombstone contracts.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to one schema version.
+        #[arg(long)]
+        schema_version: Option<u32>,
+        /// Write one file per tuple into this directory instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// List every addressable `(domain, kind, schema_version)` contract as JSON.
+    List {
+        /// Restrict to one domain.
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 /// Subcommands for `query`.
@@ -5358,6 +5412,20 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Config { action } => match action {
             ConfigAction::Show => config_show(),
+        },
+        Commands::Schema { action } => match action {
+            SchemaAction::Export {
+                domain,
+                kind,
+                schema_version,
+                out,
+            } => schema_export_cmd(
+                domain.as_deref(),
+                kind.as_deref(),
+                schema_version,
+                out.as_deref(),
+            ),
+            SchemaAction::List { domain } => schema_list_cmd(domain.as_deref()),
         },
         Commands::ScanLogs {
             log_path,

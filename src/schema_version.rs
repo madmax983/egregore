@@ -397,6 +397,7 @@ pub(crate) fn domain_for_edge_label(label: &str) -> &'static str {
             | EdgeLabel::FrameResolvesTo
             | EdgeLabel::EmittedDuring,
         ) => Domain::Log.as_str(),
+        Some(EdgeLabel::MergedAs | EdgeLabel::ReferencesTask) => Domain::Project.as_str(),
         Some(label) if label.is_codegraph_topology_label() => Domain::CodeGraph.as_str(),
         Some(_) | None => Domain::AgentMemory.as_str(),
     }

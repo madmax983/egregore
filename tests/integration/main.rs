@@ -134,6 +134,7 @@ mod route_registration;
 mod scan_coverage;
 mod scan_logs;
 mod schema_constraints;
+mod schema_export;
 mod schema_versioning;
 mod scip_export;
 mod semantic_confidence;

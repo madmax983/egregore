@@ -113,6 +113,8 @@ pub mod repo_evict;
 pub mod review_coverage;
 /// Commit-time schema-constraint evaluation and declaration (issue #486).
 pub mod schema_constraints;
+/// JSON Schema (draft 2020-12) export for persisted record contracts (issue #226).
+pub mod schema_export;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// SCIP code-intelligence export (issue #233).

@@ -27,7 +27,6 @@ embedded-aletheiadb = [
     "aletheiadb/semantic-temporal",
     "aletheiadb/semantic-diagnostics",
     "dep:rmcp",
-    "dep:schemars",
     "dep:tokio",
 ]
 embeddings = ["embedded-aletheiadb", "aletheiadb/embeddings", "dep:tokio"]
@@ -85,7 +84,9 @@ scip = "0.9"
 # validation); cargo unifies this with scip's transitive pin.
 protobuf = "3.7"
 rmcp = { version = "1.7.0", features = ["macros", "server", "transport-io"], optional = true }
-schemars = { version = "1", optional = true }
+# Unconditional: JSON Schema export (issue #226) derives `JsonSchema` on the
+# IR types, and `eg schema export` must work under --no-default-features.
+schemars = "1"
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 ureq = "2.12"
 tree-sitter = "0.26.8"

@@ -1181,6 +1181,23 @@ pub fn build_observation_records(
         authored_by_edge,
     ];
 
+    // Stamp the producer envelope (issue #226): the observation writer is a
+    // first-class producer and its records must carry the envelope.
+    let producer = evidence_producer();
+    let records = records
+        .into_iter()
+        .map(|mut record| {
+            match &mut record {
+                crate::ir::GraphRecord::Node { producer: p, .. }
+                | crate::ir::GraphRecord::Edge { producer: p, .. }
+                | crate::ir::GraphRecord::Tombstone { producer: p, .. } => {
+                    *p = Some(producer.clone());
+                }
+            }
+            record
+        })
+        .collect();
+
     Ok(EvidenceWriteOutcome {
         evidence_handle: obs_id.clone(),
         record_id: obs_id,

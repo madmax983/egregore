@@ -84,7 +84,7 @@ pub const PRODUCER_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 ///
 /// Present when the binary was built from a git checkout; absent when built from
 /// a clean release tarball. Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EgregoreGit {
     /// Short or full git commit SHA of the build tree.
     pub commit: String,
@@ -97,7 +97,7 @@ pub struct EgregoreGit {
 /// Adding a new variant is **additive** per `docs/schema/schema-versioning.md`.
 /// Removing or renaming a variant requires a producer-envelope `/v2/` bump.
 /// Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerKind {
     /// Tree-sitter-based code graph extractor (`scan` command).
@@ -161,7 +161,7 @@ impl ProducerKind {
 /// every record in that batch carries the same `Producer` value.
 ///
 /// Documented in `docs/schema/producer-version.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Producer {
     /// Semver string from `CARGO_PKG_VERSION`.
     pub egregore_version: String,
@@ -278,7 +278,7 @@ impl Default for Graph {
 /// Inline content is bounded by a 16 KiB ceiling.  When the output exceeds
 /// that ceiling the `inline` field MUST be `None` and the full content is
 /// referenced by `hash` only.  Documented in `docs/schema/verification.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputHandle {
     /// Inline content (None when bytes exceeds the 16 KiB ceiling).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,7 +294,7 @@ pub struct OutputHandle {
 /// The patch may be inlined only under the 16 KiB ceiling; otherwise the path
 /// points at protected artifact storage. Documented in
 /// `docs/schema/agent-actions.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PatchHandle {
     /// Path to the stored patch bytes.
     pub path: String,
@@ -344,7 +344,7 @@ pub struct NodeProvenance {
 /// How a `Repository` node's stable ID was determined.
 ///
 /// Documented in `docs/schema/repository-identity.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
     /// Derived from the lowest-name-sorted git remote URL (normalized).
@@ -364,7 +364,7 @@ pub enum IdentitySource {
 /// `NodeKind::Repository` nodes; absent on all other node kinds.
 ///
 /// Documented in `docs/schema/repository-identity.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryIdentityPayload {
     /// How the stable ID was computed.
     pub identity_source: IdentitySource,
@@ -388,7 +388,7 @@ pub struct RepositoryIdentityPayload {
 /// of a repo and non-Git directories serialize as `no_git`; a repository with no
 /// commits yet serializes as `unborn_head`. Documented in
 /// `docs/schema/source-snapshot.md` (issue #82).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SnapshotHead {
     /// HEAD resolved to a commit; carries the full commit SHA.
@@ -411,7 +411,7 @@ pub enum SnapshotHead {
 /// override path as `valid_time`, so it never breaks JSONL determinism.
 ///
 /// Documented in `docs/schema/source-snapshot.md` (issue #82).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceSnapshotPayload {
     /// HEAD commit state at scan time.
     pub head: SnapshotHead,
@@ -435,7 +435,7 @@ pub struct SourceSnapshotPayload {
 /// strictly local: never the output of `cargo metadata`, a network lookup, or
 /// a build. All fields are additive per `docs/schema/schema-versioning.md §2`
 /// and are never identity inputs beyond those hashed into the record ID.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DependencyDeclarationPayload {
     /// `[package].name` of the manifest declaring this dependency.
     pub declaring_package: String,
@@ -482,7 +482,7 @@ pub struct DependencyDeclarationPayload {
 /// `docs/schema/schema-versioning.md §2` and carry no paths or PII — only
 /// lowercased extensions, counts, and the named language scope — so the node is
 /// redaction-exempt deterministic code-graph data.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScanCoveragePayload {
     /// Total files the walk visited (files under excluded directories are never
     /// counted). Equals `files_indexed + sum(skipped_by_extension.values())`
@@ -530,7 +530,7 @@ pub struct ScanCoveragePayload {
 /// and carry no paths or PII — only the window kind, counts, commit SHAs, the
 /// operator-supplied revs, and a UTC instant — so the node is redaction-exempt
 /// deterministic code-graph data, like [`ScanCoveragePayload`].
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HistoryReplayWindowPayload {
     /// The window form: `"count"`, `"since"`, or `"range"`.
     pub window: String,
@@ -577,7 +577,7 @@ pub struct HistoryReplayWindowPayload {
 ///
 /// No field ever carries raw log text beyond a bounded, post-redaction excerpt
 /// (`template_excerpt` / `event_excerpt`).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "log_kind", rename_all = "snake_case")]
 pub enum LogPayload {
     /// A captured log source artifact.
@@ -615,7 +615,7 @@ impl LogPayload {
 /// Identity inputs (`docs/schema/log-graph.md`): `repository_id`,
 /// `source_relative_path`, `source_artifact_hash`. `line_count`, capture time,
 /// and producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogSourcePayload {
     /// Repository-relative path of the captured log file.
     pub source_relative_path: String,
@@ -642,7 +642,7 @@ pub struct LogSourcePayload {
 /// Identity inputs: `repository_id`, `fingerprint_algorithm`,
 /// `normalized_template`, `severity`. `occurrence_count`, `first_seen`,
 /// `last_seen`, capture time, and producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErrorSignaturePayload {
     /// Fingerprint algorithm identifier (`template-v1`).
     pub fingerprint_algorithm: String,
@@ -677,7 +677,7 @@ pub struct ErrorSignaturePayload {
 /// Identity inputs: `repository_id`, `signature_id`, `event_valid_time`,
 /// `event_content_hash`. `source_line`, byte offsets, capture time, and
 /// producer are non-identity.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogEventPayload {
     /// Bounded, post-redaction excerpt of the exemplar line(s).
     pub event_excerpt: String,
@@ -703,7 +703,7 @@ pub struct LogEventPayload {
 /// makes two distinct sources observing the same signature/hour mint DISTINCT
 /// bucket IDs (summed downstream), while a genuine rescan of identical bytes
 /// mints the SAME bucket ID (collapsed as a duplicate).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogOccurrenceBucketPayload {
     /// RFC 3339 UTC start of the bucket, floored to the hour.
     pub bucket_start: String,
@@ -745,7 +745,7 @@ pub struct LogOccurrenceBucketPayload {
 /// resolves the triple at write time.
 ///
 /// Documented in docs/schema/agent-memory.md.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceLink {
     /// Stable record ID of the cited graph node.
     /// Either this or the triple fields below must be present.
@@ -776,7 +776,7 @@ pub struct EvidenceLink {
 ///
 /// All fields omitted means "global to this operator"; see
 /// `docs/schema/user-context.md`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct UserContextScope {
     /// Optional repository identity from the repository-identity domain.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,7 +796,7 @@ pub struct UserContextScope {
 ///
 /// The fields are flattened into node JSON so the schema remains a normal
 /// record shape instead of a nested metadata blob.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct UserContextFields {
     /// Candidate durable rule body.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -983,7 +983,9 @@ impl UserContextFields {
 ///
 /// Adding this optional field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CallResolution {
     /// Exactly one in-repo definition matched the call site.
@@ -1047,7 +1049,9 @@ impl CallResolution {
 ///
 /// Adding this optional edge field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameResolution {
     /// Exactly one in-repo `Symbol` matched the frame.
@@ -1109,7 +1113,9 @@ impl FrameResolution {
 ///
 /// Adding this optional edge field is additive per
 /// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CorrelationBasis {
     /// The signature's `LogSource` artifact hash equals a `CommandRun` output
@@ -1159,7 +1165,7 @@ impl CorrelationBasis {
 /// repository-relative form (or a generalized external-toolchain form) so no
 /// absolute host path or username enters the graph. Frames are **non-identity**:
 /// they never participate in the `ErrorSignature` record-ID hash preimage.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StackFrame {
     /// Zero-based position of the frame in the captured backtrace.
     pub frame_index: u32,
@@ -1180,7 +1186,7 @@ pub struct StackFrame {
 // These are None for all code-graph nodes, so the memory cost is only
 // paid by agent-memory records that actually populate them.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 pub enum GraphRecord {
     /// A graph node.
@@ -3267,7 +3273,9 @@ impl GraphRecord {
 }
 
 /// Git and bitemporal provenance attached to history-backed records.
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Hash,
+)]
 pub struct TemporalMetadata {
     /// Git commit SHA that supplied the valid-time source tree.
     pub git_commit: String,
@@ -3325,7 +3333,7 @@ impl Domain {
 }
 
 /// Structured identity for an embedding model.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingModel {
     /// Provider boundary that supplied the model.
     pub provider: String,
@@ -3340,7 +3348,7 @@ pub struct EmbeddingModel {
 }
 
 /// Semantic distance metric used by a drift measurement.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
     /// One minus cosine similarity.
@@ -3364,7 +3372,7 @@ impl MetricKind {
 }
 
 /// Selection policy that caused a drift record to be emitted.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionBasis {
     /// Emit every drift whose score is greater than or equal to the threshold.
@@ -3388,7 +3396,7 @@ impl SelectionBasis {
 }
 
 /// Structured metadata for a semantic drift measurement.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDriftMetadata {
     /// Structured embedding model identity.
     pub embedding_model: EmbeddingModel,
@@ -3417,7 +3425,9 @@ pub struct SemanticDriftMetadata {
 impl Eq for SemanticDriftMetadata {}
 
 /// Initial graph node kinds.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "PascalCase")]
 pub enum NodeKind {
     /// Indexed repository root.
@@ -3734,7 +3744,9 @@ impl NodeKind {
 }
 
 /// Initial graph edge labels.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EdgeLabel {
     /// Hierarchical ownership.
@@ -4109,7 +4121,9 @@ impl EdgeLabel {
 /// `DELETE`, `PATCH`, `HEAD`, `OPTIONS`); `path` is the first string-literal
 /// argument inside the attribute (`/api/v1/contacts`). Additive metadata; never
 /// an identity input.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct RouteAnnotation {
     /// HTTP method, uppercased from the attribute identifier.
     pub method: String,
@@ -4137,7 +4151,9 @@ pub const MAX_DEPRECATION_STRING_LEN: usize = 256;
 /// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
 /// input**: the stable ID preimage is unchanged, so stamping deprecation
 /// facts never moves a record ID.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct DeprecationMark {
     /// The `since` value from `#[deprecated(since = "...")]`, bounded to
     /// [`MAX_DEPRECATION_STRING_LEN`] chars and passed through redaction
@@ -4161,14 +4177,18 @@ pub struct DeprecationMark {
 /// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
 /// input**: the stable ID preimage is unchanged, so stamping entry-point
 /// facts never moves a record ID.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct EntryPointMark {
     /// Which closed entry-point class the item belongs to.
     pub kind: EntryPointKind,
 }
 
 /// Closed vocabulary of recognized non-call entry points (issue #240).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryPointKind {
     /// `#[test]` / `#[bench]`, or a path attribute ending in `::test` /
@@ -4197,7 +4217,9 @@ pub enum EntryPointKind {
 /// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
 /// input**: the stable ID preimage is unchanged, so stamping a role never
 /// moves a record ID.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolRole {
     /// Test code: a test-harness entry, a `#[cfg(test)]`-gated module member,
@@ -4241,7 +4263,9 @@ impl SymbolRole {
 ///
 /// Attribution is nearest-enclosing-manifest directory containment, never proof
 /// the file is compiled into that package.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct CrateAttribution {
     /// Whether an owning package was resolved.
     pub status: CrateAttributionStatus,
@@ -4429,7 +4453,9 @@ impl CrateAttribution {
 }
 
 /// Whether a node resolved to an owning Cargo package (issue #117).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CrateAttributionStatus {
     /// An owning package was resolved; `package_name` and
@@ -4454,7 +4480,9 @@ impl CrateAttributionStatus {
 ///
 /// A CLOSED vocabulary. Each variant is a named, operator-checkable fact about
 /// the manifest tree — never a guess, and never a carrier for raw error text.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CrateAttributionReason {
     /// No `Cargo.toml` sits in any ancestor directory: a stray source file
@@ -4502,7 +4530,9 @@ impl CrateAttributionReason {
 /// non-tree-sitter sources such as GitHub line anchors); an absent field is
 /// UNKNOWN, never "column 0". Columns are coordinates, not identity inputs
 /// (ADR-0004).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct SourceSpan {
     /// Start byte, inclusive.
     pub start_byte: usize,

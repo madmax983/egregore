@@ -58,6 +58,7 @@
 //! importer version and a JSONL `schema_version` bump on all emitted records.
 //! See `docs/adr/codex-field-stability-tiers.md §Upgrade Contract`.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -67,11 +68,34 @@ use crate::{
     error::Result,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
-        agent_memory_stable_id,
+        Producer, ProducerKind, agent_memory_stable_id,
     },
 };
 
 // ── Importer identity ─────────────────────────────────────────────────────────
+
+/// Builds the producer envelope for the Codex importer (issue #226).
+///
+/// The envelope carries the importer and source-format versions per
+/// `docs/schema/producer-version.md` §4.
+fn codex_producer() -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::CodexImporter,
+        producer_components: BTreeMap::from([
+            (
+                "importer_schema_version".to_owned(),
+                IMPORTER_VERSION.to_owned(),
+            ),
+            (
+                "source_format_version".to_owned(),
+                SOURCE_FORMAT_VERSION.to_owned(),
+            ),
+        ]),
+        producer_started_at: crate::PROCESS_STARTED_AT.clone(),
+    }
+}
 
 /// Stable importer identifier embedded in every emitted record.
 pub const IMPORTER_ID: &str = "codex-jsonl";
@@ -728,7 +752,7 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         emit_unknown_event_diagnostic(&mut graph, line_idx, &run_id, &ctx);
     }
 
-    Ok(graph)
+    Ok(graph.stamp_producer(&codex_producer()))
 }
 
 // ── Turn emission ─────────────────────────────────────────────────────────────
