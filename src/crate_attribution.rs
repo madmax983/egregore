@@ -455,6 +455,7 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::DependencyDeclaration
         // A `Change` records that one path changed in one commit, so it names a
         // file and its owning package is meaningful at that commit.

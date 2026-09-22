@@ -105,6 +105,7 @@ const fn domain_of_kind(kind: NodeKind) -> Domain {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow

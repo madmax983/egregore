@@ -65,6 +65,8 @@ mod path;
 // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
 mod who_imports;
 // Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+mod lint_suppressions;
 mod who_constructs;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 mod sessions;
@@ -138,6 +140,8 @@ pub use who_imports::*;
 pub use who_constructs::*;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 pub use sessions::*;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+pub use lint_suppressions::*;
 // Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
 pub use trust::{TrustClass, TrustIndex};
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.

@@ -113,6 +113,8 @@ mod query_trust_audit;
 mod query_undocumented;
 mod query_unreferenced;
 mod query_unsafe_sites;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+mod query_suppressions;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 mod query_blind_spots;
 mod query_unwrap_expect;

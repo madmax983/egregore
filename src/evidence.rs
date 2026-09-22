@@ -636,6 +636,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&["node", "agent", agent_id, agent_kind]);
     GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id,
@@ -768,6 +769,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
     ]);
     GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id,
@@ -1045,6 +1047,7 @@ pub fn build_observation_records(
     // Build the observation node
     let obs_node = GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id: obs_id.clone(),
@@ -1315,6 +1318,7 @@ pub fn build_failure_records(
     // Build the failure node
     let failure_node = GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id: failure_id.clone(),
@@ -1572,6 +1576,7 @@ pub fn build_command_evidence_records(
 
     let cmd_node = GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id: cmd_id.clone(),
@@ -1829,6 +1834,7 @@ pub fn build_artifact_records(
 
     let art_node = GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id: art_id.clone(),
@@ -2059,6 +2065,7 @@ pub fn build_verification_records(
 
     let ver_node = GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id: ver_id.clone(),

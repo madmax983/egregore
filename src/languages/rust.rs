@@ -12,7 +12,8 @@ use crate::{
     fs::SourceFile,
     ir::{
         DeprecationMark, EdgeLabel, EntryPointKind, EntryPointMark, Graph, GraphRecord,
-        MAX_DEPRECATION_STRING_LEN, NodeKind, RouteAnnotation, SourceSpan, SymbolRole, stable_id,
+        LintSuppressionFacts, LintSuppressionScope, MAX_DEPRECATION_STRING_LEN, NodeKind,
+        RouteAnnotation, SourceSpan, SymbolRole, stable_id,
     },
     languages::{
         common::{
@@ -221,6 +222,7 @@ struct RustExtractor<'graph, 'source> {
     facts: FileFacts,
     panic_risk_ordinals: BTreeMap<String, u64>,
     unsafe_site_ordinals: BTreeMap<String, u64>,
+    lint_suppression_ordinals: BTreeMap<String, u64>,
     /// Inline-module segments currently enclosing the walk (out-of-line
     /// `mod x;` declarations do not push here).
     inline_module_stack: Vec<String>,
@@ -306,6 +308,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             facts: FileFacts::default(),
             panic_risk_ordinals: BTreeMap::new(),
             unsafe_site_ordinals: BTreeMap::new(),
+            lint_suppression_ordinals: BTreeMap::new(),
             inline_module_stack: Vec::new(),
             inline_path_override_depth: 0,
             test_scope_depth: 0,
@@ -333,6 +336,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "macro_invocation" => self.extract_macro_diagnostic(node),
             "call_expression" => self.extract_call_expression(node),
             "line_comment" | "block_comment" => self.extract_comment_markers(node),
+            "attribute_item" | "inner_attribute_item" => self.extract_lint_suppression(node),
             "function_signature_item" => self.extract_function_signature(node),
             "unsafe_block" => self.extract_unsafe_block(node),
             _ => self.walk_children(node),
@@ -1984,6 +1988,73 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let disambiguator = self
             .unsafe_site_ordinals
             .entry(site_kind.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
+    /// Visits an `attribute_item` (`#[...]`) or `inner_attribute_item`
+    /// (`#![...]`): emits one deterministic `LintSuppression` record when the
+    /// attribute is an `allow` suppression (issue #227), then keeps walking
+    /// so any nested content (e.g. comments inside the token tree) is
+    /// visited exactly as before.
+    ///
+    /// Detection is purely AST-shaped — the attribute's own name leaf must be
+    /// exactly `allow` — so `#[allow(...)]` text inside line comments, doc
+    /// comments, block comments, and string literals can never match (those
+    /// are `line_comment` / `block_comment` / `string_literal` nodes, never
+    /// attribute nodes).
+    fn extract_lint_suppression(&mut self, node: Node<'_>) {
+        if let Some(facts) = lint_suppression_from_attribute(node, self.source) {
+            self.emit_lint_suppression(node, facts);
+        }
+        self.walk_children(node);
+    }
+
+    /// Emits one deterministic `LintSuppression` record plus the `CONTAINS`
+    /// edge from the owning file. The record's `name` carries the closed
+    /// scope string (`item` / `module` / `crate`); the sorted lint names and
+    /// the adjacent justification-comment signal ride the additive
+    /// [`LintSuppressionFacts`] payload.
+    fn emit_lint_suppression(&mut self, node: Node<'_>, facts: LintSuppressionFacts) {
+        let scope = facts.scope.as_str();
+        let disambiguator = self.next_lint_suppression_disambiguator(scope);
+        let id = stable_id(&[
+            "node",
+            "lint_suppression",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            scope,
+            &disambiguator.to_string(),
+        ]);
+        self.graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::LintSuppression,
+                self.file.repo_relative_path.clone(),
+                span(node),
+                scope.to_owned(),
+                "rust",
+                format!("Rust #[allow(...)] lint suppression ({scope} scope)"),
+            )
+            .with_lint_suppression(facts),
+        );
+        self.add_edge(
+            EdgeLabel::Contains,
+            self.file_id.to_owned(),
+            id,
+            format!(
+                "{} contains #[allow(...)] lint suppression",
+                self.file.repo_relative_path
+            ),
+        );
+    }
+
+    fn next_lint_suppression_disambiguator(&mut self, scope: &str) -> u64 {
+        let disambiguator = self
+            .lint_suppression_ordinals
+            .entry(scope.to_owned())
             .or_default();
         let current = *disambiguator;
         *disambiguator += 1;
@@ -3774,6 +3845,160 @@ fn deprecation_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<
         }
     }
     Some(DeprecationMark { since, note })
+}
+
+/// Parses one `attribute_item` (`#[...]`) or `inner_attribute_item`
+/// (`#![...]`) into [`LintSuppressionFacts`] when the attribute's own name
+/// leaf is exactly `allow` (issue #227). Tree-sitter node walking only,
+/// never regex.
+///
+/// Only the attribute's own name is compared: `#[cfg_attr(test,
+/// allow(dead_code))]` never matches (the name leaf is `cfg_attr`), and the
+/// bare forms `#[allow]` / `#[allow()]` carry no lint names, so they emit no
+/// suppression fact. Returns `None` for every other attribute.
+fn lint_suppression_from_attribute(node: Node<'_>, source: &str) -> Option<LintSuppressionFacts> {
+    if !matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+        return None;
+    }
+    let attribute = first_descendant_of_kind(node, "attribute")?;
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if leaf != "allow" {
+        return None;
+    }
+    let arguments = attribute.child_by_field_name("arguments")?;
+    let mut lints = Vec::new();
+    collect_suppression_lint_names(arguments, source, &mut lints);
+    if lints.is_empty() {
+        return None;
+    }
+    lints.sort();
+    lints.dedup();
+    Some(LintSuppressionFacts {
+        lints,
+        scope: suppression_scope(node),
+        has_justification: suppression_has_adjacent_comment(node),
+        is_inner: node.kind() == "inner_attribute_item",
+    })
+}
+
+/// Collects lint-path tokens from an `allow` attribute's `arguments` token
+/// tree. Inside a token tree the grammar lexes paths flat — `clippy::all`
+/// arrives as `identifier("clippy")`, `::`, `identifier("all")`, not as one
+/// `scoped_identifier` — so consecutive `identifier (:: identifier)*`
+/// runs are re-joined into a single lint path (`clippy::too_many_arguments`);
+/// any other token (`,`, parens, literals, …) terminates the current path.
+/// A `scoped_identifier` node, where the grammar does produce one, still
+/// contributes as a whole. Recurses into nested token trees. Non-path tokens
+/// contribute nothing.
+fn collect_suppression_lint_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    fn flush(current: &mut Option<String>, out: &mut Vec<String>) {
+        if let Some(path) = current.take() {
+            // A trailing `::` with no final segment is not a lint path.
+            let path = path.strip_suffix("::").unwrap_or(&path);
+            if !path.is_empty() {
+                out.push(path.to_owned());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    let mut current: Option<String> = None;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let name = node_source(child, source).trim();
+                if name.is_empty() {
+                    continue;
+                }
+                match current.as_mut() {
+                    Some(path) if path.ends_with("::") => path.push_str(name),
+                    // Defensive: an identifier that does not continue a `::`
+                    // run starts a fresh path rather than gluing onto one.
+                    _ => {
+                        flush(&mut current, out);
+                        current = Some(name.to_owned());
+                    }
+                }
+            }
+            "::" => {
+                if let Some(path) = current.as_mut()
+                    && !path.ends_with("::")
+                {
+                    path.push_str("::");
+                }
+                // A stray leading `::` with no path under construction is
+                // not a lint name; ignore it.
+            }
+            "scoped_identifier" => {
+                flush(&mut current, out);
+                let name = node_source(child, source).trim();
+                if !name.is_empty() {
+                    out.push(name.to_owned());
+                }
+            }
+            "token_tree" => {
+                flush(&mut current, out);
+                collect_suppression_lint_names(child, source, out);
+            }
+            _ => flush(&mut current, out),
+        }
+    }
+    flush(&mut current, out);
+}
+
+/// Resolves the closed [`LintSuppressionScope`] for an allow-attribute node
+/// (issue #227): an outer `attribute_item` always annotates the following
+/// item (`item`); an `inner_attribute_item`'s scope is the item that owns the
+/// block it opens — the module when that item is a `mod_item` (`module`),
+/// the crate root (`crate`), or any other enclosing item (`item`, e.g. a
+/// function body carrying `#![allow(..)]`).
+fn suppression_scope(node: Node<'_>) -> LintSuppressionScope {
+    if node.kind() == "attribute_item" {
+        return LintSuppressionScope::Item;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "source_file" => return LintSuppressionScope::Crate,
+            "mod_item" => return LintSuppressionScope::Module,
+            "function_item" | "closure_expression" | "const_item" | "static_item"
+            | "struct_item" | "enum_item" | "trait_item" | "impl_item" | "type_item"
+            | "foreign_mod_item" => return LintSuppressionScope::Item,
+            _ => current = parent.parent(),
+        }
+    }
+    // Unreachable for a well-formed parse (every inner attribute sits inside
+    // a `source_file`); a closed fallback keeps the lane total.
+    LintSuppressionScope::Item
+}
+
+/// `true` when a line or block comment (doc comments included) sits
+/// immediately adjacent to the attribute node: a comment ending on the line
+/// directly above it (preceding justification), or a comment starting on the
+/// same line the attribute ends on (trailing justification). Tree-sitter
+/// points only — no text scanning — so a comment separated by a blank line
+/// is not adjacent.
+fn suppression_has_adjacent_comment(node: Node<'_>) -> bool {
+    let attr_start_row = node.start_position().row;
+    let attr_end_row = node.end_position().row;
+    if let Some(prev) = node.prev_sibling()
+        && matches!(prev.kind(), "line_comment" | "block_comment")
+        && prev.end_position().row + 1 == attr_start_row
+    {
+        return true;
+    }
+    if let Some(next) = node.next_sibling()
+        && matches!(next.kind(), "line_comment" | "block_comment")
+        && next.start_position().row == attr_end_row
+    {
+        return true;
+    }
+    false
 }
 
 /// Maps one attribute item's source text onto a closed entry-point class
@@ -6374,6 +6599,158 @@ pub mod inner {
             stamped,
             vec![("draw".to_owned(), None)],
             "a shadowed binding must not carry stale dispatch metadata"
+        );
+    }
+
+    // ── Lint-suppression inventory (issue #227, RED) ────────────────────────
+
+    /// Seeded fixture exercising every acceptance decoy: `#[allow(` inside a
+    /// line comment, a doc comment, and a block comment; inside a string
+    /// literal; an inner `#![allow]` at crate scope and at module scope; a
+    /// multi-lint form; and adjacent justification comments (preceding for
+    /// the module suppression, trailing for the item suppression).
+    const LINT_SUPPRESSION_FIXTURE: &str = "#![allow(unused_imports)]\n\n// Line-comment decoy: #[allow(dead_code)] is never extracted.\n/// Doc-comment decoy: #[allow(dead_code)] is never extracted.\n/** Block-comment decoy: #[allow(dead_code)] is never extracted. */\n\nmod inner {\n    // Silence the noisy lint while the API settles.\n    #![allow(clippy::too_many_arguments, dead_code)]\n\n    // This string is not a suppression: \"#[allow(dead_code)]\".\n    const MARKER: &str = \"#[allow(dead_code)]\";\n\n    #[allow(unused_variables)] // trailing justification for the fn\n    fn helper() {}\n}\n";
+
+    /// Extracts every `LintSuppression` payload in `source` as
+    /// `(sorted lints, scope, has_justification, is_inner)`, in walk order.
+    fn lint_suppressions_at(source: &str, path: &str) -> Vec<(Vec<String>, String, bool, bool)> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::LintSuppression,
+                    lint_suppression: Some(facts),
+                    ..
+                } => Some((
+                    facts.lints.clone(),
+                    facts.scope.as_str().to_owned(),
+                    facts.has_justification,
+                    facts.is_inner,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lint_suppression_fixture_yields_exactly_three_suppressions() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            rows.len(),
+            3,
+            "comment, doc-comment, and string-literal decoys must never extract: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_crate_scope_without_justification() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec!["unused_imports".to_owned()],
+                "crate".to_owned(),
+                false,
+                true
+            )),
+            "inner #![allow] at the crate root is crate scope: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_module_scope_multi_lint_sorted_with_justification() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec![
+                    "clippy::too_many_arguments".to_owned(),
+                    "dead_code".to_owned()
+                ],
+                "module".to_owned(),
+                true,
+                true
+            )),
+            "multi-lint forms sort and dedup; the preceding comment justifies: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_item_scope_trailing_comment_justifies() {
+        let rows = lint_suppressions_at(LINT_SUPPRESSION_FIXTURE, "src/lib.rs");
+        assert!(
+            rows.contains(&(
+                vec!["unused_variables".to_owned()],
+                "item".to_owned(),
+                true,
+                false
+            )),
+            "outer #[allow] is item scope; the same-line comment justifies: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_dedups_and_sorts_lint_names() {
+        let rows = lint_suppressions_at(
+            "#[allow(dead_code, clippy::all, dead_code)]\nfn f() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                vec!["clippy::all".to_owned(), "dead_code".to_owned()],
+                "item".to_owned(),
+                false,
+                false
+            )],
+            "duplicate lint names collapse; rustc and clippy lints sort together"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_ignores_cfg_attr_wrapped_allows() {
+        let rows = lint_suppressions_at(
+            "#[cfg_attr(test, allow(dead_code))]\n#[derive(Debug)]\nstruct S;\n",
+            "src/lib.rs",
+        );
+        assert!(
+            rows.is_empty(),
+            "only the attribute's own name may match: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn lint_suppression_bare_and_empty_allow_emit_nothing() {
+        for source in ["#[allow]\nfn f() {}\n", "#[allow()]\nfn f() {}\n"] {
+            let rows = lint_suppressions_at(source, "src/lib.rs");
+            assert!(
+                rows.is_empty(),
+                "an allow silencing no lints is no suppression fact: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lint_suppression_blank_line_breaks_comment_adjacency() {
+        let rows = lint_suppressions_at(
+            "// A comment with a blank line between it and the attribute.\n\n#[allow(dead_code)]\nfn f() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                vec!["dead_code".to_owned()],
+                "item".to_owned(),
+                false,
+                false
+            )],
+            "only an immediately adjacent comment is a justification signal"
         );
     }
 }

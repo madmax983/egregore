@@ -1279,6 +1279,16 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deprecated: Option<DeprecationMark>,
+        // ── Lint-suppression facts (issue #227) ───────────────────────────
+        /// `#[allow(...)]` / `#![allow(...)]` suppression facts on a
+        /// `LintSuppression` node (issue #227): presence means an allow
+        /// attribute was detected over the Tree-sitter attribute AST; the
+        /// payload carries the sorted lint names, the closed attribute
+        /// scope, and the adjacent justification-comment signal. Additive
+        /// per `docs/schema/schema-versioning.md §2`; never an identity
+        /// input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lint_suppression: Option<LintSuppressionFacts>,
         // ── Entry-point facts (issue #240) ────────────────────────────────
         /// Non-call entry-point facts on a `Symbol` node (issue #240):
         /// presence means the item is a recognized non-call entry point — a
@@ -1877,6 +1887,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            lint_suppression: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2010,6 +2021,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            lint_suppression: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2142,6 +2154,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            lint_suppression: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2279,6 +2292,7 @@ impl GraphRecord {
             content_signature: None,
             route: None,
             deprecated: None,
+            lint_suppression: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2764,6 +2778,32 @@ impl GraphRecord {
     pub const fn deprecated(&self) -> Option<&DeprecationMark> {
         match self {
             Self::Node { deprecated, .. } => deprecated.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches lint-suppression facts (`#[allow(...)]` / `#![allow(...)]`)
+    /// to a `LintSuppression` node (issue #227). The value is additive
+    /// metadata per `docs/schema/schema-versioning.md` §2 and MUST NOT
+    /// contribute to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_lint_suppression(mut self, facts: LintSuppressionFacts) -> Self {
+        if let Self::Node {
+            lint_suppression, ..
+        } = &mut self
+        {
+            *lint_suppression = Some(facts);
+        }
+        self
+    }
+
+    /// Returns the lint-suppression facts when present (issue #227).
+    #[must_use]
+    pub const fn lint_suppression(&self) -> Option<&LintSuppressionFacts> {
+        match self {
+            Self::Node {
+                lint_suppression, ..
+            } => lint_suppression.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -3456,6 +3496,13 @@ pub enum NodeKind {
     /// block. The `name` field carries the closed site kind
     /// (`block` / `fn` / `impl`).
     UnsafeSite,
+    /// Deterministic `#[allow(...)]` / `#![allow(...)]` lint-suppression site
+    /// (issue #227): one node per allow attribute, detected over the
+    /// Tree-sitter attribute AST. The `name` field carries the closed scope
+    /// (`item` / `module` / `crate`) and the additive [`LintSuppressionFacts`]
+    /// payload carries the sorted lint names plus the adjacent
+    /// justification-comment signal.
+    LintSuppression,
     /// Directly-declared Cargo manifest dependency (issue #180).
     DependencyDeclaration,
     /// File-level scan-coverage summary (issue #135): one node per full
@@ -3610,7 +3657,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 62] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3620,6 +3667,7 @@ impl NodeKind {
         Self::PanicRiskSite,
         Self::DebtMarker,
         Self::UnsafeSite,
+        Self::LintSuppression,
         Self::DependencyDeclaration,
         Self::ScanCoverage,
         Self::HistoryReplayWindow,
@@ -3687,6 +3735,7 @@ impl NodeKind {
             Self::PanicRiskSite => "PanicRiskSite",
             Self::DebtMarker => "DebtMarker",
             Self::UnsafeSite => "UnsafeSite",
+            Self::LintSuppression => "LintSuppression",
             Self::DependencyDeclaration => "DependencyDeclaration",
             Self::ScanCoverage => "ScanCoverage",
             Self::HistoryReplayWindow => "HistoryReplayWindow",
@@ -4166,6 +4215,67 @@ pub struct DeprecationMark {
     /// Absent when the attribute did not carry a note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// Closed vocabulary of attribute-application scopes for a lint suppression
+/// (issue #227).
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LintSuppressionScope {
+    /// An outer `#[allow(...)]` on an item, or a `#![allow(...)]` inside a
+    /// non-module body (e.g. a function body): the suppression applies to the
+    /// annotated item.
+    Item,
+    /// A `#![allow(...)]` at the start of a module body: the suppression
+    /// applies to the whole module.
+    Module,
+    /// A `#![allow(...)]` at the crate root (`source_file`): the suppression
+    /// applies to the whole crate.
+    Crate,
+}
+
+impl LintSuppressionScope {
+    /// Returns the serialized scope string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Item => "item",
+            Self::Module => "module",
+            Self::Crate => "crate",
+        }
+    }
+}
+
+/// Deterministic `#[allow(...)]` / `#![allow(...)]` suppression facts carried
+/// by a `LintSuppression` node (issue #227).
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: the stable ID preimage is unchanged, so stamping suppression facts
+/// never moves a record ID.
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct LintSuppressionFacts {
+    /// Lint names silenced by the attribute, sorted and deduplicated
+    /// (`dead_code`, `clippy::too_many_arguments`, …). Multi-lint forms
+    /// contribute one entry per lint-path token; non-path tokens in the
+    /// attribute's token tree contribute nothing.
+    pub lints: Vec<String>,
+    /// The closed attribute-application scope.
+    pub scope: LintSuppressionScope,
+    /// Whether an adjacent comment (a line or block comment — doc comments
+    /// included — ending on the line directly above the attribute, or on the
+    /// same line after it) was detected at extraction time. A justification
+    /// *signal*, never a verdict on whether the suppression is warranted.
+    pub has_justification: bool,
+    /// Whether the attribute is an inner `#![allow(...)]` (`true`) or an
+    /// outer `#[allow(...)]` (`false`). The query lane keys its
+    /// enclosing-symbol rule on this: an outer attribute annotates the
+    /// *following* item (nearest following symbol), while an inner attribute
+    /// applies to the *enclosing* item (innermost containing symbol).
+    pub is_inner: bool,
 }
 
 /// Non-call entry-point classification for one `Symbol` node (issue #240).

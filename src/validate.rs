@@ -186,6 +186,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             // `File` CONTAINS `UnsafeSite` attributes unsafe-surface sites to
             // their owning file (issue #222).
             NodeKind::UnsafeSite,
+            // `File` CONTAINS `LintSuppression` attributes lint-suppression
+            // annotations to their owning file (issue #227).
+            NodeKind::LintSuppression,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
         // `IMPORTS` has two shapes: the extractor's containment-shaped

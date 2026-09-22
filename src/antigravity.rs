@@ -182,6 +182,7 @@ fn make_node(
     };
     GraphRecord::Node {
         deprecated: None,
+        lint_suppression: None,
         entry_point: None,
         role: None,
         id,

@@ -113,6 +113,8 @@ mod verify_scan;
 mod trust_audit;
 // Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
 mod diagram;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+mod suppressions;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -224,6 +226,8 @@ pub(crate) use verify_scan::*;
 pub(crate) use trust_audit::*;
 // Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use diagram::*;
+// Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use suppressions::*;
 
 use std::{
     collections::BTreeMap,
@@ -4469,6 +4473,68 @@ pub(crate) enum QuerySubcommand {
     /// no ingested store, no project config. Works on a fresh clone with an
     /// empty data dir.
     Lanes {
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory `#[allow(...)]` / `#![allow(...)]` lint suppressions (issue #227).
+    ///
+    /// Returns every Tree-sitter-detected lint-suppression attribute as a
+    /// citable debt row: a stable record ID, the sorted lint-name list
+    /// (`dead_code`, `clippy::too_many_arguments`, …), the closed scope
+    /// (`item` / `module` / `crate`), the adjacent justification-comment
+    /// signal, the repo-relative file/span handle, and the enclosing symbol
+    /// handle (explicit `null` when no symbol encloses the attribute —
+    /// always at crate scope, and at module scope where the module is a
+    /// `Module` record rather than a `Symbol`). `#[allow(` text inside line
+    /// comments, doc comments, block comments, and string literals is never
+    /// returned; detection runs over the attribute AST, not the raw text.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that a suppression of a lint set exists at a span — never that the
+    /// suppression is warranted. Strictly read-only; byte-identical across
+    /// runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — suppressions returned (or the scoped slice contains zero
+    ///       suppressions, with `empty_reason: "no_suppressions_in_scope"`).
+    ///   1 — malformed prefix, ambiguous commit prefix, or unknown/ambiguous
+    ///       repository selector.
+    ///   2 — scope not found (`scope_not_found`) or unknown commit
+    ///       (`unknown_commit`).
+    ///
+    /// Documented in `docs/cli/suppressions.md`.
+    Suppressions {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -9477,6 +9543,46 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             query_session_cmd(&records, &id_or_handle, format)
         }
         QuerySubcommand::Lanes { format } => query_lanes_cmd(format),
+        QuerySubcommand::Suppressions {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane (issue #227): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_lint_suppressions_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
     }
 }
 

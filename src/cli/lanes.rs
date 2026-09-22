@@ -647,6 +647,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "suppressions",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
         "task",
         LaneStatic {
             store_mode: StoreMode::Structural,

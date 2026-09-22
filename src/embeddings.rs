@@ -179,6 +179,7 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift

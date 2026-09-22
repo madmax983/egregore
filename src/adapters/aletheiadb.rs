@@ -20,9 +20,9 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         CrateAttribution, DeprecationMark, EdgeLabel, EmbeddingModel, EntryPointMark, EvidenceLink,
-        GraphRecord, IdentitySource, MetricKind, NodeKind, Producer, RouteAnnotation,
-        SelectionBasis, SemanticDriftMetadata, SourceSpan, SymbolRole, TemporalMetadata,
-        UserContextFields,
+        GraphRecord, IdentitySource, LintSuppressionFacts, MetricKind, NodeKind, Producer,
+        RouteAnnotation, SelectionBasis, SemanticDriftMetadata, SourceSpan, SymbolRole,
+        TemporalMetadata, UserContextFields,
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
@@ -2685,6 +2685,7 @@ impl EmbeddedAletheiaSink {
             content_signature,
             route,
             deprecated,
+            lint_suppression,
             entry_point,
             role,
             crate_attribution,
@@ -2825,6 +2826,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(mark)
         {
             builder = builder.insert("deprecated_json", json.as_str());
+        }
+        // Lint-suppression facts (issue #227). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(facts) = lint_suppression
+            && let Ok(json) = serde_json::to_string(facts)
+        {
+            builder = builder.insert("lint_suppression_json", json.as_str());
         }
         // Entry-point facts (issue #240). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3627,6 +3635,19 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<DeprecationMark>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("deprecated_json invalid: {e}")))?,
+            // Lint-suppression facts (issue #227). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            lint_suppression: optional_str_property(
+                record_id,
+                "lint_suppression_json",
+                node.get_property("lint_suppression_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<LintSuppressionFacts>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("lint_suppression_json invalid: {e}"))
+            })?,
             // Entry-point facts (issue #240). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make
@@ -5206,6 +5227,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift

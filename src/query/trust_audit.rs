@@ -131,6 +131,7 @@ pub const fn node_trust_class(kind: NodeKind) -> NodeTrustClass {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
+        | NodeKind::LintSuppression
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow
@@ -462,7 +463,7 @@ mod tests {
     fn node_classes_partition_every_node_kind() {
         // The classifier is total over `NodeKind::ALL`: the no-wildcard match
         // fails to compile on a new variant, and this pins the documented
-        // partition counts (21 code-fact + 40 agent-authored).
+        // partition counts (22 code-fact + 40 agent-authored).
         let mut code_fact = 0_usize;
         let mut agent_authored = 0_usize;
         for kind in NodeKind::ALL {
@@ -471,8 +472,8 @@ mod tests {
                 NodeTrustClass::AgentAuthored => agent_authored += 1,
             }
         }
-        assert_eq!(NodeKind::ALL.len(), 61);
-        assert_eq!(code_fact, 21, "documented code-fact count");
+        assert_eq!(NodeKind::ALL.len(), 62);
+        assert_eq!(code_fact, 22, "documented code-fact count");
         assert_eq!(agent_authored, 40, "documented agent-authored count");
         assert_eq!(node_trust_class(NodeKind::Symbol), NodeTrustClass::CodeFact);
         assert_eq!(

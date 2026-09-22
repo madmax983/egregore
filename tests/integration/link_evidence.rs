@@ -222,6 +222,7 @@ fn make_agent_memory_node(
         embedding_model: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
+        lint_suppression: None,
     }
 }
 

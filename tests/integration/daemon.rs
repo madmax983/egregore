@@ -4574,6 +4574,9 @@ fn all_node_kinds_have_documented_schema() {
         // Unsafe-surface sites (issue #222), documented in
         // docs/cli/unsafe-sites.md.
         | NodeKind::UnsafeSite
+        // Lint-suppression inventory (issue #227), documented in
+        // docs/cli/suppressions.md.
+        | NodeKind::LintSuppression
         // Declared Cargo dependencies (issue #180), documented in
         // docs/cli/manifest-deps.md.
         | NodeKind::DependencyDeclaration

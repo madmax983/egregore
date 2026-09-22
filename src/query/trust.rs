@@ -334,6 +334,7 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::PanicRiskSite
             | NodeKind::DebtMarker
             | NodeKind::UnsafeSite
+            | NodeKind::LintSuppression
             | NodeKind::DependencyDeclaration
             | NodeKind::ScanCoverage
             | NodeKind::HistoryReplayWindow
