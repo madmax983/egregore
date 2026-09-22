@@ -13,8 +13,8 @@ use crate::{
     fs::SourceFile,
     identity,
     ir::{
-        EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, SnapshotHead, SourceSnapshotPayload,
-        TemporalMetadata, stable_id,
+        EdgeLabel, Graph, GraphRecord, HistoryReplayTipPayload, NodeKind, Producer, ProducerKind,
+        SnapshotHead, SourceSnapshotPayload, TemporalMetadata, stable_id,
     },
     repository_record_from_identity, scan_source_text_records, validate_repository,
 };
@@ -362,6 +362,987 @@ fn resolve_rev(repo_root: &Path, rev: &str, flag: &str) -> Result<String> {
     Ok(sha)
 }
 
+/// The per-run stamps on the `Repository` node (issue #224).
+struct RepositoryStamp {
+    /// The stamped `Repository` node (source snapshot + inferred valid time).
+    node: GraphRecord,
+    /// HEAD's committer date (or wall-clock fallback when HEAD is unborn),
+    /// anchoring the producer envelope and every inferred valid time.
+    transaction_time: String,
+    /// Full SHA of HEAD when it resolves to a commit.
+    head_sha: Option<String>,
+}
+
+/// Stamps the source snapshot on the `Repository` node (issue #224 extraction).
+///
+/// Without the snapshot, `eg freshness --graph history.graph.jsonl` and
+/// `--at` queries with `--repo-path` always report `unknown` (BB1 / PR #186
+/// follow-up); the stamped HEAD lets freshness detect `stale_head` after new
+/// commits are added.
+///
+/// History replay reads only committed Git objects, so the snapshot records
+/// the committed HEAD state with `dirty = false` (TT1): uncommitted
+/// working-tree edits never enter the replayed graph, and stamping them dirty
+/// would leave the store permanently `stale_dirty` even after the edits are
+/// reverted with HEAD unchanged. Current working-tree dirtiness is detected
+/// live at freshness-check time instead.
+///
+/// The transaction time is derived from HEAD's committer date, not
+/// wall-clock, so repeated scans of an unchanged repository stay byte-stable
+/// across a seconds boundary (TT3 / the history replay determinism contract).
+fn repository_stamp(
+    repo_root: &Path,
+    repository_id: &str,
+    repository: GraphRecord,
+) -> Result<RepositoryStamp> {
+    let head = identity::working_tree_head(repo_root);
+    let head_sha = match &head {
+        SnapshotHead::Commit { sha } => Some(sha.clone()),
+        _ => None,
+    };
+    let transaction_time = match &head_sha {
+        Some(sha) => commit_metadata(repo_root, sha)?.committed_at,
+        None => PROCESS_STARTED_AT.clone(),
+    };
+    let snapshot = SourceSnapshotPayload {
+        head,
+        dirty: false,
+        repository_id: repository_id.to_owned(),
+        scanned_at: transaction_time.clone(),
+    };
+    let node = repository
+        .with_valid_time_inferred(&transaction_time)
+        .with_source_snapshot(snapshot);
+    Ok(RepositoryStamp {
+        node,
+        transaction_time,
+        head_sha,
+    })
+}
+
+/// Builds the deterministic `HistoryReplay` producer envelope (issue #224
+/// extraction).
+///
+/// `code_graph_producer` sets `producer_started_at` from the wall-clock
+/// `PROCESS_STARTED_AT`, which would make two `scan-history` runs of the same
+/// unchanged repository in separate processes differ (CCC1). History replay
+/// is committed-state-only, so the envelope is anchored to the same
+/// deterministic HEAD-committer transaction time as the snapshot.
+fn history_producer(graph: &Graph, transaction_time: &str) -> Producer {
+    let languages = crate::languages_in_graph(graph);
+    let mut producer = code_graph_producer(&languages);
+    producer.producer_kind = ProducerKind::HistoryReplay;
+    producer.producer_started_at.clear();
+    producer.producer_started_at.push_str(transaction_time);
+    producer
+}
+
+/// Stable ID of the history-replay tip node for a repository (issue #224).
+///
+/// The ID folds in only the repository identity, never the tip SHA: a
+/// resumed replay replaces the previous tip node in place, so every store
+/// holds exactly one tip per repository.
+#[must_use]
+pub fn history_replay_tip_id(repository_id: &str) -> String {
+    stable_id(&["node", "history-replay-tip", repository_id])
+}
+
+/// Builds the `HistoryReplayTip` node and its `Repository CONTAINS` edge for
+/// a replay covering `covered_commit_count` commits and ending at
+/// `tip_commit` (issue #224).
+///
+/// The node mirrors the `HistoryReplayWindow` metadata-node convention
+/// (issue #256): the payload carries the facts, the node's valid time is the
+/// replay's deterministic transaction time, and the edge attributes the tip
+/// to its repository so it is never an orphan.
+fn history_replay_tip_records(
+    repository_id: &str,
+    tip_commit: &GitCommit,
+    covered_commit_count: usize,
+    transaction_time: &str,
+) -> (GraphRecord, GraphRecord) {
+    let tip_id = history_replay_tip_id(repository_id);
+    let payload = HistoryReplayTipPayload {
+        repository_id: repository_id.to_owned(),
+        tip_sha: tip_commit.sha.clone(),
+        covered_commit_count,
+        tip_committed_at: tip_commit.committed_at.clone(),
+    };
+    let summary = format!(
+        "History replay tip for {repository_id}: commit {} ({}), covering {covered_commit_count} commit{}",
+        tip_commit.short_sha(),
+        tip_commit.committed_at,
+        if covered_commit_count == 1 { "" } else { "s" },
+    );
+    let tip_node = GraphRecord::node(
+        tip_id.clone(),
+        NodeKind::HistoryReplayTip,
+        None,
+        None,
+        Some(format!("history replay tip {}", tip_commit.short_sha())),
+        summary,
+    )
+    .with_history_replay_tip(payload)
+    .with_valid_time_inferred(transaction_time);
+    let tip_edge = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repository_id.to_owned(),
+        tip_id,
+        Some("1.0".to_owned()),
+        "Repository contains history replay tip".to_owned(),
+    )
+    .with_valid_time_inferred(transaction_time);
+    (tip_node, tip_edge)
+}
+
+/// A resume frontier for an incremental history replay (issue #224).
+///
+/// Produced by [`history_resume_point`] from a prior full replay's records:
+/// it names the per-repository identity, the stored tip commit, and carries
+/// the prior record set so [`scan_repository_history_resumed`] can merge the
+/// new commits' records with it.
+#[derive(Debug, Clone)]
+pub struct HistoryResumePoint {
+    /// Repository identity the tip belongs to; resume points never cross
+    /// repository identities, even inside a shared multi-repo store.
+    pub repository_id: String,
+    /// Full SHA of the newest commit covered by the prior replay.
+    pub tip_sha: String,
+    /// Number of commits the prior replay covered.
+    pub covered_commit_count: usize,
+    /// The prior replay's record set. Per-run stamps (the `Repository` node,
+    /// the tip node and its edge) are re-derived on resume, so they are
+    /// carried along and replaced rather than pre-stripped.
+    pub prior_records: Vec<GraphRecord>,
+}
+
+/// Outcome of an incremental history replay (issue #224).
+#[derive(Debug)]
+pub struct HistoryResumeOutcome {
+    /// The merged graph: the resumed repository's prior records with fresh
+    /// per-run stamps, plus the new commits' records — byte-identical to a
+    /// full replay's output for that repository. Other repositories'
+    /// records in a shared multi-repo frontier pass through untouched.
+    pub graph: Graph,
+    /// Commits read from Git and replayed in this run.
+    pub processed: usize,
+    /// Commits already covered by the prior replay (its
+    /// `covered_commit_count`).
+    pub skipped: usize,
+    /// Full SHA of the new tip commit (`HEAD` after the replay).
+    pub new_tip_sha: String,
+}
+
+/// Returns the repository identities of all history-replay tips in `records`.
+///
+/// Used to distinguish a foreign frontier (`repository_identity_mismatch`:
+/// the frontier is a valid frontier, but for another repository) from a
+/// frontier with no tip at all (`no_resume_point`).
+#[must_use]
+pub fn history_replay_tip_repository_ids(records: &[GraphRecord]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind,
+            history_replay_tip,
+            ..
+        } = record
+            && *kind == NodeKind::HistoryReplayTip
+            && let Some(tip) = history_replay_tip
+        {
+            let id = tip.repository_id.clone();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Extracts the resume frontier for `repository_id` from a prior replay's
+/// records (issue #224).
+///
+/// Returns `None` when no `HistoryReplayTip` node is `CONTAINS`-attached to
+/// the repository — windowed replays (issue #256) deliberately record no tip,
+/// so a windowed store is never a valid resume frontier, and neither is a
+/// plain `scan` graph.
+#[must_use]
+pub fn history_resume_point(
+    records: &[GraphRecord],
+    repository_id: &str,
+) -> Option<HistoryResumePoint> {
+    let tip_id = history_replay_tip_id(repository_id);
+    let tip = records
+        .iter()
+        .find(|record| record.id() == tip_id)?
+        .history_replay_tip()?;
+    // The tip only counts when it is attached to the repository: a tip node
+    // without the `Repository CONTAINS` edge is not a frontier.
+    let attached = records.iter().any(|record| {
+        matches!(
+            record,
+            GraphRecord::Edge {
+                label: EdgeLabel::Contains,
+                source,
+                target,
+                ..
+            } if source == repository_id && target == &tip_id
+        )
+    });
+    if !attached {
+        return None;
+    }
+    Some(HistoryResumePoint {
+        repository_id: repository_id.to_owned(),
+        tip_sha: tip.tip_sha.clone(),
+        covered_commit_count: tip.covered_commit_count,
+        prior_records: records.to_vec(),
+    })
+}
+
+/// Returns `true` when `tip_sha` is an ancestor of the current `HEAD`
+/// (issue #224).
+///
+/// Uses `git merge-base --is-ancestor`, which reports via exit status only
+/// (0 = ancestor, 1 = not, anything else = a real failure). Read-only:
+/// `GIT_OPTIONAL_LOCKS=0` and no index or config writes, so the caller's
+/// checkout is never mutated.
+fn tip_is_ancestor_of_head(repo_root: &Path, tip_sha: &str) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", tip_sha, "HEAD"];
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| CodegraphError::GitCommand {
+            command: command_display(repo_root, &args),
+            message: source.to_string(),
+        })?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(CodegraphError::GitCommand {
+            command: command_display(repo_root, &args),
+            message: format!("merge-base --is-ancestor exited with status {status}"),
+        }),
+    }
+}
+
+/// Lists the commits strictly after `tip_sha` up to `HEAD`, oldest first
+/// (issue #224).
+///
+/// The range resolves through the same `rev-list --reverse --topo-order`
+/// invocation as the full replay's [`list_commits`], so the new commits are
+/// replayed in exactly the order a full replay would emit them.
+fn list_new_commits(repo_root: &Path, tip_sha: &str) -> Result<Vec<GitCommit>> {
+    let range = format!("{tip_sha}..HEAD");
+    let output = git_output(
+        repo_root,
+        &["rev-list", "--reverse", "--topo-order", range.as_str()],
+    )?;
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|sha| commit_metadata(repo_root, sha.trim()))
+        .collect()
+}
+
+/// Returns `true` when `record` is one of the per-run stamps that a resumed
+/// replay re-derives at the new `HEAD`: the `Repository` node, the
+/// `HistoryReplayTip` node, or the `Repository CONTAINS HistoryReplayTip`
+/// edge (issue #224).
+fn is_resume_stamp(record: &GraphRecord, repository_id: &str, tip_id: &str) -> bool {
+    if record.id() == repository_id || record.id() == tip_id {
+        return true;
+    }
+    matches!(
+        record,
+        GraphRecord::Edge {
+            label: EdgeLabel::Contains,
+            source,
+            target,
+            ..
+        } if source == repository_id && target == tip_id
+    )
+}
+
+/// Incrementally extends a prior full history replay with only the commits
+/// that landed after its tip (issue #224).
+///
+/// The prior replay's records are merged with the new commits' records —
+/// replayed by the exact same [`replay_commit`] builder a full replay uses —
+/// and the per-run stamps (the `Repository` node, the tip node and its edge,
+/// the producer envelope) are re-derived at the new `HEAD`. The merged
+/// record set is byte-identical to a fresh full replay of the resumed
+/// repository; a zero-new-commit resume is a no-op that converges
+/// byte-for-byte with the frontier. Other repositories' records in a
+/// shared multi-repo frontier pass through the merge untouched (AC4).
+///
+/// The resume point is keyed per repository identity: presenting another
+/// repository's frontier is rejected with `repository_identity_mismatch`.
+/// When the stored tip is no longer an ancestor of `HEAD` the history was
+/// rewritten (force-push or rebase) and resuming would fork the timeline;
+/// the run fails with the machine-readable code `history_rewrite_detected`
+/// and the documented recovery is a full replay.
+///
+/// History replay reads only committed Git objects, so the caller's checkout
+/// is never mutated.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid, Git is unavailable,
+/// a reachable Rust source blob cannot be parsed, the resume point belongs
+/// to another repository, or the stored tip is not an ancestor of `HEAD`.
+pub fn scan_repository_history_resumed(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    resume: HistoryResumePoint,
+) -> Result<HistoryResumeOutcome> {
+    std::sync::LazyLock::force(&PROCESS_STARTED_AT);
+    let repo_root = repo_path.as_ref();
+    validate_repository(repo_root)?;
+
+    let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
+    let (repository_id, repository) = repository_record_from_identity(&repo_identity);
+    if resume.repository_id != repository_id {
+        return Err(CodegraphError::HistoryResume {
+            code: "repository_identity_mismatch",
+            message: format!(
+                "resume point belongs to repository {}; current repository is {repository_id}; resume points never cross repository identities",
+                resume.repository_id,
+            ),
+        });
+    }
+
+    // Rewritten history invalidates the frontier: resuming past a
+    // force-push or rebase would fork the timeline. The check is read-only.
+    if !tip_is_ancestor_of_head(repo_root, &resume.tip_sha)? {
+        let short = resume.tip_sha.chars().take(8).collect::<String>();
+        return Err(CodegraphError::HistoryResume {
+            code: "history_rewrite_detected",
+            message: format!(
+                "stored history tip {short} is not an ancestor of HEAD; the repository history was rewritten (force-push or rebase). Recovery: run a full scan-history without --resume-from",
+            ),
+        });
+    }
+
+    let new_commits = list_new_commits(repo_root, &resume.tip_sha)?;
+    let stamp = repository_stamp(repo_root, &repository_id, repository)?;
+    let transaction_time = stamp.transaction_time.clone();
+    let tip_id = history_replay_tip_id(&repository_id);
+
+    // Merge: keep every prior record except the per-run stamps, which are
+    // re-emitted below at the new HEAD. The resumed repository's records
+    // get the re-derived producer envelope at the end; other repositories'
+    // records in a shared multi-repo frontier pass through byte-untouched
+    // (AC4) — see `stamp_resumed_repository`.
+    let mut graph = Graph::new();
+    for record in resume.prior_records {
+        if !is_resume_stamp(&record, &repository_id, &tip_id) {
+            graph.push(record);
+        }
+    }
+    graph.push(stamp.node);
+
+    let mut manifest_outcome_memo: BTreeMap<String, ManifestParseOutcome> = BTreeMap::new();
+    for commit in &new_commits {
+        replay_commit(
+            repo_root,
+            &repository_id,
+            commit,
+            &mut manifest_outcome_memo,
+            &mut graph,
+        )?;
+    }
+
+    // The new tip is HEAD; the ancestry check above guarantees HEAD resolves
+    // to a commit, so the fallback only guards the unrepresentable.
+    let new_head = match stamp.head_sha {
+        Some(sha) => commit_metadata(repo_root, &sha)?,
+        None => commit_metadata(repo_root, &resume.tip_sha)?,
+    };
+    let (tip_node, tip_edge) = history_replay_tip_records(
+        &repository_id,
+        &new_head,
+        resume.covered_commit_count + new_commits.len(),
+        &transaction_time,
+    );
+    graph.push(tip_node);
+    graph.push(tip_edge);
+
+    let producer = history_producer(&graph, &transaction_time);
+    Ok(HistoryResumeOutcome {
+        graph: stamp_resumed_repository(graph, &producer, &repository_id),
+        processed: new_commits.len(),
+        skipped: resume.covered_commit_count,
+        new_tip_sha: new_head.sha,
+    })
+}
+
+/// Re-stamps the producer envelope after a resumed replay (issue #224).
+///
+/// The envelope is re-derived at the new `HEAD` — `producer_started_at`
+/// and the language inventory move with it — but ONLY the resumed
+/// repository's records are re-stamped. Records belonging to other
+/// repositories in a shared multi-repo frontier pass through
+/// byte-untouched (AC4).
+///
+/// Ownership is structural: each replay's records form the connected
+/// subgraph rooted at its `Repository` node, and every per-commit record
+/// carries its commit's SHA as `temporal.git_commit`. A record is foreign
+/// when it is reachable from another repository's node or its commit SHA
+/// belongs to another repository's commits. Records attributable to
+/// neither (only possible for records with no edges and no temporal
+/// provenance) are treated as the resumed repository's own, which keeps
+/// the single-repo resume byte-identical to a full replay.
+fn stamp_resumed_repository(graph: Graph, producer: &Producer, repository_id: &str) -> Graph {
+    let foreign = foreign_repository_record_ids(&graph, repository_id);
+    let mut stamped = Graph::new();
+    for record in graph.into_records() {
+        if foreign.contains(record.id()) {
+            stamped.push(record);
+        } else {
+            stamped.push(record.with_producer(producer.clone()));
+        }
+    }
+    stamped
+}
+
+/// Returns the IDs of records belonging to a repository OTHER than
+/// `repository_id` (issue #224, AC4).
+///
+/// Two structural signals, either of which marks a record foreign: graph
+/// reachability from another repository's `Repository` node (undirected,
+/// over edge endpoints — edge records themselves are included via their
+/// own IDs), and per-commit temporal provenance (`temporal.git_commit`)
+/// naming one of another repository's commits. The second signal covers
+/// records with no edges at all, such as `Module`/`Import` syntax nodes
+/// and non-UTF-8 `Diagnostic` nodes.
+fn foreign_repository_record_ids(graph: &Graph, repository_id: &str) -> BTreeSet<String> {
+    let mut other_roots: BTreeSet<&str> = BTreeSet::new();
+    // Undirected adjacency over (edge id, source, target) triples, so edge
+    // records are visited alongside their endpoints.
+    let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut by_id: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    for record in graph.records() {
+        by_id.insert(record.id(), record);
+        match record {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } if id.as_str() != repository_id => {
+                other_roots.insert(id.as_str());
+            }
+            GraphRecord::Edge {
+                id, source, target, ..
+            } => {
+                adjacency
+                    .entry(id.as_str())
+                    .or_default()
+                    .extend([source.as_str(), target.as_str()]);
+                adjacency
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(id.as_str());
+                adjacency
+                    .entry(target.as_str())
+                    .or_default()
+                    .push(id.as_str());
+            }
+            GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => {}
+        }
+    }
+
+    // Another repository's commits: the targets of its `Repository
+    // CONTAINS` edges, identified by their `temporal.git_commit`.
+    let mut other_commit_shas: BTreeSet<&str> = BTreeSet::new();
+    for record in graph.records() {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::Contains,
+            source,
+            target,
+            ..
+        } = record
+            && other_roots.contains(source.as_str())
+            && let Some(commit_sha) = by_id
+                .get(target.as_str())
+                .and_then(|target_record| record_git_commit(target_record))
+        {
+            other_commit_shas.insert(commit_sha);
+        }
+    }
+
+    let mut foreign: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<&str> = other_roots.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        if !foreign.insert(id.to_owned()) {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(id) {
+            stack.extend(neighbors.iter().copied());
+        }
+    }
+    for record in graph.records() {
+        if let Some(commit_sha) = record_git_commit(record)
+            && other_commit_shas.contains(commit_sha)
+        {
+            foreign.insert(record.id().to_owned());
+        }
+    }
+    foreign
+}
+
+/// The commit SHA a record's temporal provenance attributes it to, if any
+/// (issue #224).
+const fn record_git_commit(record: &GraphRecord) -> Option<&str> {
+    match record {
+        GraphRecord::Node {
+            temporal: Some(temporal),
+            ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(temporal),
+            ..
+        } => Some(temporal.git_commit.as_str()),
+        _ => None,
+    }
+}
+
+/// Replays ONE commit into `graph`: the `Commit` node, its `Change` records,
+/// every indexed source's syntax records, and the repo-wide cross-file passes
+/// — all stamped with the commit's temporal provenance (issue #224).
+///
+/// This is the exact per-commit body the full-history loop always ran,
+/// extracted so a resumed replay can run the same builder over only the new
+/// commits. The emitted records are a pure function of the commit (its SHA,
+/// parents, and parent trees); the manifest-OID memo is order-independent.
+/// Slice-scoped passes key off `graph.records().len()` at slice start, so
+/// they stay correct when already-represented records precede the new commits
+/// in the graph.
+///
+/// # Errors
+///
+/// Returns an error when a reachable Rust source blob cannot be parsed or a
+/// Git object command fails.
+fn replay_commit(
+    repo_root: &Path,
+    repository_id: &str,
+    commit: &GitCommit,
+    manifest_outcome_memo: &mut BTreeMap<String, ManifestParseOutcome>,
+    graph: &mut Graph,
+) -> Result<()> {
+    let commit_id = replay_commit_node(repository_id, commit, graph);
+    // Attribution covers this commit's `Change` records too (they carry a
+    // path), so its slice opens BEFORE them — earlier than the
+    // resolution-labeling slice below, which must see only the replayed
+    // source records.
+    let commit_attribution_start = graph.records().len();
+    let (change_ids_by_path, deleted_paths) =
+        replay_commit_changes(repo_root, repository_id, commit, &commit_id, graph)?;
+    let (facts_by_file, attribution, commit_records_start) = replay_commit_sources(
+        repo_root,
+        repository_id,
+        commit,
+        &change_ids_by_path,
+        &commit_id,
+        manifest_outcome_memo,
+        graph,
+    )?;
+    replay_commit_cross_file_passes(
+        repository_id,
+        commit,
+        &facts_by_file,
+        &attribution,
+        commit_attribution_start,
+        commit_records_start,
+        graph,
+    );
+    replay_commit_deleted_paths(
+        repo_root,
+        commit,
+        &deleted_paths,
+        commit_attribution_start,
+        commit_records_start,
+        manifest_outcome_memo,
+        graph,
+    )?;
+    Ok(())
+}
+
+/// Pushes the `Commit` node, its `Repository CONTAINS` edge, and one
+/// `ParentOf` edge per parent (issue #224).
+///
+/// Returns the commit node's stable ID so later phases can wire edges to it.
+fn replay_commit_node(repository_id: &str, commit: &GitCommit, graph: &mut Graph) -> String {
+    let commit_record = commit_record(repository_id, commit);
+    let commit_id = commit_record.id().to_owned();
+    graph.push(commit_record);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repository_id.to_owned(),
+        commit_id.clone(),
+        Some("1.0".to_owned()),
+        format!("Repository contains commit {}", commit.short_sha()),
+    ));
+
+    for parent in &commit.parents {
+        let parent_id = stable_id(&["node", "commit", repository_id, parent]);
+        graph.push(
+            GraphRecord::edge(
+                EdgeLabel::ParentOf,
+                parent_id,
+                commit_id.clone(),
+                Some("1.0".to_owned()),
+                format!(
+                    "Commit {} is parent of {}",
+                    short_sha(parent),
+                    commit.short_sha()
+                ),
+            )
+            .with_temporal(commit.temporal()),
+        );
+    }
+    commit_id
+}
+
+/// Pushes one `Change` node plus its `Commit CONTAINS` edge per `diff-tree`
+/// entry (issue #224).
+///
+/// Returns the change-node IDs keyed by path (for `ChangedIn` wiring) and
+/// the set of deleted paths. A deleted path's `Change` record describes the
+/// parent tree, not this one (issue #117), so deletions are re-attributed
+/// against the parent tree by [`replay_commit_deleted_paths`].
+///
+/// # Errors
+///
+/// Returns an error when the `diff-tree` Git command fails.
+fn replay_commit_changes(
+    repo_root: &Path,
+    repository_id: &str,
+    commit: &GitCommit,
+    commit_id: &str,
+    graph: &mut Graph,
+) -> Result<(BTreeMap<String, String>, BTreeSet<String>)> {
+    let mut change_ids_by_path = BTreeMap::new();
+    let mut deleted_paths: BTreeSet<String> = BTreeSet::new();
+    for change in list_changes(repo_root, commit)? {
+        if change.status.starts_with('D') {
+            deleted_paths.insert(change.path.clone());
+        }
+        let change_record = change_record(repository_id, commit, &change);
+        let change_id = change_record.id().to_owned();
+        change_ids_by_path.insert(change.path.clone(), change_id.clone());
+        graph.push(change_record);
+        graph.push(
+            GraphRecord::edge(
+                EdgeLabel::Contains,
+                commit_id.to_owned(),
+                change_id.clone(),
+                Some("1.0".to_owned()),
+                format!(
+                    "Commit {} contains change {}",
+                    commit.short_sha(),
+                    change.path
+                ),
+            )
+            .with_temporal(commit.temporal()),
+        );
+    }
+    Ok((change_ids_by_path, deleted_paths))
+}
+
+/// Replays the commit's tree: one `ls-tree` pass yields both the indexed
+/// sources and the Cargo manifests (issue #117), and each source's syntax
+/// records are pushed with the commit's temporal provenance (issue #224).
+///
+/// Returns the per-file facts for the cross-file passes, this commit's
+/// crate-attribution index, and the slice start of the pushed source
+/// records. The resolution-labeling passes must see only this commit's
+/// slice: the same stable edge ID can recur across commits with different
+/// in-repo definition sets (issue #134).
+///
+/// # Errors
+///
+/// Returns an error when the `ls-tree` Git command fails, a reachable blob
+/// cannot be read, or a reachable Rust source blob cannot be parsed.
+fn replay_commit_sources(
+    repo_root: &Path,
+    repository_id: &str,
+    commit: &GitCommit,
+    change_ids_by_path: &BTreeMap<String, String>,
+    commit_id: &str,
+    manifest_outcome_memo: &mut BTreeMap<String, ManifestParseOutcome>,
+    graph: &mut Graph,
+) -> Result<(
+    BTreeMap<String, crate::languages::cross_file::FileFacts>,
+    CrateAttributionIndex,
+    usize,
+)> {
+    let mut facts_by_file = BTreeMap::new();
+    let commit_tree = list_commit_tree(repo_root, &commit.sha)?;
+    let attribution = commit_crate_attribution_index(
+        repo_root,
+        &commit.sha,
+        &commit_tree.manifests,
+        &mut *manifest_outcome_memo,
+    );
+    // Records pushed from here on belong to this commit's replayed tree.
+    let commit_records_start = graph.records().len();
+    for path in &commit_tree.sources {
+        let bytes = git_blob_bytes(repo_root, &commit.sha, path)?;
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            replay_non_utf8_diagnostic(repository_id, commit, path, graph);
+            continue;
+        };
+        let source_file = SourceFile {
+            path: repo_root.join(path),
+            repo_relative_path: path.clone(),
+        };
+        let (records, facts) = scan_source_text_records(&source_file, source, repository_id)?;
+        if !facts.is_empty() {
+            facts_by_file.insert(path.clone(), facts);
+        }
+        let change_id = change_ids_by_path.get(path);
+        for record in records {
+            let record = record.with_temporal(commit.temporal());
+            if is_temporal_change_target(&record) {
+                let source_id = record.id().to_owned();
+                graph.push(record);
+                if let Some(change_id) = change_id {
+                    graph.push(
+                        GraphRecord::edge(
+                            EdgeLabel::ChangedIn,
+                            source_id.clone(),
+                            commit_id.to_owned(),
+                            Some("1.0".to_owned()),
+                            format!("{path} changed in commit {}", commit.short_sha()),
+                        )
+                        .with_temporal(commit.temporal()),
+                    );
+                    graph.push(
+                        GraphRecord::edge(
+                            EdgeLabel::ChangedIn,
+                            source_id,
+                            change_id.clone(),
+                            Some("1.0".to_owned()),
+                            format!("{path} changed in change {}", commit.short_sha()),
+                        )
+                        .with_temporal(commit.temporal()),
+                    );
+                }
+            } else {
+                graph.push(record);
+            }
+        }
+    }
+    Ok((facts_by_file, attribution, commit_records_start))
+}
+
+/// Pushes the deterministic `Diagnostic` for a non-UTF-8 committed blob:
+/// the blob is skipped, not aborted, and the diagnostic names the commit +
+/// path with a fixed summary — never raw bytes (issue #438). `git show`
+/// reads objects only, never mutating the checkout.
+fn replay_non_utf8_diagnostic(
+    repository_id: &str,
+    commit: &GitCommit,
+    path: &str,
+    graph: &mut Graph,
+) {
+    let diag_id = stable_id(&[
+        "node",
+        "diagnostic",
+        "non_utf8_source",
+        repository_id,
+        &commit.sha,
+        path,
+    ]);
+    graph.push(
+        GraphRecord::node(
+            diag_id,
+            NodeKind::Diagnostic,
+            Some(path.to_owned()),
+            None,
+            Some("non_utf8_source".to_owned()),
+            "skipped source file: not valid UTF-8".to_owned(),
+        )
+        .with_temporal(commit.temporal()),
+    );
+}
+
+/// Runs the repo-wide cross-file passes over this commit's replayed tree and
+/// the slice-scoped labeling passes, then applies owning-Cargo-package
+/// attribution (issue #224).
+///
+/// The CALLS (issue #152), IMPLEMENTS (issue #344), and IMPORTS-target
+/// (issue #444) passes are stamped with the commit's temporal provenance
+/// like every other syntax-backed record replayed at this commit. The
+/// resolution-labeling (issue #134), test-scope (issue #223), and test-role
+/// (issue #238) passes are scoped to `commit_records_start..` — they must
+/// see only this commit's slice. Attribution (issue #117) is scoped wider,
+/// to `commit_attribution_start..`, so it also covers this commit's
+/// `Change` records. Slice-scoping is mandatory: an ADR-0004 symbol ID
+/// carries no commit component, so a whole-graph pass would stamp every
+/// historical version of a record with the LAST commit's manifest tree — a
+/// fabricated fact at a pinned historical point.
+fn replay_commit_cross_file_passes(
+    repository_id: &str,
+    commit: &GitCommit,
+    facts_by_file: &BTreeMap<String, crate::languages::cross_file::FileFacts>,
+    attribution: &CrateAttributionIndex,
+    commit_attribution_start: usize,
+    commit_records_start: usize,
+    graph: &mut Graph,
+) {
+    // Repo-wide cross-file call resolution for this commit's tree
+    // (issue #152), stamped with the commit's temporal provenance like
+    // every other syntax-backed record replayed at this commit.
+    for record in
+        crate::languages::cross_file::cross_file_call_records(repository_id, facts_by_file)
+    {
+        graph.push(record.with_temporal(commit.temporal()));
+    }
+    // Repo-wide cross-file trait resolution (issue #344) for this commit's
+    // tree: an out-of-line impl whose trait lives in another file
+    // edge-backs here, stamped with the commit's temporal provenance.
+    for record in
+        crate::languages::cross_file::cross_file_implements_records(repository_id, facts_by_file)
+    {
+        graph.push(record.with_temporal(commit.temporal()));
+    }
+    // Inbound IMPORTS edges to imported Module/File targets (issue #444)
+    // for this commit's tree: each resolvable Rust `use` mints
+    // `File —IMPORTS→ Module|File`, stamped with the commit's temporal
+    // provenance like the CALLS/IMPLEMENTS passes above. `attribution` is
+    // this commit's per-commit index, built above. Fail-closed:
+    // unresolvable imports mint no edge.
+    let import_target_edges: Vec<GraphRecord> =
+        crate::languages::cross_file::cross_file_import_target_edges(
+            repository_id,
+            &graph.records()[commit_records_start..],
+            facts_by_file,
+            attribution,
+        );
+    for record in import_target_edges {
+        graph.push(record.with_temporal(commit.temporal()));
+    }
+    // Same-file resolution labeling (issue #134) over this commit's slice.
+    crate::languages::cross_file::label_same_file_call_resolutions(
+        &mut graph.records_mut()[commit_records_start..],
+        facts_by_file,
+    );
+    // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223)
+    // over this commit's replayed tree.
+    crate::languages::cross_file::apply_out_of_line_test_scope(
+        &mut graph.records_mut()[commit_records_start..],
+        facts_by_file,
+    );
+    // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238),
+    // slice-scoped to this commit like the pass above.
+    crate::languages::cross_file::apply_out_of_line_test_roles(
+        &mut graph.records_mut()[commit_records_start..],
+        facts_by_file,
+    );
+    // Owning-Cargo-package attribution (issue #117), scoped to THIS
+    // COMMIT'S SLICE (see the doc comment above for why).
+    crate::crate_attribution::apply_crate_attribution(
+        &mut graph.records_mut()[commit_attribution_start..],
+        attribution,
+    );
+}
+
+/// Re-resolves this commit's DELETION `Change` records against the parent
+/// tree where the file last existed (issue #117).
+///
+/// A DELETION's `Change` describes a path this commit no longer has, so the
+/// per-commit attribution above resolved it against a tree the file is
+/// absent from. If the commit also removed the enclosing `Cargo.toml` — a
+/// whole-package removal — that walk reaches an OUTER manifest and claims
+/// the file belonged to a package it never belonged to. Re-resolving
+/// against the FIRST PARENT's tree makes a deletion cite the package that
+/// lost it.
+///
+/// Costs one extra `ls-tree` only for commits that delete something; the
+/// blob-OID parse memo is shared, so manifests already parsed at an
+/// earlier commit are not re-parsed. A root commit deletes nothing.
+///
+/// A MERGE needs the reporting parent, not the mainline one: `diff-tree
+/// -m` diffs against every parent and `--no-commit-id` discards which
+/// produced each entry, so a file deleted on a side branch — one the
+/// first parent never had — would be resolved against a tree with no
+/// nested manifest and inherit an outer package. Each parent is asked
+/// separately (only for merges; a single-parent commit reports all of
+/// its deletions by definition and pays no extra call).
+///
+/// # Errors
+///
+/// Returns an error when a per-parent `diff-tree` or `ls-tree` Git command
+/// fails.
+fn replay_commit_deleted_paths(
+    repo_root: &Path,
+    commit: &GitCommit,
+    deleted_paths: &BTreeSet<String>,
+    commit_attribution_start: usize,
+    commit_records_start: usize,
+    manifest_outcome_memo: &mut BTreeMap<String, ManifestParseOutcome>,
+    graph: &mut Graph,
+) -> Result<()> {
+    if deleted_paths.is_empty() {
+        return Ok(());
+    }
+    let mut remaining = deleted_paths.clone();
+    for parent_sha in &commit.parents {
+        if remaining.is_empty() {
+            break;
+        }
+        // Which of the remaining deletions THIS parent reports. A
+        // single-parent commit reports all of them by definition, so it
+        // pays no extra Git call; only a merge needs asking, because
+        // `diff-tree -m` discards which parent produced each entry and
+        // a file deleted on one branch may not exist on the other at
+        // all. First parent wins an overlap, deterministically.
+        let mine: BTreeSet<String> = if commit.parents.len() == 1 {
+            remaining.clone()
+        } else {
+            let reported = deletions_against_parent(repo_root, parent_sha, &commit.sha)?;
+            remaining.intersection(&reported).cloned().collect()
+        };
+        if mine.is_empty() {
+            continue;
+        }
+        let parent_tree = list_commit_tree(repo_root, parent_sha)?;
+        let parent_attribution = commit_crate_attribution_index(
+            repo_root,
+            parent_sha,
+            &parent_tree.manifests,
+            &mut *manifest_outcome_memo,
+        );
+        crate::crate_attribution::apply_crate_attribution_where(
+            &mut graph.records_mut()[commit_attribution_start..commit_records_start],
+            &parent_attribution,
+            |record| {
+                matches!(
+                    record,
+                    GraphRecord::Node {
+                        kind: NodeKind::Change,
+                        repo_relative_path: Some(path),
+                        ..
+                    } if mine.contains(path)
+                )
+            },
+        );
+        remaining.retain(|path| !mine.contains(path));
+    }
+    // A deletion no parent reports (only reachable if Git's `-m` output
+    // and the per-parent diffs disagree) keeps the post-commit answer
+    // rather than being resolved against an arbitrary tree.
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_repository_history_inner(
     repo_path: impl AsRef<Path>,
@@ -375,39 +1356,13 @@ fn scan_repository_history_inner(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
 
-    // Stamp a source snapshot on the Repository node (BB1 / PR #186 follow-up):
-    // without it, `eg freshness --graph history.graph.jsonl` and `--at` queries
-    // with `--repo-path` always report `unknown`. The stamped HEAD lets freshness
-    // detect `stale_head` after new commits are added.
-    //
-    // History replay reads only committed Git objects, so the snapshot records the
-    // committed HEAD state with `dirty = false` (TT1): uncommitted working-tree
-    // edits never enter the replayed graph, and stamping them dirty would leave the
-    // store permanently `stale_dirty` even after the edits are reverted with HEAD
-    // unchanged. Current working-tree dirtiness is detected live at freshness-check
-    // time instead.
-    //
-    // The transaction time is derived from HEAD's committer date, not wall-clock,
-    // so repeated scans of an unchanged repository stay byte-stable across a
-    // seconds boundary (TT3 / the history replay determinism contract).
-    let head = identity::working_tree_head(repo_root);
-    let transaction_time = match &head {
-        SnapshotHead::Commit { sha } => commit_metadata(repo_root, sha)?.committed_at,
-        _ => PROCESS_STARTED_AT.clone(),
-    };
-    let snapshot = SourceSnapshotPayload {
-        head,
-        dirty: false,
-        repository_id: repository_id.clone(),
-        scanned_at: transaction_time.clone(),
-    };
+    // The Repository node's per-run stamps (source snapshot at HEAD, inferred
+    // valid time) are re-derived identically by a resumed replay, so the merged
+    // record set converges byte-for-byte with a fresh full replay (issue #224).
+    let stamp = repository_stamp(repo_root, &repository_id, repository)?;
+    let transaction_time = stamp.transaction_time.clone();
     let mut graph = Graph::new();
-    graph.push(
-        repository
-            .with_valid_time_inferred(&transaction_time)
-            .with_source_snapshot(snapshot),
-    );
-
+    graph.push(stamp.node);
     // Issue #256: resolve the commit window before walking any history. The
     // full-history default resolves through the exact pre-#256 `rev-list`
     // invocation and records no window node; every windowed form records one
@@ -472,293 +1427,36 @@ fn scan_repository_history_inner(
     // typically unchanged across hundreds of commits, so each distinct manifest
     // blob is read and parsed exactly once for the whole replay.
     let mut manifest_outcome_memo: BTreeMap<String, ManifestParseOutcome> = BTreeMap::new();
-    for commit in resolved.commits {
-        let commit_record = commit_record(&repository_id, &commit);
-        let commit_id = commit_record.id().to_owned();
-        graph.push(commit_record);
-        graph.push(GraphRecord::edge(
-            EdgeLabel::Contains,
-            repository_id.clone(),
-            commit_id.clone(),
-            Some("1.0".to_owned()),
-            format!("Repository contains commit {}", commit.short_sha()),
-        ));
-
-        for parent in &commit.parents {
-            let parent_id = stable_id(&["node", "commit", &repository_id, parent]);
-            graph.push(
-                GraphRecord::edge(
-                    EdgeLabel::ParentOf,
-                    parent_id,
-                    commit_id.clone(),
-                    Some("1.0".to_owned()),
-                    format!(
-                        "Commit {} is parent of {}",
-                        short_sha(parent),
-                        commit.short_sha()
-                    ),
-                )
-                .with_temporal(commit.temporal()),
-            );
-        }
-
-        // Attribution covers this commit's `Change` records too (they carry a
-        // path), so its slice opens BEFORE them — earlier than the
-        // resolution-labeling slice below, which must see only the replayed
-        // source records.
-        let commit_attribution_start = graph.records().len();
-        let mut change_ids_by_path = BTreeMap::new();
-        // Paths this commit DELETED. Their `Change` records describe the parent
-        // tree, not this one (issue #117), so they are re-attributed below.
-        let mut deleted_paths: BTreeSet<String> = BTreeSet::new();
-        for change in list_changes(repo_root, &commit)? {
-            if change.status.starts_with('D') {
-                deleted_paths.insert(change.path.clone());
-            }
-            let change_record = change_record(&repository_id, &commit, &change);
-            let change_id = change_record.id().to_owned();
-            change_ids_by_path.insert(change.path.clone(), change_id.clone());
-            graph.push(change_record);
-            graph.push(
-                GraphRecord::edge(
-                    EdgeLabel::Contains,
-                    commit_id.clone(),
-                    change_id.clone(),
-                    Some("1.0".to_owned()),
-                    format!(
-                        "Commit {} contains change {}",
-                        commit.short_sha(),
-                        change.path
-                    ),
-                )
-                .with_temporal(commit.temporal()),
-            );
-        }
-
-        let mut facts_by_file = BTreeMap::new();
-        // One `ls-tree` pass yields both this commit's indexed sources and its
-        // Cargo manifests (issue #117), so adding attribution costs no extra
-        // Git invocation per commit.
-        let commit_tree = list_commit_tree(repo_root, &commit.sha)?;
-        let attribution = commit_crate_attribution_index(
+    for commit in &resolved.commits {
+        replay_commit(
             repo_root,
-            &commit.sha,
-            &commit_tree.manifests,
-            &mut manifest_outcome_memo,
-        );
-        // Records pushed from here on belong to this commit's replayed tree;
-        // the same-file resolution labeling pass (issue #134) must only see
-        // this commit's slice because the same stable edge ID can recur across
-        // commits with different in-repo definition sets.
-        let commit_records_start = graph.records().len();
-        for path in commit_tree.sources {
-            let change_id = change_ids_by_path.get(&path);
-            let bytes = git_blob_bytes(repo_root, &commit.sha, &path)?;
-            let Ok(source) = std::str::from_utf8(&bytes) else {
-                // Issue #438: a non-UTF-8 committed blob is skipped, not aborted.
-                // Emit a deterministic `Diagnostic` naming the commit + path
-                // (fixed summary, no raw bytes) and keep replaying the tree.
-                // `git show` reads objects only, never mutating the checkout.
-                let diag_id = stable_id(&[
-                    "node",
-                    "diagnostic",
-                    "non_utf8_source",
-                    &repository_id,
-                    &commit.sha,
-                    &path,
-                ]);
-                graph.push(
-                    GraphRecord::node(
-                        diag_id,
-                        NodeKind::Diagnostic,
-                        Some(path.clone()),
-                        None,
-                        Some("non_utf8_source".to_owned()),
-                        "skipped source file: not valid UTF-8".to_owned(),
-                    )
-                    .with_temporal(commit.temporal()),
-                );
-                continue;
-            };
-            let source_file = SourceFile {
-                path: repo_root.join(&path),
-                repo_relative_path: path.clone(),
-            };
-            let (records, facts) = scan_source_text_records(&source_file, source, &repository_id)?;
-            if !facts.is_empty() {
-                facts_by_file.insert(path.clone(), facts);
-            }
-            for record in records {
-                let record = record.with_temporal(commit.temporal());
-                if is_temporal_change_target(&record) {
-                    let source_id = record.id().to_owned();
-                    graph.push(record);
-                    if let Some(change_id) = change_id {
-                        graph.push(
-                            GraphRecord::edge(
-                                EdgeLabel::ChangedIn,
-                                source_id.clone(),
-                                commit_id.clone(),
-                                Some("1.0".to_owned()),
-                                format!("{path} changed in commit {}", commit.short_sha()),
-                            )
-                            .with_temporal(commit.temporal()),
-                        );
-                        graph.push(
-                            GraphRecord::edge(
-                                EdgeLabel::ChangedIn,
-                                source_id,
-                                change_id.clone(),
-                                Some("1.0".to_owned()),
-                                format!("{path} changed in change {}", commit.short_sha()),
-                            )
-                            .with_temporal(commit.temporal()),
-                        );
-                    }
-                } else {
-                    graph.push(record);
-                }
-            }
-        }
-
-        // Repo-wide cross-file call resolution for this commit's tree
-        // (issue #152), stamped with the commit's temporal provenance like
-        // every other syntax-backed record replayed at this commit.
-        for record in
-            crate::languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file)
-        {
-            graph.push(record.with_temporal(commit.temporal()));
-        }
-        // Repo-wide cross-file trait resolution (issue #344) for this commit's
-        // tree: an out-of-line impl whose trait lives in another file
-        // edge-backs here, stamped with the commit's temporal provenance.
-        for record in crate::languages::cross_file::cross_file_implements_records(
             &repository_id,
-            &facts_by_file,
-        ) {
-            graph.push(record.with_temporal(commit.temporal()));
-        }
-        // Inbound IMPORTS edges to imported Module/File targets (issue #444)
-        // for this commit's tree: each resolvable Rust `use` mints
-        // `File —IMPORTS→ Module|File`, stamped with the commit's temporal
-        // provenance like the CALLS/IMPLEMENTS passes above. `attribution` is
-        // this commit's per-commit index, built above. Fail-closed:
-        // unresolvable imports mint no edge.
-        let import_target_edges: Vec<GraphRecord> =
-            crate::languages::cross_file::cross_file_import_target_edges(
-                &repository_id,
-                &graph.records()[commit_records_start..],
-                &facts_by_file,
-                &attribution,
-            );
-        for record in import_target_edges {
-            graph.push(record.with_temporal(commit.temporal()));
-        }
-        // Same-file resolution labeling (issue #134) over this commit's slice.
-        crate::languages::cross_file::label_same_file_call_resolutions(
-            &mut graph.records_mut()[commit_records_start..],
-            &facts_by_file,
-        );
-        // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223)
-        // over this commit's replayed tree.
-        crate::languages::cross_file::apply_out_of_line_test_scope(
-            &mut graph.records_mut()[commit_records_start..],
-            &facts_by_file,
-        );
-        // Out-of-line `#[cfg(test)] mod x;` File-role stamping (issue #238),
-        // slice-scoped to this commit like the pass above.
-        crate::languages::cross_file::apply_out_of_line_test_roles(
-            &mut graph.records_mut()[commit_records_start..],
-            &facts_by_file,
-        );
-        // Owning-Cargo-package attribution (issue #117), scoped to THIS
-        // COMMIT'S SLICE. Slice-scoping is mandatory, for the same reason the
-        // resolution-labeling pass above is scoped: an ADR-0004 symbol ID
-        // carries no commit component, so a whole-graph pass would stamp every
-        // historical version of a record with the LAST commit's manifest tree —
-        // a fabricated fact at a pinned historical point.
-        crate::crate_attribution::apply_crate_attribution(
-            &mut graph.records_mut()[commit_attribution_start..],
-            &attribution,
-        );
-        // A DELETION's `Change` describes a path this commit no longer has, so
-        // the walk above resolved it against a tree the file is absent from. If
-        // the commit also removed the enclosing `Cargo.toml` — a whole-package
-        // removal — that walk reaches an OUTER manifest and claims the file
-        // belonged to a package it never belonged to. Re-resolve those records
-        // against the FIRST PARENT's tree, where the file last existed, so a
-        // deletion cites the package that lost it.
-        //
-        // Costs one extra `ls-tree` only for commits that delete something; the
-        // blob-OID parse memo is shared, so manifests already parsed at an
-        // earlier commit are not re-parsed. A root commit deletes nothing.
-        //
-        // A MERGE needs the reporting parent, not the mainline one: `diff-tree
-        // -m` diffs against every parent and `--no-commit-id` discards which
-        // produced each entry, so a file deleted on a side branch — one the
-        // first parent never had — would be resolved against a tree with no
-        // nested manifest and inherit an outer package. Each parent is asked
-        // separately (only for merges; a single-parent commit reports all of
-        // its deletions by definition and pays no extra call).
-        if !deleted_paths.is_empty() {
-            let mut remaining = deleted_paths.clone();
-            for parent_sha in &commit.parents {
-                if remaining.is_empty() {
-                    break;
-                }
-                // Which of the remaining deletions THIS parent reports. A
-                // single-parent commit reports all of them by definition, so it
-                // pays no extra Git call; only a merge needs asking, because
-                // `diff-tree -m` discards which parent produced each entry and
-                // a file deleted on one branch may not exist on the other at
-                // all. First parent wins an overlap, deterministically.
-                let mine: BTreeSet<String> = if commit.parents.len() == 1 {
-                    remaining.clone()
-                } else {
-                    let reported = deletions_against_parent(repo_root, parent_sha, &commit.sha)?;
-                    remaining.intersection(&reported).cloned().collect()
-                };
-                if mine.is_empty() {
-                    continue;
-                }
-                let parent_tree = list_commit_tree(repo_root, parent_sha)?;
-                let parent_attribution = commit_crate_attribution_index(
-                    repo_root,
-                    parent_sha,
-                    &parent_tree.manifests,
-                    &mut manifest_outcome_memo,
-                );
-                crate::crate_attribution::apply_crate_attribution_where(
-                    &mut graph.records_mut()[commit_attribution_start..commit_records_start],
-                    &parent_attribution,
-                    |record| {
-                        matches!(
-                            record,
-                            GraphRecord::Node {
-                                kind: NodeKind::Change,
-                                repo_relative_path: Some(path),
-                                ..
-                            } if mine.contains(path)
-                        )
-                    },
-                );
-                remaining.retain(|path| !mine.contains(path));
-            }
-            // A deletion no parent reports (only reachable if Git's `-m` output
-            // and the per-parent diffs disagree) keeps the post-commit answer
-            // rather than being resolved against an arbitrary tree.
-        }
+            commit,
+            &mut manifest_outcome_memo,
+            &mut graph,
+        )?;
     }
 
-    let languages = crate::languages_in_graph(&graph);
-    let mut producer = code_graph_producer(&languages);
-    producer.producer_kind = ProducerKind::HistoryReplay;
-    // Make the producer fully deterministic too (CCC1): `code_graph_producer`
-    // sets `producer_started_at` from the wall-clock `PROCESS_STARTED_AT`, which
-    // would make two `eg scan-history` runs of the same unchanged repository in
-    // separate processes differ. History replay is committed-state-only, so anchor
-    // it to the same deterministic HEAD-committer transaction time as the snapshot.
-    producer.producer_started_at = transaction_time;
+    // Issue #224: a full, unwindowed history replay ends at a named frontier
+    // so the next replay can start from the new commits instead of replaying
+    // everything. The tip node records the newest covered commit; windowed
+    // replays deliberately record NO tip — a bounded store is not a valid
+    // resume frontier (resuming from one would silently drop the
+    // bounded-out history).
+    if matches!(window, HistoryWindow::Full)
+        && let Some(tip_commit) = resolved.commits.last()
+    {
+        let (tip_node, tip_edge) = history_replay_tip_records(
+            &repository_id,
+            tip_commit,
+            resolved.commits.len(),
+            &transaction_time,
+        );
+        graph.push(tip_node);
+        graph.push(tip_edge);
+    }
+
+    let producer = history_producer(&graph, &transaction_time);
     Ok(graph.stamp_producer(&producer))
 }
 

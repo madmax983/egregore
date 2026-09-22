@@ -177,6 +177,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 log,
                 scan_coverage,
                 history_replay_window,
+                history_replay_tip,
                 embedding_model,
                 text,
                 superseded_by,
@@ -380,6 +381,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 insert_json(&mut values, log.as_deref());
                 insert_json(&mut values, scan_coverage.as_deref());
                 insert_json(&mut values, history_replay_window.as_deref());
+                insert_json(&mut values, history_replay_tip.as_ref());
                 insert_json(&mut values, embedding_model.as_deref());
                 insert_json(&mut values, body_handle.as_deref());
                 insert_json(&mut values, route.as_ref());

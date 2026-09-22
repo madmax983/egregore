@@ -337,7 +337,7 @@ fn run_history_stages(
     // skips the stage with a recorded reason instead of failing the bootstrap.
     eprintln!("init: replaying Git history…");
     let history_scanned = match git_history_preflight(&args.repo_path) {
-        Ok(()) => match scan_history(&args.repo_path, history_jsonl, scan_args) {
+        Ok(()) => match scan_history(&args.repo_path, history_jsonl, scan_args, None) {
             Ok(()) => {
                 // The history batch stamps its own Repository snapshot; align
                 // it to the tree scan's snapshot before ingest so the store's

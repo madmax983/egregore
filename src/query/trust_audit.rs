@@ -135,6 +135,7 @@ pub const fn node_trust_class(kind: NodeKind) -> NodeTrustClass {
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift

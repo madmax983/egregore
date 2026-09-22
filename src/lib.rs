@@ -148,7 +148,9 @@ pub use codex::import_codex;
 pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};
 pub use history::{
-    HistoryWindow, scan_repository_history, scan_repository_history_with_override,
+    HistoryResumeOutcome, HistoryResumePoint, HistoryWindow, history_replay_tip_id,
+    history_replay_tip_repository_ids, history_resume_point, scan_repository_history,
+    scan_repository_history_resumed, scan_repository_history_with_override,
     scan_repository_history_with_window,
 };
 pub use ir::{

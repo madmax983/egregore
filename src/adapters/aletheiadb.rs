@@ -2698,6 +2698,7 @@ impl EmbeddedAletheiaSink {
             log,
             scan_coverage,
             history_replay_window,
+            history_replay_tip,
             embedding_model,
             text,
             superseded_by,
@@ -2950,6 +2951,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("history_replay_window_json", json.as_str());
+        }
+        // History-replay resume marker (issue #224): persisted beside the
+        // window summary so a resumed store round-trips its tip.
+        if let Some(payload) = history_replay_tip
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("history_replay_tip_json", json.as_str());
         }
         // Vector-index embedding-model identity (issue #104): the queryable
         // index's producing model, persisted so `eg query semantic` can prove
@@ -3810,6 +3818,18 @@ impl EmbeddedAletheiaSink {
                     record_id,
                     format!("history_replay_window_json invalid: {e}"),
                 )
+            })?
+            .map(Box::new),
+            history_replay_tip: optional_str_property(
+                record_id,
+                "history_replay_tip_json",
+                node.get_property("history_replay_tip_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::HistoryReplayTipPayload>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("history_replay_tip_json invalid: {e}"))
             })?
             .map(Box::new),
             embedding_model: optional_str_property(
@@ -4929,6 +4949,8 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "ScanCoverage" => Ok(NodeKind::ScanCoverage),
         // History-replay window summary (issue #256).
         "HistoryReplayWindow" => Ok(NodeKind::HistoryReplayWindow),
+        // History-replay resume marker (issue #224).
+        "HistoryReplayTip" => Ok(NodeKind::HistoryReplayTip),
         // Log-signature node kinds (issues #319 / #320).
         "LogSource" => Ok(NodeKind::LogSource),
         "ErrorSignature" => Ok(NodeKind::ErrorSignature),
@@ -5276,6 +5298,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent
@@ -6586,6 +6609,48 @@ mod tests {
             "history-replay window payload must survive the embedded round trip"
         );
         assert_eq!(read_back, node, "window node must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn history_replay_tip_payload_round_trips_through_the_embedded_store() {
+        // Issue #224: a full `scan-history` emits a `HistoryReplayTip`
+        // resume-marker node; the embedded adapter must persist its payload
+        // and read it back unchanged, so a resumed store keeps its resume
+        // frontier after an ingest round trip.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("history-tip-round-trip-store");
+        let repository_id = stable_id(&["repository", "local-root-commit", "abc"]);
+        let node_id = stable_id(&["node", "history-replay-tip", &repository_id]);
+        let payload = crate::ir::HistoryReplayTipPayload {
+            repository_id,
+            tip_sha: "abc123".to_owned(),
+            covered_commit_count: 11,
+            tip_committed_at: "2026-01-11T00:00:00Z".to_owned(),
+        };
+        let node = GraphRecord::node(
+            node_id,
+            NodeKind::HistoryReplayTip,
+            None,
+            None,
+            None,
+            "history replay tip abc123".to_owned(),
+        )
+        .with_history_replay_tip(payload);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&node).expect("tip node should write");
+        let StoredRecord::Node(stored) = sink.record_handles[node.id()] else {
+            panic!("node handle should point at a node");
+        };
+        let read_back = sink
+            .read_node_record(node.id(), stored)
+            .expect("tip node should read back");
+
+        assert_eq!(
+            read_back.history_replay_tip(),
+            node.history_replay_tip(),
+            "history-replay tip payload must survive the embedded round trip"
+        );
+        assert_eq!(read_back, node, "tip node must round-trip byte-for-byte");
     }
 
     #[test]

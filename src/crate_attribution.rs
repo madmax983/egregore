@@ -466,6 +466,7 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::Commit
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         // Every non-code-graph domain.
         | NodeKind::SemanticDrift
         | NodeKind::EmbeddingModel

@@ -180,6 +180,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             // history-replay window summary to its repository (issue #256),
             // keeping the window node citable and non-orphan.
             NodeKind::HistoryReplayWindow,
+            // `Repository CONTAINS HistoryReplayTip` attributes the
+            // history-replay resume marker to its repository (issue #224),
+            // keeping the tip node citable and non-orphan.
+            NodeKind::HistoryReplayTip,
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
             // sites are contained by their owning file (issue #223).
             NodeKind::PanicRiskSite,
@@ -309,13 +313,15 @@ const fn allowed_source_kinds_for_target(
     target: NodeKind,
 ) -> Option<&'static [NodeKind]> {
     match (label, target) {
-        // `Repository —CONTAINS→ ScanCoverage` (issue #135) and
-        // `Repository —CONTAINS→ HistoryReplayWindow` (issue #256): the
+        // `Repository —CONTAINS→ ScanCoverage` (issue #135),
+        // `Repository —CONTAINS→ HistoryReplayWindow` (issue #256), and
+        // `Repository —CONTAINS→ HistoryReplayTip` (issue #224): the
         // summary must be attributed to the `Repository` it scopes, never a
         // `File` or any other container.
-        (EdgeLabel::Contains, NodeKind::ScanCoverage | NodeKind::HistoryReplayWindow) => {
-            Some(&[NodeKind::Repository])
-        }
+        (
+            EdgeLabel::Contains,
+            NodeKind::ScanCoverage | NodeKind::HistoryReplayWindow | NodeKind::HistoryReplayTip,
+        ) => Some(&[NodeKind::Repository]),
         _ => None,
     }
 }
@@ -1025,8 +1031,9 @@ fn check_required_containment(
             .is_some_and(|kinds| kinds.contains(&kind))
     }
     // Summary node IDs that have at least one `Repository —CONTAINS→` container,
-    // keyed by (node id, summary kind): `ScanCoverage` (issue #135) and
-    // `HistoryReplayWindow` (issue #256) share the containment invariant.
+    // keyed by (node id, summary kind): `ScanCoverage` (issue #135),
+    // `HistoryReplayWindow` (issue #256), and `HistoryReplayTip` (issue #224)
+    // share the containment invariant.
     let mut contained: BTreeSet<(&str, NodeKind)> = BTreeSet::new();
     for record in records {
         let GraphRecord::Edge {
@@ -1050,14 +1057,22 @@ fn check_required_containment(
         if !source_is_repository {
             continue;
         }
-        for summary_kind in [NodeKind::ScanCoverage, NodeKind::HistoryReplayWindow] {
+        for summary_kind in [
+            NodeKind::ScanCoverage,
+            NodeKind::HistoryReplayWindow,
+            NodeKind::HistoryReplayTip,
+        ] {
             if has_kind(index, target, summary_kind) {
                 contained.insert((target.as_str(), summary_kind));
             }
         }
     }
     for (id, kinds) in &index.node_kinds {
-        for summary_kind in [NodeKind::ScanCoverage, NodeKind::HistoryReplayWindow] {
+        for summary_kind in [
+            NodeKind::ScanCoverage,
+            NodeKind::HistoryReplayWindow,
+            NodeKind::HistoryReplayTip,
+        ] {
             if !kinds.contains(&summary_kind) || contained.contains(&(*id, summary_kind)) {
                 continue;
             }

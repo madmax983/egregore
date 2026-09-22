@@ -111,6 +111,26 @@ records whose endpoints no longer match freshly-minted v10 ones.
 Re-extraction from source regenerates every codegraph record under the current
 version deterministically.
 
+It was then bumped 10 → 11 by issue #224: the `HistoryReplayTip` node kind
+plus the optional `history_replay_tip` field on `Node` records, carrying the
+resume frontier (`repository_id`, `tip_sha`, `covered_commit_count`,
+`tip_committed_at`) a full `eg scan-history` emits so the next replay can
+resume from new commits instead of replaying all history. The field addition
+is `additive`: the field is `#[serde(default, skip_serializing_if =
+"Option::is_none")]`, so a legacy v10 node record with no `history_replay_tip`
+key still deserializes, and it is **never an identity input**, so `stable_id`'s
+preimage is unchanged. The new `NodeKind` variant is what forces the bump:
+`NodeKind` has no `#[serde(other)]` fallback (the `ALL` inventory test pins it
+exhaustive via serde's unknown-variant error), so a v10 reader meeting a
+`HistoryReplayTip` kind would fail deserialization rather than ignoring it —
+the `additive` reader rule ("old readers MUST accept by ignoring reserved
+variants") cannot hold without the version gate. The paired incremental
+`CACHE_SCHEMA_VERSION` bumped 28 → 29: the `SCHEMA_VERSION` bump changes every
+`codegraph:v<N>:` record-ID prefix, so a cache holding v10 IDs would replay
+records whose endpoints no longer match freshly-minted v11 ones.
+Re-extraction from source regenerates every codegraph record under the current
+version deterministically.
+
 Issue #238 added the optional `role` field (`"test"` | `"production"`) on
 `Symbol` and `File` node records WITHOUT a version bump: the addition is
 `additive` — `#[serde(default, skip_serializing_if = "Option::is_none")]`, so

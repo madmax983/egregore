@@ -109,6 +109,7 @@ const fn domain_of_kind(kind: NodeKind) -> Domain {
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow
+        | NodeKind::HistoryReplayTip
         | NodeKind::Commit
         | NodeKind::Change => Domain::CodeGraph,
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {

@@ -53,9 +53,8 @@ giving more than one window form is an error.
 Every **windowed** replay records its resolved window as a stated,
 deterministic, queryable graph fact — one `HistoryReplayWindow` node,
 attached to its `Repository` by a `CONTAINS` edge (citable, never an orphan,
-accepted by `eg validate`). Unwindowed (full-history) replays emit **no**
-window node: their output is byte-identical to pre-#256 replays, and a
-windowed store can never be mistaken for full history.
+accepted by `eg validate`). Windowed replays record **no** history-replay
+tip: a bounded store is never a valid resume frontier.
 
 ```json
 {"record_type":"node","kind":"HistoryReplayWindow","id":"codegraph:v10:…",
@@ -88,6 +87,67 @@ The payload carries no paths or PII (window kind, counts, SHAs, revs, one
 UTC instant), so the node is redaction-exempt deterministic code-graph data,
 classified `SourceDerived` for trust and `CodeGraph` for blind-spot analysis.
 
+## The `HistoryReplayTip` node and `--resume-from`
+
+Every **full, unwindowed** replay ends at a named frontier: one
+`HistoryReplayTip` node, attached to its `Repository` by a `CONTAINS` edge,
+recording the newest commit covered and how many commits the replay covered.
+(This is why full-replay output is no longer byte-identical to pre-#224
+replays — the tip node is new. Windowed replays are unchanged.)
+
+```json
+{"record_type":"node","kind":"HistoryReplayTip","id":"codegraph:v10:…",
+ "history_replay_tip":{
+   "repository_id":"<repository id>",
+   "tip_sha":"<full SHA of HEAD>",
+   "covered_commit_count":150,
+   "tip_committed_at":"2026-01-03T00:00:00Z"
+ },
+ "schema_version":10, …}
+```
+
+The tip ID folds in only the repository identity
+(`stable_id(["node","history-replay-tip",repository_id])`), so a resumed
+replay replaces the previous tip in place — every store holds exactly one
+tip per repository. Like the window node, the tip is redaction-exempt
+deterministic code-graph data, classified `SourceDerived` for trust and
+`CodeGraph` for blind-spot analysis.
+
+`--resume-from <frontier.jsonl>` replays **only the commits that landed
+after the frontier's tip** and merges them with the frontier's records:
+
+```sh
+$ eg scan-history . --out current.jsonl --resume-from prior.jsonl
+{"processed":10,"skipped":150}
+```
+
+`processed` counts the commits read from Git in this run; `skipped` counts
+the commits the frontier already covered. The merged output is
+**byte-identical** to a fresh full replay, and a zero-new-commit resume is a
+no-op: `--out` is not written at all (left untouched, preserving its mtime),
+while the `{"processed":0,"skipped":N}` report still prints.
+
+Rules:
+
+* `--resume-from` cannot be combined with any window flag
+  (`resume_with_window`).
+* The frontier file must be readable JSONL, or the run fails with
+  `invalid_frontier`.
+* The frontier must carry a tip for the repository being scanned, or the run
+  fails with `no_resume_point` (a windowed replay or a plain `scan` graph is
+  not a frontier).
+* Resume points never cross repository identities
+  (`repository_identity_mismatch`), even inside a shared multi-repo store.
+* If the stored tip is no longer an ancestor of `HEAD` — the history was
+  rewritten by a force-push or rebase — the run fails with
+  `history_rewrite_detected`; resuming would fork the timeline, so the
+  documented recovery is a full replay without `--resume-from`.
+
+Every failure prints exactly one machine-readable JSON line on stderr and
+exits 2 without writing partial output. The tip check (`merge-base
+--is-ancestor`) and the range replay (`rev-list <tip>..HEAD`) read only
+committed Git objects; the checkout is never mutated.
+
 ## Failure diagnostics
 
 A conflicting, empty, or unparseable window fails with **non-zero exit**,
@@ -115,5 +175,6 @@ The pre-existing `git_unavailable`, `not_a_git_repository`, and
 ## Determinism
 
 A fixed repository plus a fixed window produces **byte-identical** output
-across runs: commit order, node IDs, the window payload, and the transaction
-time (derived from `HEAD`'s committer date, not wall-clock) are all stable.
+across runs: commit order, node IDs, the window/tip payloads, and the
+transaction time (derived from `HEAD`'s committer date, not wall-clock) are
+all stable.

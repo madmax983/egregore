@@ -97,15 +97,21 @@ fn print_scan_coverage(graph: &Graph) {
     );
 }
 
-/// Prints the single-line machine-readable JSON diagnostic for a history-window
-/// failure (issue #256) and exits non-zero without writing partial output.
-fn exit_with_window_diagnostic(code: &'static str, message: &str) -> ! {
+/// Prints the single-line machine-readable JSON diagnostic for a CLI-level
+/// failure (issues #224 / #256) and exits non-zero without writing partial
+/// output.
+fn exit_with_diagnostic(code: &'static str, message: &str) -> ! {
     let diag = serde_json::json!({ "code": code, "message": message });
     eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
     std::process::exit(2);
 }
 
-pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs) -> Result<()> {
+pub(crate) fn scan_history(
+    repo_path: &Path,
+    out: &Path,
+    args: &ResolvedScanArgs,
+    resume_from: Option<&Path>,
+) -> Result<()> {
     warn_on_unconsumed_scope_pins();
 
     // Issue #256: validate the commit window before any repository or output
@@ -119,10 +125,20 @@ pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs
     ) {
         Ok(window) => window,
         Err(CodegraphError::HistoryWindow { code, message }) => {
-            exit_with_window_diagnostic(code, &message)
+            exit_with_diagnostic(code, &message)
         }
         Err(err) => return Err(err.into()),
     };
+
+    // Issue #224: resuming from a frontier and bounding the replay with a
+    // window are mutually exclusive — a bounded store is not a valid resume
+    // frontier. Fail before any repository or output work.
+    if resume_from.is_some() && !matches!(window, HistoryWindow::Full) {
+        exit_with_diagnostic(
+            "resume_with_window",
+            "--resume-from cannot be combined with a commit window (--max-commits, --since, --from, or --to); resume from a full-history frontier",
+        );
+    }
 
     // AC5: Verify git is available in PATH.
     let git_available = std::process::Command::new("git")
@@ -188,6 +204,13 @@ pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs
     // Issue #256: a window that resolves to no commits (or an unresolvable
     // revision) fails with the single-line JSON diagnostic and a non-zero
     // exit; no partial output is written.
+    //
+    // Issue #224: `--resume-from` replays only the commits that landed after
+    // the frontier's tip and merges them with the frontier's records.
+    if let Some(frontier_path) = resume_from {
+        return scan_history_resumed(repo_path, out, args, frontier_path);
+    }
+
     let graph = match scan_repository_history_with_window(
         repo_path,
         args.repo_id_override.as_deref(),
@@ -195,7 +218,7 @@ pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs
     ) {
         Ok(graph) => graph,
         Err(CodegraphError::HistoryWindow { code, message }) => {
-            exit_with_window_diagnostic(code, &message)
+            exit_with_diagnostic(code, &message)
         }
         Err(err) => {
             return Err(err).with_context(|| {
@@ -217,6 +240,130 @@ pub(crate) fn scan_history(repo_path: &Path, out: &Path, args: &ResolvedScanArgs
         .context("failed to serialize history graph JSONL")?;
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
+    Ok(())
+}
+
+/// Incremental `scan-history --resume-from <frontier>` (issue #224).
+///
+/// Reads the history-replay tip recorded in the frontier, replays only the
+/// commits that landed after it, and merges them with the frontier's records
+/// so the output is byte-identical to a fresh full replay. Prints a
+/// single-line JSON `{"processed":N,"skipped":M}` report to stderr, where
+/// `processed` counts the commits read from Git in this run and `skipped`
+/// counts the commits the frontier already covered.
+///
+/// Every failure mode prints the single-line JSON diagnostic and exits 2
+/// without writing partial output: `invalid_frontier` when the frontier file
+/// cannot be read or parsed as JSONL, `no_resume_point` when the frontier
+/// carries no tip for this repository (a windowed replay or a plain `scan`
+/// graph), `history_rewrite_detected` when the stored tip is no longer an
+/// ancestor of HEAD (recovery: a full replay), and
+/// `repository_identity_mismatch` when the frontier belongs to another
+/// repository. A zero-new-commit resume writes nothing: `--out` is left
+/// untouched while the report still prints.
+fn scan_history_resumed(
+    repo_path: &Path,
+    out: &Path,
+    args: &ResolvedScanArgs,
+    frontier_path: &Path,
+) -> Result<()> {
+    let repo_identity =
+        identity::compute_repository_identity(repo_path, args.repo_id_override.as_deref());
+    let (repository_id, _) = crate::repository_record_from_identity(&repo_identity);
+
+    // Read the whole frontier before any output work: `--out` may name the
+    // frontier itself (a no-op resume must leave it byte-identical), and no
+    // failure below may leave a partial output behind. An unreadable or
+    // unparsable frontier is the machine-readable `invalid_frontier`
+    // diagnostic, never a stack trace.
+    let frontier = match fs::read_to_string(frontier_path) {
+        Ok(frontier) => frontier,
+        Err(err) => exit_with_diagnostic(
+            "invalid_frontier",
+            &format!(
+                "cannot read resume frontier {}: {err}",
+                frontier_path.display()
+            ),
+        ),
+    };
+    let prior_records = match crate::adapters::records_from_jsonl(&frontier) {
+        Ok(records) => records,
+        Err(err) => exit_with_diagnostic(
+            "invalid_frontier",
+            &format!(
+                "cannot parse resume frontier {} as JSONL: {err}",
+                frontier_path.display()
+            ),
+        ),
+    };
+
+    let Some(resume) = crate::history_resume_point(&prior_records, &repository_id) else {
+        // A frontier that carries tips for *other* repositories is a foreign
+        // frontier, not a tipless one: report the identity mismatch rather
+        // than a missing resume point.
+        let tip_repos = crate::history_replay_tip_repository_ids(&prior_records);
+        if !tip_repos.is_empty() && !tip_repos.contains(&repository_id) {
+            exit_with_diagnostic(
+                "repository_identity_mismatch",
+                &format!(
+                    "resume frontier {} belongs to repository {}; current repository is {repository_id}; resume points never cross repository identities",
+                    frontier_path.display(),
+                    tip_repos.join(", "),
+                ),
+            );
+        }
+        exit_with_diagnostic(
+            "no_resume_point",
+            &format!(
+                "resume frontier {} has no history-replay tip for this repository; resume from a full scan-history output",
+                frontier_path.display(),
+            ),
+        );
+    };
+
+    let outcome = match crate::scan_repository_history_resumed(
+        repo_path,
+        args.repo_id_override.as_deref(),
+        resume,
+    ) {
+        Ok(outcome) => outcome,
+        Err(CodegraphError::HistoryResume { code, message }) => {
+            exit_with_diagnostic(code, &message);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to resume Git history scan for {}",
+                    repo_path.display()
+                )
+            });
+        }
+    };
+
+    // Redact the merged record set exactly as the full path does: the prior
+    // records were already redacted when the frontier was written (redaction
+    // is idempotent over them), and the new commits' records need it now.
+    let mut records = outcome.graph.into_records();
+    crate::redaction::redact_code_graph(&mut records, args.raw_literals, &repository_id);
+    let graph = Graph::from_records(records);
+
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize history graph JSONL")?;
+    // A zero-new-commit resume is a no-op: the frontier already holds the
+    // converged record set, so `--out` is left untouched — never truncated or
+    // rewritten, preserving its mtime — while the processed/skipped report
+    // below still prints.
+    if outcome.processed > 0 {
+        fs::write(out, jsonl)
+            .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
+    }
+
+    let report = serde_json::json!({
+        "processed": outcome.processed,
+        "skipped": outcome.skipped,
+    });
+    eprintln!("{}", serde_json::to_string(&report).unwrap_or_default());
     Ok(())
 }
 

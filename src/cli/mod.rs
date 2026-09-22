@@ -350,6 +350,17 @@ pub(crate) enum Commands {
         /// `--from`, replays everything reachable from this revision.
         #[arg(long)]
         to: Option<String>,
+        /// Resume from a prior full `scan-history` frontier instead of
+        /// replaying every commit (issue #224).
+        ///
+        /// Reads the history-replay tip recorded in `<path>`, replays only
+        /// the commits that landed after it, and merges them with the
+        /// frontier's records. The output is byte-identical to a fresh full
+        /// replay. Cannot be combined with any window flag (`--max-commits`,
+        /// `--since`, `--from`, `--to`): a windowed store is not a valid
+        /// resume frontier.
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
     },
     /// Extract runtime log signatures from a captured log file (issues #319 / #320).
     ///
@@ -5468,13 +5479,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             since,
             from,
             to,
+            resume_from,
         } => {
             let mut args = resolve_scan_args(repo_id_override, raw_literals);
             args.max_commits = max_commits;
             args.since = since;
             args.from_rev = from;
             args.to_rev = to;
-            scan_history(&repo_path, &out, &args)
+            scan_history(&repo_path, &out, &args, resume_from.as_deref())
         }
         Commands::Config { action } => match action {
             ConfigAction::Show => config_show(),

@@ -219,6 +219,7 @@ fn make_agent_memory_node(
         log: None,
         scan_coverage: None,
         history_replay_window: None,
+        history_replay_tip: None,
         embedding_model: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,

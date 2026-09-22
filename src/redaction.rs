@@ -286,6 +286,7 @@ pub(crate) const fn is_code_graph_kind(kind: NodeKind) -> bool {
             | NodeKind::UnsafeSite
             | NodeKind::ScanCoverage
             | NodeKind::HistoryReplayWindow
+            | NodeKind::HistoryReplayTip
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::SemanticDrift

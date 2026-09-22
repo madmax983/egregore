@@ -24,6 +24,13 @@ use std::path::{Path, PathBuf};
 /// The draft all emitted schemas must declare.
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
+/// Current codegraph schema version. Must track `SCHEMA_VERSION` in
+/// `src/ir.rs` (bumped 10 -> 11 by issue #224, which added the
+/// `HistoryReplayTip` node kind). Tests that assert current-version behavior
+/// (e.g. the producer-envelope requirement) address this version; v10 is now
+/// legacy and stays legacy per `docs/schema/producer-version.md` §6.
+const CODEGRAPH_CURRENT_VERSION: u32 = 11;
+
 fn eg() -> Command {
     Command::cargo_bin("egregore").expect("binary should be built")
 }
@@ -356,7 +363,7 @@ fn read_records(path: &Path) -> Vec<Value> {
 
 #[test]
 fn single_document_is_draft_2020_12() {
-    let doc = export_single("codegraph", "Symbol", 10);
+    let doc = export_single("codegraph", "Symbol", CODEGRAPH_CURRENT_VERSION);
     assert_eq!(
         doc.get("$schema").and_then(Value::as_str),
         Some(DRAFT_2020_12),
@@ -393,9 +400,23 @@ fn single_document_is_draft_2020_12() {
     ] {
         assert!(
             required.contains(&field),
-            "codegraph Symbol v10 should require {field}; got {required:?}"
+            "codegraph Symbol v{CODEGRAPH_CURRENT_VERSION} should require {field}; got {required:?}"
         );
     }
+    // Legacy versions stay legacy (docs/schema/producer-version.md §6): the
+    // v10 document must NOT require the producer envelope anymore.
+    let legacy_doc = export_single("codegraph", "Symbol", 10);
+    let legacy_required: Vec<&str> = legacy_doc
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("legacy node schema needs required")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !legacy_required.contains(&"producer"),
+        "codegraph Symbol v10 is legacy and must not require producer; got {legacy_required:?}"
+    );
     // Kind and version are pinned to the addressable tuple.
     let props = doc.get("properties").expect("needs properties");
     assert_eq!(
@@ -410,7 +431,7 @@ fn single_document_is_draft_2020_12() {
             .get("schema_version")
             .and_then(|v| v.get("const"))
             .and_then(Value::as_u64),
-        Some(10)
+        Some(u64::from(CODEGRAPH_CURRENT_VERSION))
     );
 }
 
@@ -856,12 +877,16 @@ fn negative_missing_producer_envelope() {
     let docs = docs_by_id();
     let list = schema_list();
     // Current-version records require the producer envelope.
-    let rec = base_node("codegraph", "Symbol", 10);
+    let rec = base_node("codegraph", "Symbol", u64::from(CODEGRAPH_CURRENT_VERSION));
     assert_invalid(&docs, &list, &Value::Object(rec));
     // ...but legacy versions predate the envelope (docs/schema/producer-version.md §4).
     let mut legacy = base_node("codegraph", "Symbol", 5);
     legacy.insert("id".into(), Value::String("codegraph:v5:test01".into()));
     assert_valid(&docs, &list, &Value::Object(legacy));
+    // v10 was current before the #224 schema bump and is legacy now (§6):
+    // a producer-less v10 record validates.
+    let legacy_v10 = base_node("codegraph", "Symbol", 10);
+    assert_valid(&docs, &list, &Value::Object(legacy_v10));
 }
 
 #[test]

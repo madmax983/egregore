@@ -12,7 +12,7 @@ use crate::error::Result;
 /// 8→9: issue #117 adds the optional `crate_attribution` field (owning Cargo
 /// package name + the repo-relative path of the owning `Cargo.toml`) on every
 /// path-bearing code-graph node. Additive and never an identity input.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -562,6 +562,31 @@ pub struct HistoryReplayWindowPayload {
     pub oldest_commit_sha: String,
     /// Newest selected commit SHA.
     pub newest_commit_sha: String,
+}
+
+/// History-replay resume marker stamped on the single `HistoryReplayTip` node
+/// (issue #224).
+///
+/// One node per *full* (unwindowed) `scan-history` replay, keyed by repository
+/// identity, records how far the replay reached: the tip commit SHA and the
+/// number of commits covered. A later `--resume-from` run reads this node back
+/// from the frontier JSONL and replays only `tip_sha..HEAD`, so the temporal
+/// graph stays current at the cost of new commits rather than all of history.
+/// All fields are additive per `docs/schema/schema-versioning.md §2` and
+/// carry no paths or PII — only the repository ID, commit SHAs, a count, and
+/// one UTC instant — so the node is redaction-exempt deterministic
+/// code-graph data, like [`ScanCoveragePayload`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HistoryReplayTipPayload {
+    /// Stable repository identity this tip belongs to (the `Repository`
+    /// node's ID).
+    pub repository_id: String,
+    /// Full SHA of the newest commit covered by the replay (inclusive).
+    pub tip_sha: String,
+    /// Commits covered by the replay — the resume frontier size.
+    pub covered_commit_count: usize,
+    /// Committer date of the tip commit, UTC `Z` RFC 3339.
+    pub tip_committed_at: String,
 }
 
 /// Per-kind payload stamped on the four log-signature node kinds (issues
@@ -1364,6 +1389,12 @@ pub enum GraphRecord {
         /// (full-history) replays.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         history_replay_window: Option<Box<HistoryReplayWindowPayload>>,
+        /// History-replay resume marker for the single `HistoryReplayTip`
+        /// node (issue #224); absent on all other kinds and on windowed
+        /// replays, which never represent full history and are not valid
+        /// resume bases.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_replay_tip: Option<Box<HistoryReplayTipPayload>>,
         /// Embedding-model identity for the semantic `EmbeddingModel` node that
         /// records which model produced a store's queryable vector index (issue
         /// #104); absent on all other kinds and on stores embedded before
@@ -1985,6 +2016,7 @@ impl GraphRecord {
             log: None,
             scan_coverage: None,
             history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2119,6 +2151,7 @@ impl GraphRecord {
             log: None,
             scan_coverage: None,
             history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2252,6 +2285,7 @@ impl GraphRecord {
             log: None,
             scan_coverage: None,
             history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -2390,6 +2424,7 @@ impl GraphRecord {
             log: None,
             scan_coverage: None,
             history_replay_window: None,
+            history_replay_tip: None,
             embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
@@ -3086,6 +3121,31 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps a [`HistoryReplayTipPayload`] on the `HistoryReplayTip` node
+    /// (issue #224). No-op on non-node records.
+    #[must_use]
+    pub fn with_history_replay_tip(mut self, payload: HistoryReplayTipPayload) -> Self {
+        if let Self::Node {
+            history_replay_tip, ..
+        } = &mut self
+        {
+            *history_replay_tip = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the history-replay tip payload when this record is a
+    /// `HistoryReplayTip` node carrying one; `None` otherwise (issue #224).
+    #[must_use]
+    pub fn history_replay_tip(&self) -> Option<&HistoryReplayTipPayload> {
+        match self {
+            Self::Node {
+                history_replay_tip, ..
+            } => history_replay_tip.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Stamps the queryable vector index's [`EmbeddingModel`] identity on an
     /// `EmbeddingModel` node (issue #104). No-op on non-node records.
     #[must_use]
@@ -3518,6 +3578,15 @@ pub enum NodeKind {
     /// citable and never an orphan. Never emitted for unwindowed (full)
     /// replays, which stay byte-identical to pre-#256 output.
     HistoryReplayWindow,
+    /// History-replay resume marker (issue #224): one node per *full*
+    /// `eg scan-history`, carrying a [`HistoryReplayTipPayload`] (the
+    /// repository identity, the tip commit SHA reached, and the covered
+    /// commit count) so a later `--resume-from` run can replay only the
+    /// commits after the tip. Keyed per repository identity, attached to its
+    /// `Repository` by a `CONTAINS` edge, and upserted by stable ID on every
+    /// full replay. Never emitted for windowed replays, which do not
+    /// represent full history and are not valid resume bases.
+    HistoryReplayTip,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -3657,7 +3726,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3671,6 +3740,7 @@ impl NodeKind {
         Self::DependencyDeclaration,
         Self::ScanCoverage,
         Self::HistoryReplayWindow,
+        Self::HistoryReplayTip,
         Self::Commit,
         Self::Change,
         Self::SemanticDrift,
@@ -3739,6 +3809,7 @@ impl NodeKind {
             Self::DependencyDeclaration => "DependencyDeclaration",
             Self::ScanCoverage => "ScanCoverage",
             Self::HistoryReplayWindow => "HistoryReplayWindow",
+            Self::HistoryReplayTip => "HistoryReplayTip",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",
