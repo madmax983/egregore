@@ -27,6 +27,7 @@ eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query transitive-callees <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query diagram <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-nodes N] [--at <COMMIT> | --as-of <RFC3339>] [--format mermaid|dot|json|text]
 eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
@@ -103,6 +104,13 @@ Evidence-backed audit subcommands have their own pages:
   `CALLS` resolution labels propagated along each path — the outbound mirror of
   `eg query transitive-callers` ([transitive-callees.md](transitive-callees.md),
   issue #253).
+- `eg query diagram` — a symbol's **local call neighborhood as a citable
+  diagram** (Mermaid by default, or Graphviz DOT): direct callers, direct
+  callees, and the containing file/module over the closed
+  `CALLS`/`DEFINES`/`CONTAINS`/`IMPORTS` vocabulary, bounded by `--depth` and
+  `--max-nodes`, with explicit truncation diagnostics, deterministic ordering,
+  and a stable-record-ID legend — honoring `--at`/`--as-of` temporal views
+  ([diagram.md](diagram.md), issue #228).
 - `eg query deps` — the **direct outbound dependencies** of a symbol — what it
   calls, implements, imports, and references — labeled by edge type, with
   unresolved targets as an explicit category, honoring `--at`/`--as-of`

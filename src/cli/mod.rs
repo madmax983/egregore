@@ -110,6 +110,8 @@ mod session_retrospective;
 mod verify_scan;
 // Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
 mod trust_audit;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+mod diagram;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -218,6 +220,8 @@ pub(crate) use deprecated_symbols::*;
 pub(crate) use verify_scan::*;
 // Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use trust_audit::*;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use diagram::*;
 
 use std::{
     collections::BTreeMap,
@@ -2348,6 +2352,71 @@ pub(crate) enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+    },
+    /// Render one symbol's local call neighborhood as a diagram (issue #228).
+    ///
+    /// A local-orientation lane for the transitive-family queries: given a
+    /// symbol record ID or an exact symbol name, draws the bounded
+    /// neighborhood around it — direct callers (`CALLS` in-edges), direct
+    /// callees (`CALLS` out-edges), and the containing file/module
+    /// (`DEFINES`/`CONTAINS`) — in a standard text diagram format
+    /// (Mermaid by default, or Graphviz DOT). `--depth` extends the walk
+    /// beyond depth 1 (containers then contribute their members and imports);
+    /// `--max-nodes` caps the rendered node count.
+    ///
+    /// The diagram is a deterministic projection of already-stored,
+    /// citable edges: every node carries its stable record ID plus a
+    /// repo-relative file/span citation in the legend, every edge is labeled
+    /// with its stored kind, and no edge appears that is not in the graph.
+    /// Node keys (`n0`, `n1`, …) are assigned in ascending record-ID order,
+    /// so output is byte-identical across runs. It is NOT a control-flow or
+    /// data-flow diagram: the lines are graph edges, not proof of runtime
+    /// behavior.
+    ///
+    /// Exit codes:
+    ///   0 — diagram rendered.
+    ///   1 — malformed handle / invalid --depth / invalid --max-nodes /
+    ///       ambiguous name / unsupported (non-symbol) handle; machine-
+    ///       readable JSON on stderr.
+    ///   2 — handle resolves to no live record (stale or unknown), or
+    ///       --at/--as-of names no resolvable commit.
+    ///   3 — symbol resolved but has no callers, callees, or container in
+    ///       this view (`empty_neighborhood`).
+    ///
+    /// Documented in `docs/cli/diagram.md` and `docs/cli/query.md`.
+    Diagram {
+        /// Symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Neighborhood depth bound (hops from the queried symbol; default 1).
+        /// Reachable nodes beyond the bound yield a truncation diagnostic with
+        /// dropped frontier counts per depth rather than silently omitted.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Maximum rendered nodes, anchor included (default 100). Dropped
+        /// nodes and their incident edges are counted in the truncation
+        /// diagnostic, never silently omitted.
+        #[arg(long, default_value_t = 100)]
+        max_nodes: usize,
+        /// Restrict the walk to the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Restrict the walk to the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format (mermaid, dot, json, text; default mermaid).
+        #[arg(long, value_enum, default_value_t = DiagramFormat::Mermaid)]
+        format: DiagramFormat,
     },
     /// Walk the transitive outbound callees/dependencies of a symbol with dependency paths (issue #253).
     ///
@@ -7804,6 +7873,72 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 as_of.as_deref(),
                 at_head,
                 all_history,
+                format,
+            )
+        }
+        QuerySubcommand::Diagram {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            depth,
+            max_nodes,
+            at,
+            as_of,
+            format,
+        } => {
+            // Validate the bounds before any store I/O.
+            if depth == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_depth",
+                    "depth": 0,
+                    "message": "--depth must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            if max_nodes == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_max_nodes",
+                    "max_nodes": 0,
+                    "message": "--max-nodes must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query transitive-callers`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_diagram_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                depth,
+                max_nodes,
+                at.as_deref(),
+                as_of.as_deref(),
                 format,
             )
         }

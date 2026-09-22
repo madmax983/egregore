@@ -697,6 +697,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "diagram",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
         "transitive-callers",
         LaneStatic {
             store_mode: StoreMode::Structural,

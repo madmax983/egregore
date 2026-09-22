@@ -72,6 +72,8 @@ mod sessions;
 mod trust;
 // Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
 mod trust_audit;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+mod neighborhood;
 // Appended (issue #265); kept at the end to minimize cross-lane merge conflicts.
 mod blind_spots;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
@@ -154,3 +156,5 @@ pub(crate) use trust::{
 };
 // Appended (issue #236); kept at the end to minimize cross-lane merge conflicts.
 pub use trust_audit::*;
+// Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
+pub use neighborhood::*;
