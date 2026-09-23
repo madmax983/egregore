@@ -8,22 +8,22 @@ use super::*;
 #[derive(Debug, Serialize)]
 pub(crate) struct FreshnessReport {
     /// Stable freshness code.
-    freshness: String,
+    pub(crate) freshness: String,
     /// Convenience boolean: `true` only when `freshness == "fresh"`.
-    fresh: bool,
+    pub(crate) fresh: bool,
     /// Stable `Repository` record ID the freshness was computed for.
-    repository_id: String,
+    pub(crate) repository_id: String,
     /// Where the store was read from: `"graph"` or `"data_dir"`.
-    store_kind: String,
+    pub(crate) store_kind: String,
     /// Current working-tree HEAD state.
-    current_head: SnapshotHead,
+    pub(crate) current_head: SnapshotHead,
     /// Current working-tree dirty flag.
-    current_dirty: bool,
+    pub(crate) current_dirty: bool,
     /// The snapshot the store was built from; absent for pre-stamping stores.
     #[serde(skip_serializing_if = "Option::is_none")]
-    stored_snapshot: Option<crate::ir::SourceSnapshotPayload>,
+    pub(crate) stored_snapshot: Option<crate::ir::SourceSnapshotPayload>,
     /// Human-oriented one-line explanation of the verdict.
-    message: String,
+    pub(crate) message: String,
 }
 
 /// Renders a [`SnapshotHead`] for human-readable output.
@@ -59,20 +59,26 @@ pub(crate) fn freshness_message(verdict: Freshness) -> String {
     }
 }
 
-/// Handles `eg freshness [repo_path] (--graph <p> | --data-dir <d>) [--format ...]`.
+/// Computes the store-freshness assessment shared by `eg freshness` and the MCP
+/// freshness stamp (issue #220).
 ///
-/// Strictly read-only (issue #82 AC4): loads the store through the same
-/// read-only path queries use, probes the working tree with `git rev-parse` /
-/// `git status`, and never writes anything. Always returns `Ok(())` once a
-/// verdict is produced; the verdict (including `unknown`) is the payload, not an
-/// error.
-pub(crate) fn freshness_cmd(
+/// This is the single code path behind both surfaces, so the MCP verdict always
+/// agrees with the CLI verdict for the same store and working-tree state:
+/// identity probe → stored snapshot lookup (with the sole-stamped fallback) →
+/// [`freshness::classify`] → the sparse-checkout `fresh`→`stale_dirty` downgrade
+/// (FFF1).
+///
+/// Strictly read-only (issue #82 AC4): probes the working tree with read-only
+/// `git` commands (`GIT_OPTIONAL_LOCKS=0`, so the index is never refreshed) and
+/// never writes to the store, the tree, or any runtime files. Always produces a
+/// verdict — including `unknown` — never an error.
+pub(crate) fn assess_freshness(
     repo_path: &Path,
+    records: &[GraphRecord],
     graph: Option<&Path>,
     data_dir: Option<&Path>,
     repo_id_override: Option<&str>,
-    format: OutputFormat,
-) -> Result<()> {
+) -> FreshnessReport {
     let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
     let identity = identity::compute_repository_identity(repo_path, repo_id_override);
     // Exclude both known store artifacts plus any in-tree `.egregore` store from
@@ -90,15 +96,6 @@ pub(crate) fn freshness_cmd(
     let (current_head, current_dirty) =
         identity::working_tree_snapshot_excluding(repo_path, &exclusions);
 
-    // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
-    // read). A `--data-dir` embedded store is read through a throwaway copy,
-    // because the embedded engine re-persists its on-disk index files on open;
-    // operating on a copy guarantees the live store's records, indexes, runtime
-    // files, and receipts are never created, modified, or deleted.
-    let records = match data_dir {
-        Some(dir) => load_records_from_data_dir_readonly(dir)?,
-        None => load_query_records(graph, None)?,
-    };
     // An explicit `--repo-id-override` pins the identity used to locate the stored
     // snapshot, so it must match exactly: a wrong/typo'd override must not borrow an
     // unrelated sole repository's snapshot via the single-repository fallback (which
@@ -115,7 +112,7 @@ pub(crate) fn freshness_cmd(
         // Exact match required; when found, the owner is the requested identity.
         (
             identity.id.clone(),
-            freshness::stored_snapshot_exact(&records, &identity.id),
+            freshness::stored_snapshot_exact(records, &identity.id),
         )
     } else {
         // Mirror the per-row query freshness path (Z1): when the identity probe
@@ -124,8 +121,8 @@ pub(crate) fn freshness_cmd(
         // legacy unstamped node) classifies unambiguously instead of reporting
         // `unknown` — and `eg freshness` agrees with `eg query ... --repo-path` on
         // the same store (PR #186 follow-up DDD1).
-        match freshness::stored_snapshot_with_owner(&records, &identity.id)
-            .or_else(|| freshness::stored_snapshot_sole_stamped(&records))
+        match freshness::stored_snapshot_with_owner(records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(records))
         {
             Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
             None => (identity.id.clone(), None),
@@ -139,14 +136,13 @@ pub(crate) fn freshness_cmd(
     // store already requires a re-scan.
     if verdict.is_fresh() {
         let removed = identity::index_hidden_absent_source_inputs(repo_path);
-        let index = query::RepositoryIndex::build(&records);
-        if cited_source_stale_on_disk(&records, &index, &report_repository_id, repo_path, &removed)
-        {
+        let index = query::RepositoryIndex::build(records);
+        if cited_source_stale_on_disk(records, &index, &report_repository_id, repo_path, &removed) {
             verdict = Freshness::StaleDirty;
         }
     }
 
-    let report = FreshnessReport {
+    FreshnessReport {
         freshness: verdict.code().to_owned(),
         fresh: verdict.is_fresh(),
         repository_id: report_repository_id,
@@ -155,7 +151,36 @@ pub(crate) fn freshness_cmd(
         current_dirty,
         stored_snapshot: stored.cloned(),
         message: freshness_message(verdict),
+    }
+}
+
+/// Handles `eg freshness [repo_path] (--graph <p> | --data-dir <d>) [--format ...]`.
+///
+/// Strictly read-only (issue #82 AC4): loads the store through the same
+/// read-only path queries use, probes the working tree with `git rev-parse` /
+/// `git status`, and never writes anything. Always returns `Ok(())` once a
+/// verdict is produced; the verdict (including `unknown`) is the payload, not an
+/// error.
+pub(crate) fn freshness_cmd(
+    repo_path: &Path,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    repo_id_override: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
+    // read). A `--data-dir` embedded store is read through a throwaway copy,
+    // because the embedded engine re-persists its on-disk index files on open;
+    // operating on a copy guarantees the live store's records, indexes, runtime
+    // files, and receipts are never created, modified, or deleted.
+    let records = match data_dir {
+        Some(dir) => load_records_from_data_dir_readonly(dir)?,
+        None => load_query_records(graph, None)?,
     };
+    // The verdict itself is computed by the shared assessment so `eg freshness`
+    // and the MCP freshness stamp (issue #220) always agree.
+    let report = assess_freshness(repo_path, &records, graph, data_dir, repo_id_override);
+    let store_kind = report.store_kind.clone();
 
     match format {
         OutputFormat::Json => {

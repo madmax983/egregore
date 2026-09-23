@@ -1,15 +1,21 @@
 //! MCP server for Egregore read-only tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
-//! three read-only tools backed by the existing daemon query, symbol-context,
+//! four read-only tools backed by the existing daemon query, symbol-context,
 //! and task-evidence contracts:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
 //! - **`task_evidence`** — evidence-backed task context, trust-separated by domain.
+//! - **`store_freshness`** — store-freshness verdict for the whole store (issue #220).
 //!
 //! All tool responses carry machine-readable structured output with record IDs and
-//! citation handles. No write tools ship in this slice.
+//! citation handles. Successful responses additionally carry a `freshness`
+//! object (issue #220): the store-freshness verdict from the #186 contract
+//! (`fresh` / `stale_head` / `stale_dirty` / `unknown`), the stored
+//! source-snapshot identity the answer was derived from, and the working-tree
+//! state it was compared against — a trust signal, never suppression. No write
+//! tools ship in this slice.
 //!
 //! ## Transport
 //!
@@ -63,6 +69,10 @@ use crate::{
 pub struct InspectStoreArgs {
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 /// Parameters for the `symbol_context` tool.
@@ -72,6 +82,10 @@ pub struct SymbolContextArgs {
     pub symbol_name: String,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 /// Parameters for the `task_evidence` tool.
@@ -81,11 +95,26 @@ pub struct TaskEvidenceArgs {
     pub id_or_handle: String,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
+/// Parameters for the `store_freshness` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StoreFreshnessArgs {
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
 
-/// MCP server that exposes the three Egregore read-only evidence-query tools.
+/// MCP server that exposes the four Egregore read-only evidence-query tools.
 ///
 /// Created by [`run_stdio`] or constructed directly for testing via
 /// [`EgregoreMcpServer::new`].
@@ -108,11 +137,14 @@ impl EgregoreMcpServer {
     /// Requires a running local daemon.
     #[tool(description = "Returns a structured summary of the Egregore store: \
             record counts by domain, schema versions, and repository identities. \
-            Requires a running local daemon.")]
+            Successful responses carry a `freshness` object (verdict, stored \
+            source-snapshot identity, working-tree state) so agents can gate \
+            trust in the cited handles. Requires a running local daemon.")]
     #[must_use]
     pub fn inspect_store(&self, Parameters(args): Parameters<InspectStoreArgs>) -> String {
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
-        let payload = run_inspect_store(&data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let payload = run_inspect_store(&data_dir, &repo_path);
         serde_json::to_string(&payload).unwrap_or_default()
     }
 
@@ -126,7 +158,9 @@ impl EgregoreMcpServer {
             truth), project_state (tasks/ACs), artifacts, \
             verification_evidence, and drift_history (semantic-drift \
             measurements). Every item carries a record_id and at \
-            least one citation handle."
+            least one citation handle. Successful responses carry a \
+            `freshness` object (verdict, stored source-snapshot identity, \
+            working-tree state) so agents can gate trust in the cited handles."
     )]
     #[must_use]
     pub fn symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
@@ -142,6 +176,7 @@ impl EgregoreMcpServer {
             return serde_json::to_string(&err).unwrap_or_default();
         }
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
         let client = match DaemonClient::from_data_dir(&data_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -154,11 +189,9 @@ impl EgregoreMcpServer {
                 return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
             }
         };
-        serde_json::to_string(&tool_symbol_context_from_records(
-            &records,
-            &args.symbol_name,
-        ))
-        .unwrap_or_default()
+        let mut payload = tool_symbol_context_from_records(&records, &args.symbol_name);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
     }
 
     /// Returns evidence-backed context for a task, accepting a canonical
@@ -167,10 +200,13 @@ impl EgregoreMcpServer {
             by its canonical record ID, GitHub URL, GitHub short handle, or \
             local JSONL handle. Sections: tasks, acceptance_criteria, \
             source_facts, observations, artifacts, verification_evidence, \
-            reviews, external_links, unresolved.")]
+            reviews, external_links, unresolved. Successful responses carry a \
+            `freshness` object (verdict, stored source-snapshot identity, \
+            working-tree state) so agents can gate trust in the cited handles.")]
     #[must_use]
     pub fn task_evidence(&self, Parameters(args): Parameters<TaskEvidenceArgs>) -> String {
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
         let client = match DaemonClient::from_data_dir(&data_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -183,11 +219,41 @@ impl EgregoreMcpServer {
                 return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
             }
         };
-        serde_json::to_string(&tool_task_evidence_from_records(
-            &records,
-            &args.id_or_handle,
-        ))
-        .unwrap_or_default()
+        let mut payload = tool_task_evidence_from_records(&records, &args.id_or_handle);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Returns the store-freshness verdict for the whole store — the same
+    /// verdict the per-tool `freshness` objects carry — without requiring a
+    /// symbol or task argument. Requires a running local daemon.
+    #[tool(description = "Returns the store-freshness verdict for the whole \
+            store: verdict (fresh / stale_head / stale_dirty / unknown), the \
+            stored source-snapshot identity, and the working-tree state it was \
+            compared against. Same verdict the inspect_store / symbol_context / \
+            task_evidence `freshness` objects carry. Requires a running local \
+            daemon.")]
+    #[must_use]
+    pub fn store_freshness(&self, Parameters(args): Parameters<StoreFreshnessArgs>) -> String {
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let payload = json!({
+            "ok": true,
+            "freshness": tool_freshness_stamp(&records, &repo_path, Some(&data_dir)),
+        });
+        serde_json::to_string(&payload).unwrap_or_default()
     }
 }
 
@@ -238,6 +304,10 @@ pub fn run_stdio(default_data_dir: &Path) -> anyhow::Result<()> {
 /// directly by tests that supply a fixture slice.
 ///
 /// The `snapshot_timestamp` field is forwarded verbatim; pass an RFC 3339 string.
+///
+/// The returned payload does NOT include the `freshness` object — the tool
+/// method stamps it via [`stamp_freshness_on_payload`] once the working-tree
+/// comparison path (`repo_path`) is known.
 #[must_use]
 pub fn tool_inspect_store_from_records(
     records: &[GraphRecord],
@@ -586,7 +656,76 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
 
 // ── Tool runners (daemon I/O) ─────────────────────────────────────────────────
 
-fn run_inspect_store(data_dir: &Path) -> Value {
+/// Builds the machine-readable `freshness` object stamped onto MCP tool
+/// responses (issue #220).
+///
+/// Reuses the store-freshness contract from #186 — no new vocabulary:
+/// - `verdict` / `fresh`: the stable code from
+///   [`freshness::Freshness::code`](crate::freshness::Freshness) (`fresh` /
+///   `stale_head` / `stale_dirty` / `unknown`), computed by the exact code path
+///   `eg freshness` uses, so the verdict always agrees with the CLI for the
+///   same store and working-tree state.
+/// - `stored_snapshot`: the source-snapshot identity the answer was derived
+///   from, reusing the on-disk [`SourceSnapshotPayload`](crate::ir::SourceSnapshotPayload)
+///   serialization (`head.state`: `commit` + `sha`, `no_git`, or `unborn_head`);
+///   a store that predates snapshot stamping carries the explicit
+///   `{"state": "pre_stamping"}` marker instead of a silent absence — never a
+///   false `fresh`.
+/// - `current_head` / `current_dirty`: the working-tree state the stored
+///   snapshot was compared against, probed read-only at `repo_path`.
+/// - `repository_id` / `repo_path` / `message`: which repository the verdict
+///   was computed for, which tree it was compared against, and the
+///   human-readable explanation from the #186 contract.
+///
+/// The probe is strictly read-only and offline: `git rev-parse` / `git status`
+/// with `GIT_OPTIONAL_LOCKS=0` (the index is never refreshed), no network, and
+/// no store writes. For a fixed store + working-tree state the object is
+/// byte-identical across calls (the stored `scanned_at` is record data, fixed
+/// for a fixed store).
+#[must_use]
+pub fn tool_freshness_stamp(
+    records: &[GraphRecord],
+    repo_path: &Path,
+    data_dir: Option<&Path>,
+) -> Value {
+    let report = crate::cli::assess_freshness(repo_path, records, None, data_dir, None);
+    // Explicit marker — a pre-stamping store must never read as a silent
+    // absence, and must never classify `fresh`.
+    let stored_snapshot = report.stored_snapshot.as_ref().map_or_else(
+        || json!({"state": "pre_stamping"}),
+        |snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null),
+    );
+    json!({
+        "verdict": report.freshness,
+        "fresh": report.fresh,
+        "repository_id": report.repository_id,
+        "repo_path": repo_path.display().to_string(),
+        "stored_snapshot": stored_snapshot,
+        "current_head": report.current_head,
+        "current_dirty": report.current_dirty,
+        "message": report.message,
+    })
+}
+
+/// Stamps the [`tool_freshness_stamp`] object onto a successful tool payload
+/// (issue #220).
+///
+/// Freshness is a trust signal, never suppression: the stamp is purely additive
+/// and the full answer payload is preserved. Error payloads (`ok: false`) are
+/// left untouched — freshness annotates answers, not failures.
+pub fn stamp_freshness_on_payload(
+    payload: &mut Value,
+    records: &[GraphRecord],
+    repo_path: &Path,
+    data_dir: Option<&Path>,
+) {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    payload["freshness"] = tool_freshness_stamp(records, repo_path, data_dir);
+}
+
+fn run_inspect_store(data_dir: &Path, repo_path: &Path) -> Value {
     let client = match DaemonClient::from_data_dir(data_dir) {
         Ok(c) => c,
         Err(e) => return daemon_error(&e.to_string()),
@@ -595,7 +734,10 @@ fn run_inspect_store(data_dir: &Path) -> Value {
         Ok(r) => r,
         Err(e) => return daemon_error(&e.to_string()),
     };
-    tool_inspect_store_from_records(&records, &unknown_versions, &snapshot_timestamp)
+    let mut payload =
+        tool_inspect_store_from_records(&records, &unknown_versions, &snapshot_timestamp);
+    stamp_freshness_on_payload(&mut payload, &records, repo_path, Some(data_dir));
+    payload
 }
 
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
@@ -885,6 +1027,19 @@ fn daemon_error(msg: &str) -> Value {
 
 fn opt_data_dir(data_dir: Option<&str>, default: &Path) -> PathBuf {
     data_dir.map_or_else(|| default.to_path_buf(), PathBuf::from)
+}
+
+/// Resolves the working-tree path a freshness verdict is computed against.
+///
+/// Defaults to the MCP server process's current directory, mirroring
+/// `eg freshness`'s default `repo_path` of `.`. A missing/unresolvable default
+/// degrades to an empty path, whose working-tree probe yields `no_git` and
+/// therefore an `unknown` verdict — never a false `fresh`.
+fn opt_repo_path(repo_path: Option<&str>) -> PathBuf {
+    repo_path.map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    )
 }
 
 // ── Domain category mapping (matches the existing CLI inspect output) ─────────

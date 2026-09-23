@@ -2,7 +2,7 @@
 
 `eg mcp` is the **primary way a coding agent talks to Egregore**: a stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server exposing
-three **read-only**, citation-bearing tools backed by the running local
+four **read-only**, citation-bearing tools backed by the running local
 daemon. Register it once in your agent host; the agent then calls Egregore's
 evidence tools over MCP instead of shelling out to `eg query …` per question —
 which keeps tool discovery, the structured-output contract, and the citation
@@ -28,7 +28,7 @@ envelope intact.
    eg daemon status --data-dir /abs/path/to/.egregore   # confirm it is up
    ```
 
-   All three tools fail closed when no daemon answers for `--data-dir`
+   All four tools fail closed when no daemon answers for `--data-dir`
    (see [Error envelope](#error-envelope) — gate on it, don't retry blindly).
 
 3. **Register the server** in your agent host with one of the copy-paste
@@ -118,7 +118,7 @@ Every tool takes an optional `data_dir` argument (string, defaults to the
 `--data-dir` the server was started with) and returns a JSON text payload.
 The top-level shape is stable: **`"ok": true`** with data fields, or
 **`"ok": false`** with an `"error"` object — never a bare string, never an
-HTTP-style status. The three tool names are stable; the response is additive
+HTTP-style status. The four tool names are stable; the response is additive
 (fields may be added, existing fields are not renamed or removed without a
 contract change — tracked by issue #194).
 
@@ -127,7 +127,7 @@ contract change — tracked by issue #194).
 Store-inspection summary: record counts, domain breakdown, schema versions,
 repository identities. Requires a running daemon.
 
-Arguments: `{ "data_dir"?: string }`
+Arguments: `{ "data_dir"?: string, "repo_path"?: string }`
 
 Stable `ok: true` fields:
 
@@ -139,6 +139,7 @@ Stable `ok: true` fields:
 | `schema_versions` | `"<domain>:<kind>:<version>" → count` |
 | `unknown_schema_versions` | same key shape, for records the daemon flagged |
 | `repositories` | `[{ "id", "identity_summary" }]` per repository node |
+| `freshness` | store-freshness object (issue #220) — see [Freshness stamping](#freshness-stamping) |
 
 ### `symbol_context`
 
@@ -146,11 +147,12 @@ Evidence-backed context for a named code symbol, trust-separated by domain.
 Every item carries `record_id`, a `trust` class, and at least one citation
 handle; observations are agent-authored — never treat them as source truth.
 
-Arguments: `{ "symbol_name": string (required, non-empty), "data_dir"?: string }`
+Arguments: `{ "symbol_name": string (required, non-empty), "data_dir"?: string, "repo_path"?: string }`
 
 Stable `ok: true` fields: `symbol_name`, then sections
 `source_facts`, `topology_edges`, `observations`, `project_state`,
-`artifacts`, `verification_evidence`, `drift_history`, `unresolved`.
+`artifacts`, `verification_evidence`, `drift_history`, `unresolved`,
+plus the `freshness` object (issue #220) — see [Freshness stamping](#freshness-stamping).
 
 Citation handles per item:
 
@@ -170,15 +172,51 @@ Stable error codes: `missing_argument` (empty `symbol_name`),
 Evidence-backed context for a task: canonical record ID, GitHub URL, GitHub
 short handle, or local JSONL handle.
 
-Arguments: `{ "id_or_handle": string, "data_dir"?: string }`
+Arguments: `{ "id_or_handle": string, "data_dir"?: string, "repo_path"?: string }`
 
 Stable `ok: true` fields: `task_id`, then sections `tasks`,
 `acceptance_criteria` (verified ACs carry an embedded `verification_record`),
 `source_facts`, `observations`, `artifacts`, `verification_evidence`,
-`reviews`, `external_links`, `unresolved`.
+`reviews`, `external_links`, `unresolved`,
+plus the `freshness` object (issue #220) — see [Freshness stamping](#freshness-stamping).
 
 Stable error codes: `no_match`, `ambiguous_handle` (with `candidates`),
 `unsupported_handle` (with `message`), plus the daemon codes below.
+
+### `store_freshness`
+
+Whole-store freshness verdict: does the store still match the working tree?
+No symbol or task argument required. Requires a running daemon.
+
+Arguments: `{ "data_dir"?: string, "repo_path"?: string }`
+
+Stable `ok: true` fields: `freshness` — the same object the other tools stamp
+(see [Freshness stamping](#freshness-stamping)).
+
+## Freshness stamping
+
+Every successful tool response carries a non-fatal, machine-readable
+`freshness` **object** (issue #220): the store-freshness verdict from the
+#186 contract (`fresh` / `stale_head` / `stale_dirty` / `unknown`), the stored
+source-snapshot identity the answer was derived from, and the working-tree
+state it was compared against — a trust signal, never suppression. A
+non-`fresh` verdict still returns the full answer payload; gate trust in the
+cited handles, not the answer itself.
+
+- `repo_path` (optional on every tool) selects the working tree the verdict is
+  computed against; it defaults to the MCP server's current directory,
+  mirroring `eg freshness`'s default `.`.
+- The verdict always agrees with `eg freshness` for the same store and tree —
+  both run the identical classification path.
+- `stored_snapshot.head.state` is `"pre_stamping"` for stores that predate
+  snapshot stamping (explicit, never a silent absence, never a false `fresh`);
+  `"no_git"` / `"unborn_head"` reuse the on-disk head serialization.
+- The probe is strictly read-only and offline (`git rev-parse` /
+  `git status` with `GIT_OPTIONAL_LOCKS=0`); stamping creates, modifies, or
+  deletes nothing. For a fixed store + working-tree state the object is
+  byte-identical across calls.
+
+See [`docs/cli/freshness.md`](freshness.md) for the full contract.
 
 ## Error envelope
 

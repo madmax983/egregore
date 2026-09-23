@@ -5,8 +5,8 @@
 //! handshake the in-process tests in `mcp.rs` never touch:
 //!
 //! 1. `initialize` succeeds and identifies the server as `egregore`.
-//! 2. `tools/list` returns exactly the three documented tools
-//!    (`inspect_store`, `symbol_context`, `task_evidence`).
+//! 2. `tools/list` returns exactly the four documented tools
+//!    (`inspect_store`, `symbol_context`, `task_evidence`, `store_freshness`).
 //! 3. One `tools/call` returns structured JSON containing a `record_id`
 //!    and a repo-relative file/span citation handle.
 //!
@@ -236,7 +236,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         // rmcp requires the initialized notification before serving requests.
         session.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
-        // 2. tools/list must return exactly the three documented tools.
+        // 2. tools/list must return exactly the four documented tools.
         let list = session.request("tools/list", &json!({}));
         let names: Vec<String> = list["result"]["tools"]
             .as_array()
@@ -253,6 +253,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         sorted.sort();
         let expected = vec![
             "inspect_store".to_owned(),
+            "store_freshness".to_owned(),
             "symbol_context".to_owned(),
             "task_evidence".to_owned(),
         ];
