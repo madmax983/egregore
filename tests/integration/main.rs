@@ -20,6 +20,7 @@ mod changes_query;
 mod citation_audit;
 mod claude_code;
 mod cli;
+mod clones;
 mod co_change_coupling;
 mod codex;
 mod control_catalog;

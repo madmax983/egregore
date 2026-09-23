@@ -9930,6 +9930,141 @@ fn handle_verb_drift_top_n(
     )
 }
 
+// ── Verb handler: clone_classes (issue #216) ─────────────────────────────────
+
+/// Groups exact-duplicate Rust symbol bodies into citable clone classes: the
+/// daemon face of `eg query clones`. The classes are computed by the shared
+/// [`graph_query::clone_classes`] query layer over the store's current-state
+/// codegraph records; each class is emitted as one record, and the full
+/// report (counts, truncation signal, empty reason) rides along under
+/// `result.report` so the CLI daemon transport prints the same envelope as
+/// the local `--graph` / `--data-dir` path.
+#[allow(clippy::too_many_arguments)]
+fn handle_verb_clone_classes(
+    request_id: &str,
+    params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    budget_limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    // Effective limit: min(params.limit capped at CLONES_MAX_LIMIT, budget_limit).
+    // Reject non-integer limit values rather than silently coercing to the default.
+    let params_limit = match params.get("limit") {
+        None => graph_query::CLONES_DEFAULT_LIMIT,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(graph_query::CLONES_MAX_LIMIT),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.limit must be a non-negative integer"),
+                );
+            }
+        },
+    }
+    .min(graph_query::CLONES_MAX_LIMIT);
+    let effective_limit = params_limit.min(budget_limit);
+
+    // Effective min_size: default 2; reject non-integers and values below 2
+    // rather than silently widening or narrowing the class definition.
+    let params_min_size = match params.get("min_size") {
+        None => graph_query::CLONES_DEFAULT_MIN_SIZE,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.min_size must be a non-negative integer"),
+                );
+            }
+        },
+    };
+    if params_min_size < graph_query::CLONES_DEFAULT_MIN_SIZE {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.min_size must be at least 2"),
+        );
+    }
+
+    let (mut records, snapshot, _, repo_index) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Valid-time point-in-time filter, same rule as `drift_top_n`: when the
+    // caller pins `as_of.valid_time`, records newer than the instant are
+    // excluded from the class computation.
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            GraphRecord::Edge { temporal, .. } => {
+                let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
+                vt_str.is_some_and(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .is_some_and(|vt| vt <= as_of_dt)
+                })
+            }
+            GraphRecord::Tombstone { .. } => true,
+        });
+    }
+
+    let report = graph_query::clone_classes(
+        &records,
+        selected_repo.as_deref(),
+        params_min_size,
+        effective_limit,
+    );
+    let result_records: Vec<serde_json::Value> = match serde_json::to_value(&report.classes) {
+        Ok(serde_json::Value::Array(classes)) => classes,
+        Ok(_) | Err(_) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request("clone class serialization failed"),
+            );
+        }
+    };
+
+    // Enforce timeout after the grouping CPU phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    let mut result = verb_success_result("clone_classes", &snapshot, &result_records);
+    // The full report (counts, truncation signal, empty reason) rides along so
+    // the CLI daemon transport prints the same envelope as the local path.
+    result["report"] = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    HttpResponse::success(Some(request_id), 200, result)
+}
+
 // ── Verb handler: semantic_search (issue #59) ────────────────────────────────
 
 /// Shapes one embedded semantic match into the daemon query-row JSON.
@@ -11276,6 +11411,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             state,
         ),
         "drift_top_n" => handle_verb_drift_top_n(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            &domain,
+            state,
+        ),
+        "clone_classes" => handle_verb_clone_classes(
             &request_id,
             &params,
             as_of_valid_time.as_deref(),

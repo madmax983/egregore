@@ -50,6 +50,8 @@ eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query clones           --graph <PATH>    [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
+eg query clones           --data-dir <DIR>  [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
 eg query conflicts <SCOPE> --graph <PATH>   [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query conflicts <SCOPE> --data-dir <DIR> [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
@@ -181,6 +183,9 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+- `eg query clones` — group **exact-duplicate Rust symbol bodies** into citable
+  clone classes by normalized-body content hash, so a fix or extraction lands
+  on every copy of duplicated logic ([clones.md](clones.md), issue #216).
 - `eg query conflicts` — surface **recorded contradicting observations on a
   shared code target**: the pairs of agent claims, verification executions,
   and user-context records joined by `CONTRADICTS` edges within a symbol /

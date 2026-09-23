@@ -143,6 +143,7 @@ Error responses follow the standard envelope in
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string`, `repo?: string` | Prefix-safe commit lookup |
 | `file_defines`          | implemented | `repo_relative_path: string`, `repo?: string` | Symbols defined in a file |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
+| `clone_classes`         | implemented | `limit?: u64` (default 50, max 500), `min_size?: u64` (default 2, min 2), `repo?: string` | Exact-duplicate Rust symbol bodies grouped into clone classes (issue #216); honours `as_of.valid_time` |
 | `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. |
@@ -392,6 +393,51 @@ node with those fields set).
 
 Coordination: issue #15 updates this response shape. Issue #10's future
 `drift` verb should return the same record shape.
+
+---
+
+### `clone_classes`
+
+Group exact-duplicate Rust symbol bodies into citable clone classes (issue
+#216): the daemon face of `eg query clones`. Computed by the shared query
+layer over the store's current-state codegraph records, so the daemon and the
+local `--graph` / `--data-dir` transports agree.
+
+**Params:**
+```json
+{ "limit": 50, "min_size": 2, "repo": "acme/widget" }
+```
+
+`limit` defaults to 50 and is capped at 500; `min_size` defaults to 2 and must
+be at least 2 (both rejected as 400 otherwise). Honours `as_of.valid_time`
+like `drift_top_n`: records newer than the instant are excluded from the
+class computation.
+
+**Record shape** — one record per clone class:
+
+```json
+{
+  "content_hash":  "blake3:9f2c…",
+  "size":          3,
+  "members": [
+    {
+      "record_id":          "codegraph:v1:…",
+      "qualified_name":     "a::compute",
+      "repo_relative_path": "src/a.rs",
+      "span":               {"start_byte":0,"end_byte":42,"start_line":1,"end_line":4}
+    }
+  ]
+}
+```
+
+No raw source body is emitted — only the shared normalized-content hash plus
+bounded citable handles. Classes order by `size` descending, then
+`content_hash` ascending; members by `record_id` ascending. The full report
+(counts, truncation signal, empty reason) also rides along under
+`result.report`, and `page.returned` counts the returned classes; `truncated`
+in the report says whether `limit` cut the class list (issue #121). A store
+with no clone classes yields a well-formed empty `records` array with
+`report.empty_reason == "no_clone_classes"`, not an error (issue #196).
 
 ---
 

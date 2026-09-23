@@ -15,6 +15,7 @@ mod capture_tests;
 mod change_impact;
 mod changes;
 mod churn;
+mod clones;
 mod config;
 mod conflicts;
 mod context;
@@ -126,6 +127,7 @@ pub(crate) use capture_bench::*;
 pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
+pub(crate) use clones::*;
 pub(crate) use config::*;
 pub(crate) use conflicts::*;
 pub(crate) use context::*;
@@ -1821,6 +1823,47 @@ pub(crate) enum QuerySubcommand {
         repo: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Group exact-duplicate Rust symbol bodies into citable clone classes (issue #216).
+    ///
+    /// A clone class is the set of live `Symbol` records sharing one
+    /// normalized-body content hash (`blake3:` over the comment-stripped,
+    /// whitespace-collapsed body), reported with citable handles only
+    /// (record ID, repo-relative path, span, qualified name) — never raw
+    /// source. Classes order by size descending, then hash; the answer is
+    /// byte-stable across repeated runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — report returned (an empty class list is a well-formed
+    ///       `no_clone_classes` answer, not an error).
+    ///   1 — load error, invalid --limit/--min-size, unknown/ambiguous --repo selector.
+    ///
+    /// Documented in `docs/cli/clones.md`.
+    Clones {
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Minimum clone-class size: only classes with at least N members are
+        /// reported (default 2).
+        #[arg(long, default_value_t = query::CLONES_DEFAULT_MIN_SIZE)]
+        min_size: usize,
+        /// Maximum clone classes returned (default 50, max 500); excess
+        /// classes are truncated with an explicit `truncated` signal.
+        #[arg(long, default_value_t = query::CLONES_DEFAULT_LIMIT)]
         limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
@@ -7620,6 +7663,56 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_drift(&records, limit, format, &index, selected.as_deref())
+        }
+        QuerySubcommand::Clones {
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            repo,
+            min_size,
+            limit,
+            format,
+        } => {
+            // Validate the bounds before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic (same
+            // contract as `eg query churn`).
+            if limit == 0 || limit > query::CLONES_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::CLONES_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::CLONES_MAX_LIMIT,
+                        query::CLONES_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            if min_size < query::CLONES_DEFAULT_MIN_SIZE {
+                let diag = serde_json::json!({
+                    "code": "invalid_min_size",
+                    "min_size": min_size,
+                    "min": query::CLONES_DEFAULT_MIN_SIZE,
+                    "message": "--min-size must be at least 2: a clone class needs two members",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_clones_via_daemon(dir, min_size, limit, repo.as_deref(), format);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_clones_cmd(&records, selected.as_deref(), min_size, limit, format)
         }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::Semantic {

@@ -191,6 +191,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "clones",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "valid_time"],
+        },
+    ),
+    (
         "conflicts",
         LaneStatic {
             store_mode: StoreMode::Structural,
