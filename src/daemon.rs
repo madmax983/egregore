@@ -28,6 +28,7 @@ use crate::{
         AdapterError, DanglingCitationPolicy, EmbeddedAletheiaSink, ExpectedRecordState,
         IngestReport, ingest_records_with_policy,
     },
+    cli::locate::locate_response_value,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
@@ -9817,6 +9818,197 @@ fn handle_verb_file_defines(
     HttpResponse::success(Some(request_id), 200, result)
 }
 
+// ── Verb handler: locate ────────────────────────────────────────────────────
+
+/// Positional query: resolve the symbol and evidence at a `file:line`
+/// (issue #212).
+///
+/// Params: `repo_relative_path` (required string), `line` (required positive
+/// integer, 1-based), `repo` (optional repository selector, resolved exactly
+/// like every other verb), `at` (optional commit prefix), `as_of` (optional
+/// RFC3339 instant), `supersession` (optional `"exclude"` /
+/// `"include-but-flag"`, default `"exclude"`).
+///
+/// `at` and `as_of` are mutually exclusive and reuse the same
+/// `file_symbols_at_point` machinery as the CLI `--at`/`--as-of` flags, so the
+/// temporal + repository-collision contract is identical. The request-level
+/// `as_of` selector is not applied: temporal pins are verb params here.
+///
+/// The result carries the full `query locate` JSON envelope under
+/// `result.locate` — the located symbol, its outermost-to-innermost enclosing
+/// chain, and the same trust-separated cross-domain bundle as `query context`.
+/// The row `limit` is inapplicable (the answer is a single envelope) and is
+/// ignored.
+///
+/// Typed positional failures are returned as `ok:false` bodies carrying the
+/// same `error.code` values the CLI prints (`no_match`,
+/// `no_enclosing_symbol`, `line_out_of_range`, `ambiguous_repository`, and
+/// the temporal codes), plus a human-readable `message`, so CLI clients can
+/// re-emit the cold path's machine-readable envelope.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_verb_locate(
+    request_id: &str,
+    params: &serde_json::Value,
+    _limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    _domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    let path = match params
+        .get("repo_relative_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(p) => p.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::missing_field("params.repo_relative_path"),
+            );
+        }
+    };
+    let line = match params.get("line").and_then(serde_json::Value::as_u64) {
+        Some(n) if n >= 1 => n,
+        _ => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request("params.line must be a positive integer (1-based)"),
+            );
+        }
+    };
+    let line = usize::try_from(line).unwrap_or(usize::MAX);
+
+    // Optional string params: reject non-string values rather than silently
+    // ignoring them.
+    let optional_param = |name: &str| -> Result<Option<String>, HttpResponse> {
+        match params.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!("params.{name} must be a string")),
+            )),
+        }
+    };
+    let at = match optional_param("at") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let as_of = match optional_param("as_of") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.at and params.as_of are mutually exclusive"),
+        );
+    }
+    let supersession = match params.get("supersession") {
+        None | Some(serde_json::Value::Null) => crate::temporal_status::SupersessionMode::Exclude,
+        Some(v) => {
+            match serde_json::from_value::<crate::temporal_status::SupersessionMode>(v.clone()) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    return HttpResponse::error_with_id(
+                        request_id,
+                        ApiError::bad_request(
+                            "params.supersession must be \"exclude\" or \"include-but-flag\"",
+                        ),
+                    );
+                }
+            }
+        }
+    };
+
+    // The locate envelope carries the same cross-domain trust-separated bundle
+    // as `eg query context`, so records must be loaded from the whole store —
+    // not the domain-filtered slice the single-domain verbs use. Otherwise
+    // agent observations and other pathless evidence would silently vanish
+    // (the `Selector::ByPath` sidecar bug, issue #212, all over again). The
+    // repository index is built over the whole graph, exactly like the CLI.
+    let (records, snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+    let index = graph_query::RepositoryIndex::build(&records);
+    let selected_repo = match resolve_verb_repo_selector(params, &index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Enforce timeout after the in-memory load phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    let envelope = match locate_response_value(
+        &records,
+        &path,
+        line,
+        at.as_deref(),
+        as_of.as_deref(),
+        &index,
+        selected_repo.as_deref(),
+        supersession,
+    ) {
+        Ok(envelope) => envelope,
+        Err((mut error, _exit_code)) => {
+            // Translate the CLI's exit-code families to HTTP statuses; the
+            // typed `error.code` is preserved verbatim for machine clients.
+            let code = error["code"].as_str().unwrap_or("unknown");
+            let status = match code {
+                "no_match"
+                | "no_enclosing_symbol"
+                | "line_out_of_range"
+                | "missing_commit"
+                | "no_commit_at_or_before" => 404,
+                _ => 400,
+            };
+            if error.get("message").is_none() {
+                error["message"] = json!(default_locate_error_message(code, &path, line, &error));
+            }
+            return HttpResponse::json(
+                status,
+                json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "error": error,
+                }),
+            );
+        }
+    };
+
+    let result = json!({
+        "verb": "locate",
+        "snapshot": snapshot,
+        "locate": envelope,
+    });
+    HttpResponse::success(Some(request_id), 200, result)
+}
+
+/// Human-readable fallback message for a typed locate error that carries no
+/// `message` field of its own.
+fn default_locate_error_message(
+    code: &str,
+    path: &str,
+    line: usize,
+    error: &serde_json::Value,
+) -> String {
+    match code {
+        "no_match" => format!("no symbol found at {path}:{line}"),
+        "no_enclosing_symbol" => format!("line {line} of {path} is not inside any symbol"),
+        "line_out_of_range" => {
+            let max = error["max_known_line"]
+                .as_u64()
+                .map_or_else(|| "unknown".to_owned(), |m| m.to_string());
+            format!("line {line} out of range for {path} (max known line {max})")
+        }
+        "ambiguous_repository" => format!("multiple repositories contain {path}"),
+        _ => format!("locate failed ({code}) at {path}:{line}"),
+    }
+}
+
 // ── Verb handler: drift_top_n ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -11410,6 +11602,9 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
+        "locate" => {
+            handle_verb_locate(&request_id, &params, limit, started, budget, &domain, state)
+        }
         "drift_top_n" => handle_verb_drift_top_n(
             &request_id,
             &params,

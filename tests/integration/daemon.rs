@@ -10603,6 +10603,163 @@ fn query_verb_conformance() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn daemon_locate_verb_returns_full_envelope() {
+    // Issue #212 `--daemon`: the `locate` verb must return the same full
+    // locate/context envelope as `eg query locate --graph` — the located
+    // symbol, its enclosing chain, and the trust-separated cross-domain
+    // bundle — plus the typed positional errors.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--repo-id-override")
+        .arg("fixture-rust-basic-stable")
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let metadata = read_metadata(&data_dir);
+
+    let records = graph_records_json(&graph_path);
+    let ingest_res = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "locate-ingest",
+            "agent_id": "verb-test-agent",
+            "session_id": "verb-test-session",
+            "idempotency_key": "locate-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        ingest_res.starts_with("HTTP/1.1 200"),
+        "fixture ingest should succeed, got {ingest_res}"
+    );
+
+    // ── locate: line 15 is inside `nested::Widget` ──────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-ok",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs", "line": 15 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "locate should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "locate must have ok:true, got {body}");
+    assert_eq!(
+        body["result"]["verb"], "locate",
+        "result.verb must be locate, got {body}"
+    );
+    let envelope = &body["result"]["locate"];
+    assert_eq!(envelope["ok"], true, "locate envelope must have ok:true");
+    assert_eq!(
+        envelope["symbol"]["name"], "nested::Widget",
+        "line 15 must resolve inside nested::Widget, got {envelope}"
+    );
+    // The full trust-separated bundle is present.
+    for section in [
+        "source_facts",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+        "unresolved",
+    ] {
+        assert!(
+            envelope[section].is_array(),
+            "locate envelope must carry section {section}, got {envelope}"
+        );
+    }
+    assert!(
+        envelope["enclosing_chain"].is_array(),
+        "locate envelope must carry the enclosing chain, got {envelope}"
+    );
+
+    // ── locate: line past the file's last line → typed 404 ─────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-oor",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs", "line": 99999 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 404"),
+        "out-of-range locate should return 404, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "line_out_of_range",
+        "error code must be the typed line_out_of_range, got {body}"
+    );
+
+    // ── locate: unknown path → typed 404 ────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-nomatch",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/nope.rs", "line": 1 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 404"),
+        "unknown-path locate should return 404, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "no_match",
+        "error code must be the typed no_match, got {body}"
+    );
+
+    // ── locate: missing line → 400 ──────────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "locate-bad",
+            "agent_id": "verb-test-agent",
+            "verb": "locate",
+            "params": { "repo_relative_path": "src/lib.rs" }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "locate without line should return 400, got {res}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn eg_query_daemon_smoke() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

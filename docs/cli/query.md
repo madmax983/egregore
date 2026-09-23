@@ -47,6 +47,7 @@ eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|te
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query locate   <PATH>:<LINE> --data-dir <DIR> [--daemon] [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
@@ -1602,7 +1603,7 @@ original store stays byte-for-byte untouched. Rust extraction only.
 
 ```text
 eg query locate <PATH>:<LINE> --graph <PATH>   [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
-eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
+eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text] [--daemon]
 ```
 
 ### Arguments
@@ -1612,6 +1613,7 @@ eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT
 | `<PATH>:<LINE>` | yes | Repo-relative path and 1-based line, e.g. `src/lib.rs:42`. The line is taken after the **last** `:`. |
 | `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store. Structural records only — no `--embed` required. |
+| `--daemon` | no | Route the query through the running daemon for `--data-dir` (requires `--data-dir`, conflicts with `--graph`). The daemon `locate` verb returns the same full envelope; typed positional errors keep their codes and the cold path's exit codes. |
 | `--at <COMMIT>` | no | Temporal pin: resolve the position against symbol spans **as they existed at this commit** (full SHA or unique prefix). Requires a history-bearing store. Mutually exclusive with `--as-of`. |
 | `--as-of <INSTANT>` | no | Temporal pin: resolve against the most recent commit **at or before** this RFC 3339 instant. Mutually exclusive with `--at`. |
 | `--repo <SELECTOR>` | no | Restrict resolution to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
@@ -1648,13 +1650,15 @@ unscoped cross-repository path collision fails closed. Two absence answers are
 distinguished:
 
 - `no_enclosing_symbol` — the line sits in a gap inside the file (blank line,
-  file-level `use`, comment, inter-item whitespace).
-- `line_out_of_range` — the line is **beyond the file's last recorded
-  structural span**. `File` nodes carry no span, so the file's true line count
-  is not stored; the recorded extent (`max_known_line`) is the deterministic
-  upper bound, and a line past it is reported as out of range rather than
-  guessed. Both are typed answers carrying the resolved `file_record_id`; a
-  nearest-neighbor symbol is never returned.
+  file-level `use`, comment, inter-item whitespace, or trailing lines after
+  the last symbol).
+- `line_out_of_range` — the line is **beyond the file's actual last line**.
+  The `File` node carries a whole-file span recording the file's true line
+  count (`str::lines` semantics: a trailing newline adds no extra line), so
+  `max_known_line` cites that count. Graphs whose `File` nodes predate
+  whole-file spans carry no `File` span and fall back to the last recorded
+  structural span, as before. Both are typed answers carrying the resolved
+  `file_record_id`; a nearest-neighbor symbol is never returned.
 
 ### Exit codes and error envelopes
 
@@ -1673,7 +1677,7 @@ Errors are one-line `{"ok":false,"error":{...}}` envelopes on stdout (repository
 | `2` | `missing_commit` | `--at` commit is absent from the store's history. |
 | `2` | `no_commit_at_or_before` | No commit exists at or before the `--as-of` instant. |
 | `2` | `no_enclosing_symbol` | The path is known but no symbol span contains the line. Carries `file_record_id`. |
-| `2` | `line_out_of_range` | The line is beyond the file's last recorded structural span. Carries `max_known_line` and `file_record_id`. |
+| `2` | `line_out_of_range` | The line is beyond the file's actual last line. Carries `max_known_line` (the file's true line count, or the last recorded structural span for graphs predating whole-file `File` spans) and `file_record_id`. |
 
 ### Example
 

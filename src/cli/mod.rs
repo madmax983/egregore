@@ -54,7 +54,7 @@ mod inspect;
 mod lanes;
 mod lifeline;
 mod link_logs;
-mod locate;
+pub(crate) mod locate;
 mod log_deltas;
 mod manifest_deps;
 mod memory;
@@ -3891,6 +3891,10 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
         /// Resolve against symbol spans as they existed at this commit SHA or
         /// unique prefix (requires a history-bearing store).
         #[arg(long, conflicts_with = "as_of")]
@@ -9169,6 +9173,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             location,
             graph,
             data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
             at,
             as_of,
             repo,
@@ -9193,6 +9199,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_locate_via_daemon(
+                    path,
+                    line,
+                    dir,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    repo.as_deref(),
+                    supersession,
+                    format,
+                );
+            }
             // Strictly read-only lookup: `--data-dir` reads from a throwaway
             // copy, never the live store (same contract as `query at`).
             // Config fallback (issue #261): explicit `--data-dir` wins; the
@@ -9201,15 +9223,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // reads as "both provided".
             let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
             let records = match (graph.as_deref(), data_dir.as_deref()) {
-                // Sidecar-index fast path (issue #447): a file's spans are a
-                // `ByPath` closure. `--repo`/`--at`/`--as-of` need global
-                // topology / the commit timeline and stay cold.
-                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
-                    load_records_from_jsonl_selected(
-                        graph_path,
-                        &crate::graph_index::Selector::ByPath(path.to_owned()),
-                    )?
-                }
+                // No sidecar-index fast path (issue #212): the locate answer
+                // is the full trust-separated cross-domain bundle — the same
+                // `record_context` walk `eg query context` performs (3 hops
+                // over cross-domain edges plus every record's evidence_links).
+                // No bounded `ByPath` closure can soundly supply that: a
+                // pathless `Observation` linked to the located symbol is not in
+                // the file's span closure, so the fast path silently dropped it
+                // from the bundle while the cold scan kept it. The whole-graph
+                // cold scan keeps an indexed answer byte-identical to the
+                // unindexed one.
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
                 (Some(_), Some(_)) => {

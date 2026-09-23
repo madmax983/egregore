@@ -840,6 +840,33 @@ fn file_role_for_path(repo_relative_path: &str) -> SymbolRole {
     }
 }
 
+/// Whole-file [`SourceSpan`] minted on the `File` node (issue #212): the file's
+/// true line count, so positional queries report `line_out_of_range` against
+/// the file's actual last line instead of the last recorded symbol span.
+///
+/// Line counting follows `str::lines` semantics — a trailing newline does not
+/// create an extra line, and lone trailing blank lines do count. An empty file
+/// yields a degenerate zero-length span with `end_line == 0`, so every
+/// positive line is out of range for it. The span covers the LF-normalized
+/// source the extractor parses, keeping the count identical across CRLF/LF
+/// checkouts (issue #242).
+fn whole_file_span(source: &str) -> SourceSpan {
+    let mut line_count = 0usize;
+    let mut last_line_len = 0usize;
+    for line in source.lines() {
+        line_count += 1;
+        last_line_len = line.len();
+    }
+    SourceSpan {
+        start_byte: 0,
+        end_byte: source.len(),
+        start_line: 1,
+        end_line: line_count,
+        start_column: Some(0),
+        end_column: Some(last_line_len),
+    }
+}
+
 pub(crate) fn scan_source_text_records(
     source_file: &fs::SourceFile,
     source: &str,
@@ -870,7 +897,7 @@ pub(crate) fn scan_source_text_records(
             file_id.clone(),
             NodeKind::File,
             Some(repo_relative_path.clone()),
-            None,
+            Some(whole_file_span(source)),
             Some(repo_relative_path.clone()),
             format!(
                 "{} source file {repo_relative_path}\nSource:\n{normalized}",
@@ -940,6 +967,32 @@ mod tests {
         assert_eq!(file_role_for_path("testing/foo.rs"), SymbolRole::Production);
     }
 
+    /// Issue #212: the `File` node's whole-file span reports the file's true
+    /// line count — `str::lines` semantics, so a trailing newline adds no
+    /// extra line, while trailing blank lines do count. An empty file yields
+    /// the degenerate zero-length span (`end_line == 0`).
+    #[test]
+    fn whole_file_span_counts_lines_like_str_lines() {
+        let span = super::whole_file_span("a\nb\nc");
+        assert_eq!((span.start_line, span.end_line), (1, 3));
+        assert_eq!((span.start_byte, span.end_byte), (0, 5));
+        assert_eq!(span.end_column, Some(1));
+
+        // Trailing newline: still 3 lines, not 4.
+        let span = super::whole_file_span("a\nb\nc\n");
+        assert_eq!((span.start_line, span.end_line), (1, 3));
+        assert_eq!((span.start_byte, span.end_byte), (0, 6));
+
+        // Trailing blank lines count.
+        let span = super::whole_file_span("a\n\n");
+        assert_eq!((span.start_line, span.end_line), (1, 2));
+        assert_eq!(span.end_column, Some(0));
+
+        // Empty file: degenerate span, every positive line out of range.
+        let span = super::whole_file_span("");
+        assert_eq!((span.start_line, span.end_line), (1, 0));
+        assert_eq!((span.start_byte, span.end_byte), (0, 0));
+    }
     /// Issue #438: an unreadable source file (here the reader is pointed at a
     /// directory, so `std::fs::read` returns an io error deterministically and
     /// without permission games) yields a `Skipped` outcome carrying an

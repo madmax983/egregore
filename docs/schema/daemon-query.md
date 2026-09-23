@@ -142,6 +142,7 @@ Error responses follow the standard envelope in
 | `symbol_by_name`        | implemented | `name: string`, `kind?: string`, `repo?: string` | Exact name match; honours `as_of.valid_time` |
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string`, `repo?: string` | Prefix-safe commit lookup |
 | `file_defines`          | implemented | `repo_relative_path: string`, `repo?: string` | Symbols defined in a file |
+| `locate`                | implemented | `repo_relative_path: string`, `line: u64`, `repo?: string`, `at?: string`, `as_of?: string`, `supersession?: string` | Positional query: innermost symbol at `file:line` plus the full trust-separated context bundle (issue #212); daemon face of `eg query locate` |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
 | `clone_classes`         | implemented | `limit?: u64` (default 50, max 500), `min_size?: u64` (default 2, min 2), `repo?: string` | Exact-duplicate Rust symbol bodies grouped into clone classes (issue #216); honours `as_of.valid_time` |
 | `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
@@ -345,6 +346,53 @@ current-state results.
   "page": { "cursor": null, "has_more": false, "returned": 2 }
 }
 ```
+
+---
+
+### `locate`
+
+Positional query (issue #212): resolve the innermost `Symbol` containing a
+1-based `file:line` and return the same full JSON envelope `eg query locate
+--graph` emits — the located `symbol`, its outermost → innermost
+`enclosing_chain`, and the trust-separated cross-domain bundle
+(`source_facts`, `topology_edges`, `observations`, `project_state`,
+`artifacts`, `verification_evidence`, `unresolved`). The answer is never a
+nearest-symbol guess. The row `limit` is inapplicable (the answer is a single
+envelope) and is ignored.
+
+**Params:**
+```json
+{
+  "repo_relative_path": "src/lib.rs",
+  "line": 13,
+  "repo": "optional repository selector (same contract as every other verb)",
+  "at": "optional commit prefix (mutually exclusive with as_of)",
+  "as_of": "optional RFC 3339 instant (mutually exclusive with at)",
+  "supersession": "optional \"exclude\" (default) or \"include-but-flag\""
+}
+```
+
+`at` / `as_of` reuse the same `file_symbols_at_point` machinery as the CLI
+`--at` / `--as-of` flags, so the temporal + repository-collision contract is
+identical. The request-level `as_of` selector is not applied: temporal pins
+are verb params here. `line` must be a positive integer.
+
+**Result shape:** `result.locate` is the `eg query locate` envelope verbatim.
+
+**Typed errors:** positional failures are `ok:false` bodies whose `error.code`
+matches the CLI's typed codes, so clients can re-emit the cold path's
+machine-readable envelope:
+
+| HTTP | `error.code` | Meaning |
+|------|--------------|---------|
+| 404 | `no_match` | No record carries the path in the selected view. |
+| 404 | `no_enclosing_symbol` | The path is known but no symbol span contains the line. |
+| 404 | `line_out_of_range` | The line is beyond the file's actual last line (`max_known_line` cited). |
+| 404 | `missing_commit` / `no_commit_at_or_before` | The `at` / `as_of` pin resolved to nothing. |
+| 400 | `ambiguous_repository` | Unscoped path exists in more than one repository; retry with `repo`. |
+| 400 | `ambiguous_commit_prefix` | `at` matches more than one commit (`candidates` listed). |
+| 400 | `malformed_timestamp` | `as_of` is not a valid RFC 3339 instant. |
+| 400 | `empty_history` | Temporal pin on a history-less store. |
 
 ---
 

@@ -484,13 +484,14 @@ pub struct LocationContext<'a> {
     pub primary: Option<&'a GraphRecord>,
     /// Repository owner groups among the path's matched records.
     pub repo_groups: BTreeSet<Option<&'a str>>,
-    /// Maximum recorded span `end_line` across the path's `Symbol`/`Module`
+    /// Maximum recorded `end_line` across the path's `File`/`Module`/`Symbol`
     /// nodes in the selected view, or `None` when the path has no spanned
-    /// structural records. Lets a caller distinguish a line beyond the file's
-    /// last recorded structural element (out of range of the graph's knowledge)
-    /// from a line in a gap between items — `File` nodes carry no span, so the
-    /// file's true last line is not stored and this recorded extent is the best
-    /// deterministic upper bound.
+    /// records. The `File` node's whole-file span (issue #212) makes this the
+    /// file's true last line, so a caller can distinguish a line beyond the
+    /// file (`line_out_of_range`) from a line in a gap between items
+    /// (`no_enclosing_symbol`) without guessing a neighbor. Graphs whose
+    /// `File` nodes predate whole-file spans carry no `File` span and fall
+    /// back to the last recorded structural span, as before.
     pub max_span_end_line: Option<usize>,
 }
 
@@ -629,18 +630,23 @@ pub fn location_context<'a>(
         let GraphRecord::Node { kind, span, .. } = record else {
             continue;
         };
-        if matches!(kind, NodeKind::File) {
+        let is_file = matches!(kind, NodeKind::File);
+        if is_file {
             ctx.file_record = Some(record);
-            continue;
         }
         let Some(span) = span else { continue };
-        // Track the deepest recorded structural line for the path so the caller
-        // can tell a line past the last known span (out of range) from a gap.
+        // Track the deepest recorded line for the path so the caller can tell
+        // a line past the file's last line (out of range) from a gap between
+        // items. The `File` node's whole-file span (issue #212) supplies the
+        // file's true line count; graphs whose `File` nodes predate it carry
+        // no span and fall back to the structural maximum, as before. The
+        // `File` node never joins the containment chain: its span covers every
+        // line by construction.
         ctx.max_span_end_line = Some(
             ctx.max_span_end_line
                 .map_or(span.end_line, |m| m.max(span.end_line)),
         );
-        if span.start_line <= line && line <= span.end_line {
+        if !is_file && span.start_line <= line && line <= span.end_line {
             ctx.chain.push(record);
         }
     }
