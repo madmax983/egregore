@@ -139,6 +139,8 @@ pub mod verification_freshness;
 pub mod verify_scan;
 /// Transcripts watcher.
 pub mod watch;
+/// Read-only working-tree diff computation for diff-scoped briefings (issue #214).
+pub mod worktree_diff;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 

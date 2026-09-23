@@ -18,6 +18,12 @@ pub enum FailureTargetKind {
     Task,
     /// A source/provenance handle naming failures directly.
     Source,
+    /// A working set of file/symbol anchors (issue #214 briefing). Traversed
+    /// like `File`/`Symbol` anchors — inbound from each anchor ID — without
+    /// the `Source` seed-only restriction, since anchor-linked failures from
+    /// other sessions are exactly the prior failures the briefing wants.
+    /// Never produced by [`resolve_failure_target`]; constructed directly.
+    WorkingSet,
 }
 
 impl FailureTargetKind {
@@ -29,6 +35,7 @@ impl FailureTargetKind {
             Self::File => "file",
             Self::Task => "task",
             Self::Source => "source",
+            Self::WorkingSet => "working_set",
         }
     }
 }
@@ -41,6 +48,8 @@ pub struct ResolvedFailureTarget {
     /// Which handle type matched.
     pub kind: FailureTargetKind,
     /// Live code/task record IDs to traverse inbound from. Empty for `Source`.
+    /// For [`FailureTargetKind::WorkingSet`] this carries the mixed file and
+    /// symbol anchor IDs of the working set.
     pub anchor_ids: BTreeSet<String>,
     /// Failure/verification record IDs matched directly by a source handle.
     pub seed_failures: BTreeSet<String>,

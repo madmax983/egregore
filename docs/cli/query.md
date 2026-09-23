@@ -2264,3 +2264,19 @@ unknown/ambiguous `--repo` selector.
 "No extraction-gap diagnostics in scope" is not proof the code is fully
 understood for any other purpose — only that the extractor flagged nothing it
 could not parse.
+
+## eg brief (working-tree-diff-scoped evidence briefing)
+
+`eg brief` is a standalone top-level command (issue #214), not a `query`
+subcommand: it computes the uncommitted working-tree diff at `repo_path`,
+resolves the changed files and the symbols whose recorded spans intersect the
+changed hunks, and returns one trust-separated JSON object with prior failures
+(runtime vs agent-authored), source facts, observations, decisions, in-flight
+tasks, verification evidence, and drift warnings — plus a `store_coverage` map
+and the store-freshness staleness marker. Strictly read-only; a clean working
+tree exits `0` with empty but well-formed sections. See [brief.md](brief.md) for
+the full contract.
+
+```sh
+eg brief [repo_path] (--graph <path> | --data-dir <dir>) [--repo <id>] [--staged-only] [--format json|text]
+```

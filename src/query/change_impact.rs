@@ -237,7 +237,12 @@ pub fn change_impact_context<'a>(
 
     let target_kind = match target.kind {
         FailureTargetKind::File => "file",
-        FailureTargetKind::Task | FailureTargetKind::Source | FailureTargetKind::Symbol => "symbol",
+        // `WorkingSet` is unreachable here (`resolve_failure_target` never
+        // produces it); grouped with the code kinds as the safe default.
+        FailureTargetKind::Task
+        | FailureTargetKind::Source
+        | FailureTargetKind::Symbol
+        | FailureTargetKind::WorkingSet => "symbol",
     };
     let target_ids: Vec<String> = target.anchor_ids.iter().cloned().collect();
 

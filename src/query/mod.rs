@@ -68,6 +68,8 @@ mod who_imports;
 // Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
 // Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
 mod lint_suppressions;
+// Appended (issue #214); kept at the end to minimize cross-lane merge conflicts.
+mod brief;
 mod who_constructs;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 mod sessions;
@@ -152,6 +154,8 @@ pub use blind_spots::*;
 pub use track_record::*;
 // Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
 pub use session_retrospective::*;
+// Appended (issue #214); kept at the end to minimize cross-lane merge conflicts.
+pub use brief::*;
 // The verification-outcome rule is shared with `crate::criteria_coverage` and
 // the daemon write path, but it is not public API: re-exported crate-internally
 // so the shared rule cannot fork, without widening `egregore::query`.

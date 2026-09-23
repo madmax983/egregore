@@ -6,6 +6,7 @@ mod as_of;
 mod at;
 mod audit;
 mod belief_timeline;
+mod brief;
 mod bundle;
 mod candidates;
 mod capture_bench;
@@ -121,6 +122,7 @@ pub(crate) use as_of::*;
 pub(crate) use at::*;
 pub(crate) use audit::*;
 pub(crate) use belief_timeline::*;
+pub(crate) use brief::*;
 pub(crate) use bundle::*;
 pub(crate) use candidates::*;
 pub(crate) use capture_bench::*;
@@ -815,6 +817,44 @@ pub(crate) enum Commands {
         /// newline-delimited `json` for embedded `--data-dir` inspection.
         #[arg(long)]
         format: Option<OutputFormat>,
+    },
+    /// Brief an agent on graph evidence scoped to the working-tree diff (issue #214).
+    ///
+    /// Resolves the uncommitted working-tree diff at `repo_path` (staged +
+    /// unstaged, or staged-only with `--staged-only`) into `File` and `Symbol`
+    /// handles and returns one JSON object with trust-separated sections:
+    /// `source_facts`, `prior_failures` (runtime vs agent-authored),
+    /// `observations`, `decisions`, `in_flight_tasks`,
+    /// `verification_evidence`, `drift_warnings`, and a `store_coverage` map.
+    /// Also carries the store-freshness staleness marker shared with
+    /// `eg freshness`: a briefing over a dirty tree reads `stale_dirty`
+    /// instead of failing or silently returning partial data.
+    ///
+    /// Strictly read-only: the diff is computed with read-only Git plumbing
+    /// (`GIT_OPTIONAL_LOCKS=0`; no checkout, stash, or index refresh) and the
+    /// store is only read, never re-scanned or mutated. Clean working trees
+    /// return `ok: true` with empty but well-formed sections. See
+    /// `docs/cli/brief.md`.
+    Brief {
+        /// Repository working-tree path to diff (defaults to the current directory).
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Graph JSONL store to read (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory to read (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Restrict graph resolution to one stored repository by its identity ID.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only consider staged (index vs HEAD) changes; unstaged working-tree
+        /// changes and untracked files are excluded.
+        #[arg(long = "staged-only", visible_alias = "staged")]
+        staged_only: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Report whether a store still matches the current working tree (issue #82).
     ///
@@ -5713,6 +5753,21 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Brief {
+            repo_path,
+            graph,
+            data_dir,
+            repo,
+            staged_only,
+            format,
+        } => brief_cmd(
+            &repo_path,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            repo.as_deref(),
+            staged_only,
+            format,
+        ),
         Commands::Freshness {
             repo_path,
             graph,
