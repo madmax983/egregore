@@ -13,7 +13,9 @@ Use semantic search when you need to find code by **meaning** rather than by exa
 
 Both embed the query text locally with the same model and run the same vector search, so for a fixed store and query they return the **same top-k record IDs in the same order** (scores agree within a tight tolerance). The daemon path sends only the resulting query vector to the daemon — no embedding model is loaded daemon-side, no remote service is contacted, and there is no background indexing.
 
-Daemon-backed results are still **retrieval leads, not proof**: each row carries a `record_id`, `score`, `repo_relative_path`, and `span` (omitted when the node has none), and nothing else. They are not verification evidence, task completion, source truth beyond deterministic code facts, or agent memory.
+Daemon-backed results are still **retrieval leads, not proof**: each row carries a `record_id`, `score`, `repo_relative_path`, and `span` (omitted when the node has none), plus the calibrated per-row confidence fields (`confidence_band`, `selection_threshold`, `selection_basis`). They are not verification evidence, task completion, source truth beyond deterministic code facts, or agent memory.
+
+Every non-empty answer — on both transports — is stamped with a top-level **confidence verdict** (`confident` | `weak` | `abstain`), derived from the best row's score against the calibrated thresholds (`confident` at `>= 0.39`, `weak` in `[0.34, 0.39)`, `abstain` below `0.34`). The verdict is the runtime's answer to "good enough to trust": `weak` means the rows are unverified leads, `abstain` means no trustworthy signal — the rows are still returned, flagged per-row as weak, never silently dropped. See the "Confidence verdicts" section of [`query.md`](query.md).
 
 Stable diagnostics make failures actionable rather than silent: a missing daemon or stale runtime metadata is reported by daemon discovery before the query runs; an un-embedded store returns `missing_semantic_index`; a store whose index exists on disk but was skipped at load as corrupted returns the distinct `semantic_index_unreadable` (issue #489 — a damaged index is never reported as a never-built one); a mismatched vector returns `incompatible_embedding_dimension`; an empty result is a clean no-match, never a fallback to a direct embedded read. The full verb contract is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
 
@@ -28,7 +30,7 @@ Stable diagnostics make failures actionable rather than silent: a missing daemon
 
 ### Relationship to issue #58 (relevance gate)
 
-This workflow makes daemon-backed semantic search **available and deterministic** — it does not decide whether the results are *good enough to trust*. Issue **#58** owns relevance calibration: the checked-in corpus and the `eg eval-semantic` top-3 recall gate measure retrieval quality. Use the corpus gate to judge accuracy; use this guidance to choose the transport and to remember that a high score is a lead to confirm, not an answer.
+This workflow makes daemon-backed semantic search **available and deterministic**. Whether the results are *good enough to trust* is decided at runtime by the calibrated confidence verdict (issue #221): `confident` means the answer cleared the bar, `weak`/`abstain` means treat the rows as unverified leads. Issue **#58** owns relevance calibration: the checked-in corpus and the `eg eval-semantic` top-3 recall gate measure retrieval quality. Use the corpus gate to judge accuracy; use the verdict to judge a single answer; use this guidance to choose the transport and to remember that a high score is a lead to confirm, not an answer.
 
 ### Good use cases
 
@@ -192,4 +194,4 @@ The relevance corpus lives at `corpus/semantic_relevance_corpus.json`. It contai
 | `persistence_query` | Database, ingest, and query-path questions |
 | `ambiguous` | No clear correct answer (false-positive risk) |
 
-The 24 labeled queries each have one or more reviewed expected targets as repo-relative file paths and optional symbol names. The 6 ambiguous queries represent concepts not present in the codebase (no authentication, no HTTP router, no GUI) — they are used to measure the false-positive rate.
+The 27 labeled queries each have one or more reviewed expected targets as repo-relative file paths and optional symbol names. The 5 ambiguous queries represent concepts not present in the codebase (no authentication, no HTTP router, no GUI) — they are used to measure the false-positive rate.

@@ -10108,6 +10108,9 @@ fn handle_verb_semantic_search(
     if let Some(repo) = selected_repo.as_deref() {
         matches.retain(|m| repo_index.owner_of(&m.record_id) == Some(repo));
     }
+    // The verdict below covers the pre-truncation pool: bind the count before
+    // the response limit narrows the rows.
+    let total_candidates = matches.len();
     matches.truncate(effective_limit);
 
     // Enforce timeout after the search CPU phase.
@@ -10147,7 +10150,41 @@ fn handle_verb_semantic_search(
         obj.insert("embedding_provenance".to_owned(), provenance_value);
     }
 
+    // Issue #221: stamp the answer-level confidence verdict on the verb result
+    // so non-CLI consumers inherit the same contract as the CLI.
+    if let Err(e) = stamp_semantic_confidence_verdict(&mut result, &matches, total_candidates) {
+        return HttpResponse::error(e);
+    }
+
     HttpResponse::success(Some(request_id), 200, result)
+}
+
+// Issue #221: stamp the answer-level confidence verdict on a semantic_search
+// verb result so non-CLI consumers inherit the same contract as the CLI. The
+// verdict is a pure function of the ranked score distribution — the matches
+// are canonically ordered (score descending), so the first row holds the best
+// score of the full filtered pool. An empty pool carries no verdict: the
+// empty answer is the CLI's exit-2 no-match path, not an abstention.
+fn stamp_semantic_confidence_verdict(
+    result: &mut serde_json::Value,
+    matches: &[crate::adapters::SemanticMatch],
+    total_candidates: usize,
+) -> Result<(), ApiError> {
+    let Some(best) = matches.first() else {
+        return Ok(());
+    };
+    let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+        crate::semantic_confidence::SemanticConfidence::of_best(best.score),
+        best.score,
+        total_candidates,
+    );
+    let verdict_value = serde_json::to_value(&verdict).map_err(|error| {
+        ApiError::internal(format!("failed to serialize confidence verdict: {error}"))
+    })?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("confidence".to_owned(), verdict_value);
+    }
+    Ok(())
 }
 
 // ── Verb handler: observations_for_symbol (issue #38) ────────────────────────

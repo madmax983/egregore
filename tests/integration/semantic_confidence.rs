@@ -1,20 +1,20 @@
 #![allow(missing_docs)]
 
-//! TDD tests for issue #263: calibrated confidence floor and abstention for
-//! `eg query semantic`.
+//! TDD tests for issues #263 and #221: calibrated confidence thresholds and
+//! the answer-level confidence verdict for `eg query semantic`.
 //!
-//! RED PHASE: these tests fail until `src/semantic_confidence.rs`,
-//! `corpus/semantic_confidence_fixture.json`, and the CLI wiring exist.
-//!
-//! The fixture pins the calibrated floor and two real measured cases (a
-//! strong in-corpus match and a below-floor abstention); the tests assert the
-//! code agrees with the fixture, so the floor cannot drift silently.
+//! The fixture pins the calibrated thresholds and measured cases (a confident
+//! in-corpus match, a weak near-miss, and a below-floor abstention); the
+//! tests assert the code agrees with the fixture, so the thresholds cannot
+//! drift silently. The verdict object is what both transports stamp on every
+//! non-empty answer (`{"confidence": {...}}` in JSON, `confidence: <verdict>`
+//! in text).
 
 use std::path::PathBuf;
 
 use aletheia_egregore::semantic_confidence::{
-    ConfidenceBand, SEMANTIC_CONFIDENCE_FLOOR, SEMANTIC_SELECTION_BASIS, SemanticAbstention,
-    should_abstain,
+    ConfidenceBand, SEMANTIC_CONFIDENT_THRESHOLD, SEMANTIC_SELECTION_BASIS,
+    SEMANTIC_WEAK_THRESHOLD, SemanticConfidence, SemanticConfidenceVerdict,
 };
 use serde::Deserialize;
 
@@ -30,17 +30,21 @@ struct FixtureHit {
 
 #[derive(Deserialize)]
 struct FixtureCase {
-    query: String,
+    // Note: the fixture also records the measured `query` text for
+    // documentation; it is intentionally not deserialized — the verdict is a
+    // pure function of the score distribution, not of the query string.
     ranked_hits: Vec<FixtureHit>,
-    expected_abstention: bool,
+    expected_verdict: String,
 }
 
 #[derive(Deserialize)]
 struct Fixture {
-    confidence_floor: f32,
+    confident_threshold: f32,
+    weak_threshold: f32,
     selection_basis: String,
-    strong_case: FixtureCase,
-    abstention_case: FixtureCase,
+    confident_case: FixtureCase,
+    weak_case: FixtureCase,
+    abstain_case: FixtureCase,
 }
 
 fn load_fixture() -> Fixture {
@@ -56,20 +60,35 @@ fn best_score(case: &FixtureCase) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Floor pinning: the code constant must equal the documented fixture value.
+// Threshold pinning: the code constants must equal the documented fixture
+// values.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn floor_matches_documented_fixture_value() {
+fn thresholds_match_documented_fixture_values() {
     let fixture = load_fixture();
-    // Float equality via epsilon: the fixture pins the exact calibrated value,
-    // and the constant must match it bit-for-bit in practice.
+    // Float equality via epsilon: the fixture pins the exact calibrated
+    // values, and the constants must match them bit-for-bit in practice.
     assert!(
-        (SEMANTIC_CONFIDENCE_FLOOR - fixture.confidence_floor).abs() < f32::EPSILON,
-        "SEMANTIC_CONFIDENCE_FLOOR ({}) must equal the calibrated value pinned in corpus/semantic_confidence_fixture.json ({})",
-        SEMANTIC_CONFIDENCE_FLOOR,
-        fixture.confidence_floor,
+        (SEMANTIC_CONFIDENT_THRESHOLD - fixture.confident_threshold).abs() < f32::EPSILON,
+        "SEMANTIC_CONFIDENT_THRESHOLD ({}) must equal the calibrated value pinned in corpus/semantic_confidence_fixture.json ({})",
+        SEMANTIC_CONFIDENT_THRESHOLD,
+        fixture.confident_threshold,
     );
+    assert!(
+        (SEMANTIC_WEAK_THRESHOLD - fixture.weak_threshold).abs() < f32::EPSILON,
+        "SEMANTIC_WEAK_THRESHOLD ({}) must equal the documented value pinned in corpus/semantic_confidence_fixture.json ({})",
+        SEMANTIC_WEAK_THRESHOLD,
+        fixture.weak_threshold,
+    );
+    // Compile-time invariant (clippy::assertions_on_constants): both are
+    // constants, so a runtime assert! would have a constant value.
+    const {
+        assert!(
+            SEMANTIC_WEAK_THRESHOLD < SEMANTIC_CONFIDENT_THRESHOLD,
+            "the weak floor must sit strictly below the confident bar"
+        );
+    }
 }
 
 #[test]
@@ -82,98 +101,130 @@ fn selection_basis_matches_documented_fixture_value() {
 }
 
 // ---------------------------------------------------------------------------
-// Strong case: no abstention, every row strong.
+// Measured cases: the verdict derived from each case's best score must match
+// the fixture's expectation.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn strong_case_does_not_abstain() {
+fn confident_case_yields_confident_verdict() {
     let fixture = load_fixture();
-    assert!(
-        !fixture.strong_case.expected_abstention,
-        "fixture strong case must expect no abstention"
-    );
-    let best = best_score(&fixture.strong_case);
-    assert!(
-        !should_abstain(best),
-        "strong case best score {best} must clear the floor {SEMANTIC_CONFIDENCE_FLOOR}"
+    let case = &fixture.confident_case;
+    assert_eq!(case.expected_verdict, "confident");
+    let best = best_score(case);
+    assert_eq!(
+        SemanticConfidence::of_best(best),
+        SemanticConfidence::Confident,
+        "confident case best score {best} must reach {SEMANTIC_CONFIDENT_THRESHOLD}"
     );
 }
 
 #[test]
-fn strong_case_rows_all_classify_strong() {
+fn confident_case_rows_all_classify_strong() {
     let fixture = load_fixture();
-    for hit in &fixture.strong_case.ranked_hits {
+    for hit in &fixture.confident_case.ranked_hits {
         assert_eq!(
-            ConfidenceBand::of(hit.score),
+            ConfidenceBand::of_score(hit.score),
             ConfidenceBand::Strong,
-            "strong-case row {} score {} must classify strong",
+            "confident-case row {} score {} must classify strong",
             hit.record_id,
             hit.score
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// Abstention case: best below floor, envelope is explicit and stable.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn abstention_case_abstains() {
+fn weak_case_yields_weak_verdict() {
     let fixture = load_fixture();
-    assert!(
-        fixture.abstention_case.expected_abstention,
-        "fixture abstention case must expect abstention"
-    );
-    let best = best_score(&fixture.abstention_case);
-    assert!(
-        should_abstain(best),
-        "abstention case best score {best} must be below the floor {SEMANTIC_CONFIDENCE_FLOOR}"
-    );
-}
-
-#[test]
-fn abstention_envelope_carries_required_fields() {
-    let fixture = load_fixture();
-    let case = &fixture.abstention_case;
+    let case = &fixture.weak_case;
+    assert_eq!(case.expected_verdict, "weak");
     let best = best_score(case);
-    let verdict = SemanticAbstention::new(&case.query, best, case.ranked_hits.len());
-    let json = serde_json::to_value(&verdict).expect("abstention must serialize");
-
-    assert_eq!(json["ok"], true, "abstention is a completed answer");
     assert_eq!(
-        json["no_confident_match"], true,
-        "explicit abstention flag must be true"
+        SemanticConfidence::of_best(best),
+        SemanticConfidence::Weak,
+        "weak case best score {best} must sit in [{SEMANTIC_WEAK_THRESHOLD}, {SEMANTIC_CONFIDENT_THRESHOLD})"
     );
-    assert_eq!(json["query"], case.query.as_str());
-    assert_eq!(json["selection_threshold"], SEMANTIC_CONFIDENCE_FLOOR);
-    assert_eq!(json["selection_basis"], SEMANTIC_SELECTION_BASIS);
-    assert_eq!(json["total_candidates"], case.ranked_hits.len());
-    assert_eq!(json["highest_score"], best);
 }
 
 #[test]
-fn abstention_envelope_is_byte_identical_across_repeats() {
+fn abstain_case_yields_abstain_verdict() {
     let fixture = load_fixture();
-    let case = &fixture.abstention_case;
+    let case = &fixture.abstain_case;
+    assert_eq!(case.expected_verdict, "abstain");
     let best = best_score(case);
-    let first = serde_json::to_string(&SemanticAbstention::new(
-        &case.query,
+    assert_eq!(
+        SemanticConfidence::of_best(best),
+        SemanticConfidence::Abstain,
+        "abstain case best score {best} must sit below {SEMANTIC_WEAK_THRESHOLD}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verdict object: shape, required fields, byte-identical across repeats.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verdict_object_carries_required_fields() {
+    let fixture = load_fixture();
+    let case = &fixture.abstain_case;
+    let best = best_score(case);
+    let verdict = SemanticConfidenceVerdict::new(
+        SemanticConfidence::of_best(best),
         best,
         case.ranked_hits.len(),
-    ))
-    .expect("serialize");
-    for _ in 0..4 {
-        let again = serde_json::to_string(&SemanticAbstention::new(
-            &case.query,
+    );
+    assert_eq!(verdict.verdict, SemanticConfidence::Abstain);
+    let json = serde_json::to_value(&verdict).expect("verdict must serialize");
+
+    assert_eq!(json["verdict"], "abstain", "stable verdict tag");
+    assert_eq!(json["best_score"], best);
+    assert_eq!(json["total_candidates"], case.ranked_hits.len());
+    assert_eq!(json["confident_threshold"], SEMANTIC_CONFIDENT_THRESHOLD);
+    assert_eq!(json["weak_threshold"], SEMANTIC_WEAK_THRESHOLD);
+    assert_eq!(json["selection_basis"], SEMANTIC_SELECTION_BASIS);
+    // The query is deliberately NOT part of the verdict: the verdict is a
+    // pure function of the score distribution, which is what makes it
+    // deterministic and comparable across queries.
+    assert!(
+        json.get("query").is_none(),
+        "verdict must not carry the query text"
+    );
+}
+
+#[test]
+fn verdict_object_is_byte_identical_across_repeats() {
+    let fixture = load_fixture();
+    let case = &fixture.weak_case;
+    let best = best_score(case);
+    let build = || {
+        serde_json::to_string(&SemanticConfidenceVerdict::new(
+            SemanticConfidence::of_best(best),
             best,
             case.ranked_hits.len(),
         ))
-        .expect("serialize");
+        .expect("serialize")
+    };
+    let first = build();
+    for _ in 0..4 {
         assert_eq!(
-            first, again,
-            "five repeated queries must produce byte-identical confidence fields"
+            first,
+            build(),
+            "five repeated derivations must produce byte-identical verdict objects"
         );
     }
+}
+
+#[test]
+fn verdict_text_line_is_stable() {
+    let verdict = SemanticConfidenceVerdict::new(SemanticConfidence::Weak, 0.5213, 9);
+    let text = verdict.as_text();
+    assert!(
+        text.starts_with("confidence: weak "),
+        "text verdict must start with the stable tag, got {text}"
+    );
+    assert!(
+        !text.contains('\n'),
+        "text verdict must be a single line, got {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -181,19 +232,28 @@ fn abstention_envelope_is_byte_identical_across_repeats() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn floor_boundary_is_inclusive_for_abstention() {
-    assert!(
-        !should_abstain(SEMANTIC_CONFIDENCE_FLOOR),
-        "a score exactly at the floor must not abstain"
+fn verdict_boundaries_are_inclusive_at_the_bar() {
+    assert_eq!(
+        SemanticConfidence::of_best(SEMANTIC_CONFIDENT_THRESHOLD),
+        SemanticConfidence::Confident,
+        "a score exactly at the confident bar is confident"
     );
     assert_eq!(
-        ConfidenceBand::of(SEMANTIC_CONFIDENCE_FLOOR),
+        SemanticConfidence::of_best(SEMANTIC_WEAK_THRESHOLD),
+        SemanticConfidence::Weak,
+        "a score exactly at the weak floor is weak"
+    );
+    assert_eq!(
+        ConfidenceBand::of_score(SEMANTIC_CONFIDENT_THRESHOLD),
         ConfidenceBand::Strong
     );
 }
 
 #[test]
-fn confidence_band_tags_are_stable() {
+fn verdict_tags_are_stable() {
+    assert_eq!(SemanticConfidence::Confident.as_str(), "confident");
+    assert_eq!(SemanticConfidence::Weak.as_str(), "weak");
+    assert_eq!(SemanticConfidence::Abstain.as_str(), "abstain");
     assert_eq!(ConfidenceBand::Strong.as_str(), "strong");
     assert_eq!(ConfidenceBand::Weak.as_str(), "weak");
 }

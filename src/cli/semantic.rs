@@ -287,6 +287,43 @@ impl PrintText for EmbeddingProvenanceLine<'_> {
     }
 }
 
+/// Prints the issue #221 answer-level confidence verdict as the first answer
+/// line after the embedding provenance, exactly once, in the answer's output
+/// format. Shared by both transports so the verdict is byte-identical.
+///
+/// The wrapper routes through the shared [`print_result`] renderer, so JSON
+/// answers keep their JSONL contract (a `{"confidence": {...}}` line ahead of
+/// the unchanged `SemanticResult` rows) and text answers get one leading
+/// `confidence: <verdict> (...)` line.
+#[cfg(feature = "embeddings")]
+fn print_semantic_confidence_verdict(
+    format: OutputFormat,
+    verdict: &crate::semantic_confidence::SemanticConfidenceVerdict,
+) -> Result<()> {
+    print_result(
+        &ConfidenceVerdictLine {
+            confidence: verdict,
+        },
+        format,
+    )
+}
+
+/// Newtype letting the issue #221 verdict flow through [`print_result`].
+/// Serializes as `{"confidence": {...}}`; the text rendering is the verdict's
+/// one-line [`crate::semantic_confidence::SemanticConfidenceVerdict::as_text`].
+#[cfg(feature = "embeddings")]
+#[derive(serde::Serialize)]
+struct ConfidenceVerdictLine<'a> {
+    confidence: &'a crate::semantic_confidence::SemanticConfidenceVerdict,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for ConfidenceVerdictLine<'_> {
+    fn as_text(&self) -> String {
+        self.confidence.as_text()
+    }
+}
+
 /// Semantic similarity search against an embedded store.
 ///
 /// `under` optionally scopes results to a repo-relative path prefix (issue #198,
@@ -423,37 +460,19 @@ pub(crate) fn query_semantic(
         report_empty_semantic_result(under_prefix, index_has_hits, false);
     }
 
-    // Calibrated confidence floor (issue #263): if the best scoped candidate
-    // scores below the floor, abstain with an explicit verdict instead of
-    // presenting a weak top hit as an authoritative answer. This is a
-    // successful, deliberate answer (exit 0), distinct from the exit-2
-    // no-match path above (no semantic index, or scope matched zero).
-    // `matches` is non-empty here and canonically ordered, so the first row
-    // holds the highest score of the full scoped pool (truncation keeps the
-    // top).
+    // Calibrated confidence verdict (issues #263, #221): stamp the top-level
+    // verdict on every non-empty answer, then return the rows — rows below
+    // the confident threshold stay in the answer, flagged per-row as weak
+    // leads, never silently dropped. `matches` is non-empty here and
+    // canonically ordered, so the first row holds the highest score of the
+    // full scoped pool (truncation keeps the top).
     let best_score = matches[0].score;
-    if crate::semantic_confidence::should_abstain(best_score) {
-        let verdict = crate::semantic_confidence::SemanticAbstention::new(
-            query,
-            best_score,
-            total_candidates,
-        );
-        match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string(&verdict)?);
-            }
-            OutputFormat::Text => {
-                println!(
-                    "no_confident_match: no candidate cleared the confidence floor {} (best score {:.4}, {} candidates)",
-                    crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
-                    best_score,
-                    total_candidates,
-                );
-            }
-        }
-        return Ok(());
-    }
-
+    let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+        crate::semantic_confidence::SemanticConfidence::of_best(best_score),
+        best_score,
+        total_candidates,
+    );
+    print_semantic_confidence_verdict(format, &verdict)?;
     for m in &matches {
         print_result(&SemanticResult::from_match(m, &index), format)?;
     }
@@ -1014,35 +1033,36 @@ pub(crate) fn query_semantic_via_daemon(
         std::process::exit(2);
     }
 
-    // Calibrated confidence floor (issue #263), applied client-side: confidence
-    // is a pure function of score, so the daemon's rows can be enriched without
-    // a daemon protocol change. The rows are canonically ordered by the daemon
-    // (score descending), so the first row holds the best score.
-    // The f64->f32 cast is safe: scores are cosine similarities in [0,1], and
-    // the precision loss is negligible for a threshold comparison.
-    #[allow(clippy::cast_possible_truncation)]
-    let best_score = records[0]
-        .get("score")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0) as f32;
-    if crate::semantic_confidence::should_abstain(best_score) {
-        let verdict =
-            crate::semantic_confidence::SemanticAbstention::new(query, best_score, records.len());
-        match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string(&verdict)?);
-            }
-            OutputFormat::Text => {
-                println!(
-                    "no_confident_match: no candidate cleared the confidence floor {} (best score {:.4}, {} candidates)",
-                    crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
-                    best_score,
-                    records.len(),
-                );
-            }
-        }
-        return Ok(());
-    }
+    // Confidence verdict (issue #221): the daemon stamps the answer-level
+    // verdict itself; forward it through the typed struct so the JSON field
+    // order matches the embedded lane byte-for-byte. Rows below the confident
+    // threshold are still returned — flagged per-row as weak leads — never
+    // dropped.
+    let verdict = if let Some(value) = result.get("confidence") {
+        serde_json::from_value::<crate::semantic_confidence::SemanticConfidenceVerdict>(
+            value.clone(),
+        )
+        .context("daemon semantic_search result has a malformed confidence verdict")?
+    } else {
+        // Daemon predates issue #221: derive the verdict client-side from
+        // the returned rows. Confidence is a pure function of score, so
+        // the verdict is exact; total_candidates covers only the returned
+        // window because the old daemon does not report the pre-limit pool.
+        // The f64->f32 cast is safe: scores are cosine similarities in
+        // [0,1], and the precision loss is negligible for a threshold
+        // comparison.
+        #[allow(clippy::cast_possible_truncation)]
+        let best_score = records[0]
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        crate::semantic_confidence::SemanticConfidenceVerdict::new(
+            crate::semantic_confidence::SemanticConfidence::of_best(best_score),
+            best_score,
+            records.len(),
+        )
+    };
+    print_semantic_confidence_verdict(format, &verdict)?;
 
     for rec in &records {
         print_daemon_semantic_record(rec, format)?;
@@ -1073,14 +1093,14 @@ pub(crate) fn print_daemon_semantic_record(
         obj.insert(
             "confidence_band".to_string(),
             serde_json::Value::String(
-                crate::semantic_confidence::ConfidenceBand::of(score)
+                crate::semantic_confidence::ConfidenceBand::of_score(score)
                     .as_str()
                     .to_string(),
             ),
         );
         obj.insert(
             "selection_threshold".to_string(),
-            serde_json::Value::from(crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR),
+            serde_json::Value::from(crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD),
         );
         obj.insert(
             "selection_basis".to_string(),
@@ -1487,7 +1507,7 @@ mod semantic_contract {
             repository_id: Some("codegraph:v1:repo"),
             repository: Some("acme/widget"),
             confidence_band: "strong",
-            selection_threshold: 0.55,
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: "corpus_calibrated_confidence_floor",
         };
         let json =
@@ -1539,7 +1559,7 @@ mod semantic_contract {
             repository_id: None,
             repository: None,
             confidence_band: "weak",
-            selection_threshold: 0.55,
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: "corpus_calibrated_confidence_floor",
         };
         let json = serde_json::to_value(&result).expect("serialize");
@@ -1558,5 +1578,36 @@ mod semantic_contract {
             json.get("span").is_none(),
             "contract: 'span' must be absent from JSON when None"
         );
+    }
+
+    /// Issue #221: the embedded CLI stamps the answer-level confidence
+    /// verdict as a `{"confidence": {...}}` JSON envelope (and a
+    /// `confidence: <verdict>` text line) via `ConfidenceVerdictLine`.
+    #[test]
+    fn confidence_verdict_line_uses_confidence_envelope() {
+        let verdict = crate::semantic_confidence::SemanticConfidenceVerdict::new(
+            crate::semantic_confidence::SemanticConfidence::Weak,
+            0.37,
+            100,
+        );
+        let line = ConfidenceVerdictLine {
+            confidence: &verdict,
+        };
+        let json = serde_json::to_value(&line).expect("serialize verdict line");
+        assert!(
+            json.get("confidence").is_some(),
+            "verdict must serialize under the confidence envelope, got {json}"
+        );
+        assert_eq!(
+            json["confidence"]["verdict"], "weak",
+            "envelope must carry the verdict tag, got {json}"
+        );
+        // Text rendering is the verdict's one-line as_text().
+        let text = line.as_text();
+        assert!(
+            text.starts_with("confidence: weak "),
+            "text verdict must start with the stable tag, got {text}"
+        );
+        assert!(!text.contains('\n'), "text verdict must be a single line");
     }
 }

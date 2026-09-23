@@ -1259,14 +1259,19 @@ One JSON object per line (JSONL). The default output format is `json`. Field nam
 | `span` | object | when available | Source span: `start_byte`, `end_byte`, `start_line`, `end_line` (all integers). Absent when the record has no span. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
+| `confidence_band` | string | yes | Per-row confidence band (issue #263): `\"strong\"` when `score >= 0.39`, else `\"weak\"`. A pure deterministic function of `score`. |
+| `selection_threshold` | number | yes | The calibrated confident threshold (`0.39`) this row was judged against. |
+| `selection_basis` | string | yes | How the threshold was set: `\"corpus_calibrated_confidence_floor\"`; mirrors drift's `selection_basis`. |
+
+Every non-empty JSON answer additionally carries a top-level `{"confidence": {...}}` answer line between the embedding-provenance envelope and the result rows — the calibrated answer-level verdict (issues #263, #221). It is a separate JSONL line, not a row field; see "Confidence verdicts" below for its contract.
 
 Machine consumers must depend only on the fields listed above. Additional fields may be added in future releases; removing or renaming any of the fields above constitutes a breaking contract change and requires a version bump.
 
 ### Embedding-provenance envelope (issue #243)
 
 Every `eg query semantic` answer starts with one embedding-provenance envelope,
-printed exactly once ahead of the result rows (or ahead of the abstention
-verdict, or ahead of nothing on a no-result answer). The envelope names the
+printed exactly once ahead of the confidence verdict line and result rows (or
+ahead of nothing on a no-result answer). The envelope names the
 model that embedded the query and the model identity recorded when the vector
 index was built, so a score is never silently incomparable across embedding
 spaces. `SemanticResult` row fields are unchanged; the envelope is additive.
@@ -1344,6 +1349,12 @@ Exit code `2` is also returned when the query produced no cosine-similar results
 scan_repository score=0.9500 @ src/lib.rs:51
 ```
 
+A non-empty text answer opens with the embedding-provenance header line and
+then prints the confidence verdict on its own line —
+`confidence: confident (best score 0.6191; confident threshold 0.39; weak
+threshold 0.34; 42 candidates; basis corpus_calibrated_confidence_floor)` —
+before the result rows (see "Confidence verdicts").
+
 The exact format of `--format text` output is **not stable** and must not be parsed by scripts or agents. Use `--format json` for machine-readable output with stable field names.
 
 ### Example
@@ -1359,51 +1370,83 @@ eg query semantic "write nodes to database storage" --data-dir .egregore-semanti
 
 The `record_id` is stable across re-scans of the same commit and can be cited in agent-memory records. The `repo_relative_path` and `span` together give a file and line-range handle that agents can pass directly to editor tools or other `eg` commands.
 
-### Confidence calibration and abstention (issue #263)
+### Confidence verdicts (issues #263, #221)
 
-Every `eg query semantic` JSON row carries three confidence fields:
+Every non-empty `eg query semantic` answer is stamped with a top-level
+confidence verdict — a calibrated, deterministic judgment of whether the
+ranked rows are trustworthy. The verdict is a pure function of the best
+row's score, so identical store + query + model yields a byte-identical
+verdict on every run and on both transports (embedded CLI and
+`--daemon`).
+
+JSON answers print the verdict as the first line after the
+`embedding_provenance` line:
+
+```json
+{"confidence":{"verdict":"confident","best_score":0.6191,"total_candidates":42,"confident_threshold":0.39,"weak_threshold":0.34,"selection_basis":"corpus_calibrated_confidence_floor"}}
+```
+
+Text answers print one leading line: `confidence: confident (best score
+0.6191; confident threshold 0.39; weak threshold 0.34; 42 candidates; basis
+corpus_calibrated_confidence_floor)`.
+
+| Verdict | Meaning |
+|---------|---------|
+| `confident` | Best score `>= 0.39`. The answer is trusted. |
+| `weak` | Best score in `[0.34, 0.39)`. A candidate lead the caller must treat as unverified. |
+| `abstain` | Best score `< 0.34`. No trustworthy signal; the rows are low-confidence leads only. |
+
+| Field | Meaning |
+|-------|---------|
+| `verdict` | One of `confident` / `weak` / `abstain`. |
+| `best_score` | Highest score among the ranked candidates — the verdict's input. |
+| `total_candidates` | Full scoped candidate count **before** `--limit` truncation. |
+| `confident_threshold` | The bar for `confident` (`0.39`). |
+| `weak_threshold` | The floor for `weak` (`0.34`); below is `abstain`. |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the thresholds were set. |
+
+**Rows are never dropped for low confidence.** A below-threshold non-empty
+answer returns its rows — each flagged per-row as `weak` — under an explicit
+`weak`/`abstain` verdict, instead of the old behavior of suppressing them.
+An empty result (no semantic index, or the scope matched zero records) is
+still a clean no-match exiting `2`; that is distinct from `abstain`, which
+means "candidates exist but none is trustworthy".
+
+Every JSON row also carries three per-row confidence fields:
 
 | Field | Meaning |
 |-------|---------|
 | `score` | Raw cosine similarity (0.0–1.0). |
-| `confidence_band` | `"strong"` if `score >= 0.55`, else `"weak"`. A pure deterministic function of `score`. |
-| `selection_threshold` | The calibrated floor (`0.55`) this row was judged against. |
-| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the floor was set; mirrors drift's `selection_basis`. |
+| `confidence_band` | `"strong"` if `score >= 0.39`, else `"weak"`. A pure deterministic function of `score`. |
+| `selection_threshold` | The calibrated threshold (`0.39`) this row was judged against. |
+| `selection_basis` | `"corpus_calibrated_confidence_floor"` — how the threshold was set; mirrors drift's `selection_basis`. |
 
-**Derivation.** The floor derives from analysis of `corpus/semantic_relevance_corpus.json`:
-the corpus contains 5 ambiguous queries (`q026`, `q027`, `q029`, `q031`, `q032`)
-with no expected targets, representing the "no confident match" case. The
-existing `semantic_eval.rs` uses `0.5` as the ambiguous-query false-positive
-threshold. The floor is set at `0.55` — `0.05` above the ambiguous threshold —
-providing a conservative margin that separates confident matches from
-ambiguous/negative cases. The value is pinned by
-`corpus/semantic_confidence_fixture.json` and verified by integration tests;
-it cannot drift silently.
+**Derivation.** The `0.39` bar is the issue #263 selection floor, retained by
+the issue #221 recalibration: it sits `0.05` above the `eg eval-semantic`
+`--fp-threshold` default (`0.34`) — the cosine score at which the offline eval
+starts counting an ambiguous-query retrieval as a false positive — giving a
+conservative margin over `corpus/semantic_relevance_corpus.json`'s 5 ambiguous
+queries (`q026`, `q027`, `q029`, `q031`, `q032`), which define the "no confident
+match" case. The `0.34` weak floor is that same eval default: below it there is
+not even a candidate signal; between the two bars is a candidate the answer
+refuses to trust. The issue #221 acceptance gate measures both bars against
+the corpus — ≥90% of the 20 unanswerable queries (the 5 ambiguous plus the 15
+held-out queries in `corpus/semantic_confidence_unanswerable.json`) must land
+in `abstain`|`weak`, and ≥85% of the 27 answerable corpus queries must land in
+`confident`. The fixed-methodology re-run (2026-09-23, full-repo graph, 15,098
+File/Symbol candidates) confirms the bars: 24/27 answerable (88.9%)
+`confident`, 19/20 unanswerable (95.0%) `weak`|`abstain` — superseding the
+flawed 2026-09-22 run, which embedded every node with non-empty text (4,501
+nodes, including `Diagnostics`/`PanicRiskSites` nodes that are never retrieval
+candidates) and omitted `src/cli/mod.rs`. The procedure and the measured run
+live in `calibration/README.md`, `calibration/calibrate.py`, and
+`calibration/py_calibrate_fixed.py` (the fixed-population script). The values
+are pinned by `corpus/semantic_confidence_fixture.json` (see its
+`derivation` note) and verified by integration tests; they cannot drift
+silently.
 
-**Abstention.** If the best scoped candidate scores below the floor, `eg query
-semantic` abstains with an explicit verdict (exit `0`), rather than presenting
-a weak top hit as an authoritative answer:
-
-```json
-{"no_confident_match":true,"query":"...","best_score":0.42,"total_candidates":150,"selection_threshold":0.55,"selection_basis":"corpus_calibrated_confidence_floor"}
-```
-
-| Field | Meaning |
-|-------|---------|
-| `no_confident_match` | Always `true` in the abstention envelope. |
-| `query` | The original query string. |
-| `best_score` | Highest observed score among scoped candidates. |
-| `total_candidates` | Full scoped candidate count **before** `--limit` truncation. |
-| `selection_threshold` | The floor (`0.55`). |
-| `selection_basis` | `"corpus_calibrated_confidence_floor"`. |
-
-Abstention is **distinct** from:
-- **Exit 2 (no semantic index):** the store lacks embeddings; re-run ingest with `--embed`.
-- **Exit 2 (no candidates):** the `--repo`/`--under` scope matched zero records.
-- **Truncation (#121):** `--limit` caps the returned rows; `total_candidates` reports the pre-truncation count.
-
-The abstention verdict is deterministic: five repeated queries produce
-byte-identical confidence fields after canonical ordering (score descending,
+The verdict is deterministic: repeated identical queries produce
+byte-identical verdict objects after canonical ordering (score descending,
 record ID ascending).
 
 ---

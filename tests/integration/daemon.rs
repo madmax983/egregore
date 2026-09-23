@@ -12923,6 +12923,181 @@ fn daemon_semantic_search_result_carries_embedding_provenance() {
     assert!(!rows.is_empty(), "expected ranked rows, got {body}");
 }
 
+// ── Issue #221: the semantic_search verb result carries a top-level ─────────
+// confidence verdict (confident | weak | abstain) derived deterministically
+// from the ranked score distribution against the documented thresholds.
+// Driven with a synthetic query vector — no embedding model is loaded
+// anywhere in this test.
+
+/// Valid verdict tags for the issue #221 answer-level confidence verdict.
+#[cfg(feature = "embeddings")]
+const SEMANTIC_CONFIDENCE_VERDICT_TAGS: &[&str] = &["confident", "weak", "abstain"];
+
+/// Issues a `semantic_search` verb and returns the full parsed response body.
+#[cfg(feature = "embeddings")]
+fn daemon_semantic_search_body(
+    metadata: &DaemonMetadata,
+    request_id: &str,
+    query_vector: &[f32],
+    limit: usize,
+) -> serde_json::Value {
+    let res = http_json(
+        metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": query_vector, "limit": limit as u64 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "semantic_search should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "semantic_search must be ok, got {body}");
+    body
+}
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_result_carries_confidence_verdict() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-confidence-store");
+    build_semantic_fixture_store(&data_dir, 8);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // limit < pool so total_candidates can be checked against the
+    // pre-truncation pool, not the returned window.
+    let query = semantic_vec_at(0.0);
+    let body = daemon_semantic_search_body(&metadata, "confidence-verb-1", &query, 5);
+    // Second identical call: the verdict must be byte-identical (determinism).
+    let again = daemon_semantic_search_body(&metadata, "confidence-verb-2", &query, 5);
+    daemon.stop();
+
+    for (n, body) in ["first", "second"].iter().zip([&body, &again]) {
+        let confidence = &body["result"]["confidence"];
+        assert!(
+            confidence.is_object(),
+            "{n} verb result must carry the top-level confidence verdict object (issue #221), got {body}"
+        );
+        let verdict = confidence["verdict"].as_str().unwrap_or_default();
+        assert!(
+            SEMANTIC_CONFIDENCE_VERDICT_TAGS.contains(&verdict),
+            "{n} confidence.verdict must be one of confident|weak|abstain, got {verdict} in {confidence}"
+        );
+    }
+
+    // The verdict is derived from the returned rows' score distribution: the
+    // best row's band must agree with the verdict. The calibrated bands under
+    // test are confident >= 0.39, weak in [0.34, 0.39), abstain < 0.34
+    // (docs/cli/query.md, "Confidence verdicts").
+    let rows = body["result"]["records"]
+        .as_array()
+        .expect("records must be an array");
+    assert_eq!(rows.len(), 5, "limit bounds the returned rows, got {body}");
+    let best = rows
+        .iter()
+        .map(|r| r["score"].as_f64().unwrap_or(0.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let expected = if best >= 0.39 {
+        "confident"
+    } else if best >= 0.34 {
+        "weak"
+    } else {
+        "abstain"
+    };
+    assert_eq!(
+        body["result"]["confidence"]["verdict"].as_str(),
+        Some(expected),
+        "verdict must be derived from the best row score {best}"
+    );
+    // The verdict carries its derivation for machine consumers. Thresholds
+    // are f32 constants, so compare with an epsilon: 0.39 is not
+    // exactly representable in binary.
+    let confidence = &body["result"]["confidence"];
+    assert!(
+        (confidence["confident_threshold"].as_f64().unwrap_or(-1.0) - 0.39).abs() < 1e-6,
+        "verdict must name the confident threshold, got {confidence}"
+    );
+    assert!(
+        (confidence["weak_threshold"].as_f64().unwrap_or(-1.0) - 0.34).abs() < 1e-6,
+        "verdict must name the weak threshold, got {confidence}"
+    );
+    assert_eq!(
+        confidence["selection_basis"].as_str(),
+        Some("corpus_calibrated_confidence_floor"),
+        "verdict must name the selection basis, got {confidence}"
+    );
+    assert_eq!(
+        confidence["total_candidates"].as_u64(),
+        Some(8),
+        "total_candidates covers the pre-truncation pool, got {confidence}"
+    );
+    assert!(
+        (confidence["best_score"].as_f64().unwrap_or(-1.0) - best).abs() < 1e-6,
+        "best_score must match the best row score, got {confidence}"
+    );
+
+    // Determinism: two identical verbs yield byte-identical verdict objects.
+    let first = serde_json::to_string(&body["result"]["confidence"]).expect("serialize");
+    let second = serde_json::to_string(&again["result"]["confidence"]).expect("serialize");
+    assert_eq!(
+        first, second,
+        "identical store+query+model must yield byte-identical verdicts"
+    );
+}
+
+// ── Issue #221: embedded/daemon classifier parity ───────────────────────────
+// The daemon's verdict wiring must agree with the library classifier
+// (`SemanticConfidence::of_best`): for each query, the daemon's verdict tag
+// must equal the classifier applied to the daemon's own best score. This
+// locks the wiring, not just the constants — if the daemon ever hardcodes
+// divergent thresholds, this fails even when the constants change.
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_verdict_matches_library_classifier() {
+    use aletheia_egregore::semantic_confidence::SemanticConfidence;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-classifier-parity-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let queries = semantic_fixture_query_vectors();
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    for (idx, query) in queries.iter().enumerate().take(5) {
+        let body =
+            daemon_semantic_search_body(&metadata, &format!("classifier-parity-{idx}"), query, 5);
+        let confidence = &body["result"]["confidence"];
+        let daemon_tag = confidence["verdict"].as_str().expect("verdict tag");
+        #[allow(clippy::cast_possible_truncation)]
+        let best = confidence["best_score"].as_f64().expect("best_score") as f32;
+        // Skip near-boundary scores: a 1e-4 score drift across transports
+        // could flip the verdict, which is correct behavior, not a bug.
+        let near_boundary = [
+            aletheia_egregore::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
+            aletheia_egregore::semantic_confidence::SEMANTIC_WEAK_THRESHOLD,
+        ]
+        .iter()
+        .any(|t| (best - t).abs() < 1e-3);
+        if near_boundary {
+            continue;
+        }
+        let expected = SemanticConfidence::of_best(best).as_str();
+        assert_eq!(
+            daemon_tag, expected,
+            "daemon verdict wiring must match the library classifier for query {idx} (best {best})"
+        );
+    }
+    daemon.stop();
+}
+
 // ── AC6 + AC7: rows are bounded retrieval leads, never raw content or proof ───
 #[cfg(feature = "embeddings")]
 #[test]

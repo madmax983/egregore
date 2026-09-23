@@ -6228,11 +6228,14 @@ pub(crate) struct SemanticResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
     /// Confidence band for this row (issue #263): `strong` when
-    /// `score >= SEMANTIC_CONFIDENCE_FLOOR`, else `weak`.
+    /// `score >= SEMANTIC_CONFIDENT_THRESHOLD`, else `weak`. The row-level
+    /// band complements the answer-level `confidence` verdict (issue #221):
+    /// the verdict judges the answer by its best row, the band judges each
+    /// row on its own.
     confidence_band: &'static str,
-    /// The calibrated floor this row was judged against (issue #263).
+    /// The calibrated threshold this row was judged against (issue #263).
     selection_threshold: f32,
-    /// How the floor was set (issue #263); mirrors drift's `selection_basis`.
+    /// How the threshold was set (issue #263); mirrors drift's `selection_basis`.
     selection_basis: &'static str,
 }
 
@@ -6248,8 +6251,8 @@ impl<'a> SemanticResult<'a> {
             span: m.span,
             repository_id,
             repository: repository_id.and_then(|id| index.display_of(id)),
-            confidence_band: crate::semantic_confidence::ConfidenceBand::of(m.score).as_str(),
-            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENCE_FLOOR,
+            confidence_band: crate::semantic_confidence::ConfidenceBand::of_score(m.score).as_str(),
+            selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: crate::semantic_confidence::SEMANTIC_SELECTION_BASIS,
         }
     }

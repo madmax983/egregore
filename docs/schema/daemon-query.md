@@ -445,6 +445,28 @@ order-stable across repeated runs and match the embedded `eg query semantic`
 top-k for the same store, after canonical ordering. Daemon and embedded read
 the same persisted index, so scores agree within a tight tolerance (≤ 1e-4).
 
+**Confidence verdict (issue #221):** every non-empty result carries a
+top-level `confidence` object stamped by the daemon itself, so MCP consumers
+inherit the same contract as the CLI without client-side derivation:
+
+```json
+"confidence": {"verdict":"confident","best_score":0.83,"total_candidates":42,"confident_threshold":0.39,"weak_threshold":0.34,"selection_basis":"corpus_calibrated_confidence_floor"}
+```
+
+`verdict` is one of `confident` (best score `>= 0.39`), `weak` (best score in
+`[0.34, 0.39)`), `abstain` (best score `< 0.34`). `best_score` is the highest
+score among the ranked candidates; `total_candidates` covers the
+pre-`limit` pool. Rows below the confident threshold are still returned —
+flagged per-row via the embedded lane's `confidence_band` — never silently
+dropped. An empty pool carries no `confidence` object: the empty answer is
+the CLI's exit-2 no-match path, not an abstention. The verdict is a pure
+function of the ranked score distribution, so repeated identical verbs yield
+byte-identical verdicts. The CLI's `--daemon` path forwards the daemon's
+verdict verbatim (re-serialized through the shared struct for canonical field
+order); against a pre-#221 daemon it derives the verdict client-side from the
+returned rows. Full semantics in [`docs/cli/query.md`](../cli/query.md)
+("Confidence verdicts").
+
 **Diagnostics:**
 
 | Condition | Code | HTTP |
