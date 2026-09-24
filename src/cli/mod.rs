@@ -86,6 +86,7 @@ mod task;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
+mod tx_delta;
 mod undocumented;
 mod unreferenced;
 mod unsafe_sites;
@@ -198,6 +199,7 @@ pub(crate) use task::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
+pub(crate) use tx_delta::*;
 pub(crate) use undocumented::*;
 pub(crate) use unreferenced::*;
 pub(crate) use unsafe_sites::*;
@@ -4738,6 +4740,53 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Records added to the store since a transaction-time cursor (issue #197).
+    ///
+    /// The delta feed for resuming and swarm agents: returns every record
+    /// whose transaction-time handle is strictly after `--tx-after`, spanning
+    /// all domains, ordered by `(transaction_time, record_id)`. The answer
+    /// carries a `next_cursor`; feeding it back returns only records added
+    /// after the prior call, with no gaps and no overlap. Retraction and
+    /// supersession records appear as records (classified by `event`), so a
+    /// consumer learns a prior record was retired.
+    ///
+    /// Exit codes:
+    ///   0 — delta returned (an empty delta is a well-formed `up_to_date`
+    ///       answer, not an error).
+    ///   1 — load error, invalid cursor, unknown domain, invalid --limit, or
+    ///       unknown/ambiguous --repo selector.
+    ///
+    /// Documented in `docs/cli/since.md`.
+    Since {
+        /// Transaction-time cursor: only records with `transaction_time`
+        /// strictly after this RFC 3339 instant are returned.
+        #[arg(long)]
+        tx_after: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict records to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict the feed to one or more domains (repeatable). One of
+        /// `codegraph`, `agent_memory`, `verification`, `artifact`,
+        /// `project`, `semantic`, `user_context`, `log`. Unknown names exit 1
+        /// with an `unknown_domain` diagnostic.
+        #[arg(long)]
+        domain: Vec<String>,
+        /// Maximum records returned (default 500, max 5000); excess records
+        /// are truncated with an explicit `truncated` signal. Truncation only
+        /// ever cuts between transaction-time groups, so `next_cursor` stays
+        /// gap-free.
+        #[arg(long, default_value_t = query::SINCE_DEFAULT_LIMIT)]
+        limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -9916,6 +9965,41 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at_head,
                 all_history,
+                format,
+            )
+        }
+        QuerySubcommand::Since {
+            tx_after,
+            graph,
+            data_dir,
+            repo,
+            domain,
+            limit,
+            format,
+        } => {
+            // Transaction-time lane (issues #197, #66): every written version
+            // is a feed event, so load the history-inclusive view; and the
+            // strictly read-only lane (issue #227) means `--data-dir` reads
+            // from a throwaway copy, never the live store. Config fallback
+            // (issue #261): explicit `--data-dir` wins; the config-pinned dir
+            // applies only when neither `--graph` nor `--data-dir` was passed.
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) => load_records_from_db_history_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_since_cmd(
+                &records,
+                &tx_after,
+                &domain,
+                selected.as_deref(),
+                limit,
                 format,
             )
         }

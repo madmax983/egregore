@@ -56,11 +56,14 @@ eg query clones           --data-dir <DIR>  [--repo <SELECTOR>] [--min-size N] [
 eg query conflicts <SCOPE> --graph <PATH>   [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query conflicts <SCOPE> --data-dir <DIR> [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query since --tx-after <RFC3339> --graph <PATH> [--domain <DOMAIN>]... [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query since --tx-after <RFC3339> --data-dir <DIR> [--domain <DOMAIN>]... [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
 
 - `eg query context` — evidence-backed context for a **symbol** (issue #38).
+- `eg query since` — transaction-time **delta feed** for resuming and swarm agents ([since.md](since.md), issue #197).
 - `eg query semantic-context` — **natural-language query → evidence-backed
   context** for the top-N semantic matches in one call
   ([semantic-search-guidance.md](semantic-search-guidance.md), issue #90).
