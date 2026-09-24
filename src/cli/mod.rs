@@ -69,6 +69,7 @@ mod public_api;
 mod public_api_deltas;
 mod query_bench;
 mod recency;
+mod record_budget;
 mod records;
 mod redaction_audit;
 mod repair_cmd;
@@ -244,6 +245,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use self::record_budget::BudgetedSection;
 use crate::{
     adapters::{
         DanglingCitationPolicy, DryRunSink, ingest_records, ingest_records_with_policy,
@@ -2053,6 +2055,16 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
     },
     /// Return the latest captured benchmark run for a benchmark id, symbol, or file.
     Bench {
@@ -2165,6 +2177,16 @@ pub(crate) enum QuerySubcommand {
         /// Exclude unverified observations; report each as an `excluded` diagnostic.
         #[arg(long)]
         verified_only: bool,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
     },
     /// Trace the agent-belief timeline for one code target (issue #235).
     ///
@@ -2266,6 +2288,16 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
     },
     /// Rank code targets by repeated agent-failure density (issue #254).
     ///
@@ -2435,6 +2467,16 @@ pub(crate) enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+        /// Cap the total evidence records returned across all sections
+        /// (issue #211).
+        ///
+        /// Sections fill in envelope order; each keeps its top-ranked prefix
+        /// and a section that loses records is rendered as
+        /// `{"returned","total","records"}` so every omission is counted. A
+        /// budget at or above the natural section sizes leaves the answer
+        /// byte-identical to the un-budgeted one. Omit for the full answer.
+        #[arg(long)]
+        max_records: Option<usize>,
     },
     /// Walk the transitive inbound callers/referencers of a symbol with call paths (issue #139).
     ///
@@ -6516,18 +6558,18 @@ pub(crate) struct ContextResponse<'a> {
     /// returned handles instead of losing them.
     #[serde(skip_serializing_if = "Option::is_none")]
     freshness: Option<&'static str>,
-    source_facts: Vec<ContextSourceFact<'a>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    topology_edges: Vec<ContextTopologyEdge<'a>>,
-    observations: Vec<ContextObservation<'a>>,
-    project_state: Vec<ContextLinkedItem<'a>>,
-    artifacts: Vec<ContextLinkedItem<'a>>,
-    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    source_facts: BudgetedSection<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "BudgetedSection::is_empty")]
+    topology_edges: BudgetedSection<ContextTopologyEdge<'a>>,
+    observations: BudgetedSection<ContextObservation<'a>>,
+    project_state: BudgetedSection<ContextLinkedItem<'a>>,
+    artifacts: BudgetedSection<ContextLinkedItem<'a>>,
+    verification_evidence: BudgetedSection<ContextLinkedItem<'a>>,
     /// `SemanticDrift` records targeting this symbol, score descending
     /// (issue #108). Always present — an empty array, not an omitted field,
     /// signals "no drift recorded" (AC4).
-    drift_history: Vec<ContextDrift<'a>>,
-    unresolved: Vec<ContextUnresolved<'a>>,
+    drift_history: BudgetedSection<ContextDrift<'a>>,
+    unresolved: BudgetedSection<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
     /// Corpus the current-state view read (issue #427):
@@ -6861,14 +6903,14 @@ pub(crate) struct MemoryAuditResponse<'a> {
     ok: bool,
     memory_id: &'a str,
     verified_only: bool,
-    memory_claim: Vec<AuditClaim<'a>>,
+    memory_claim: BudgetedSection<AuditClaim<'a>>,
     direct_provenance: AuditProvenance<'a>,
-    supporting_evidence: Vec<AuditItem<'a>>,
-    contradicting_evidence: Vec<AuditItem<'a>>,
-    superseding_records: Vec<AuditItem<'a>>,
-    related_code_handles: Vec<AuditItem<'a>>,
-    related_project_handles: Vec<AuditItem<'a>>,
-    verification_evidence: Vec<AuditItem<'a>>,
+    supporting_evidence: BudgetedSection<AuditItem<'a>>,
+    contradicting_evidence: BudgetedSection<AuditItem<'a>>,
+    superseding_records: BudgetedSection<AuditItem<'a>>,
+    related_code_handles: BudgetedSection<AuditItem<'a>>,
+    related_project_handles: BudgetedSection<AuditItem<'a>>,
+    verification_evidence: BudgetedSection<AuditItem<'a>>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     excluded: Vec<AuditExcluded<'a>>,
     page: AuditPage,
@@ -6903,10 +6945,10 @@ pub(crate) struct FailureHistoryResponse<'a> {
     target_handle: &'a str,
     target_type: &'a str,
     target_ids: Vec<&'a str>,
-    runtime_failures: Vec<FailureAttemptJson<'a>>,
-    agent_failures: Vec<FailureAttemptJson<'a>>,
-    superseding_successes: Vec<AuditItem<'a>>,
-    patch_artifacts: Vec<AuditItem<'a>>,
+    runtime_failures: BudgetedSection<FailureAttemptJson<'a>>,
+    agent_failures: BudgetedSection<FailureAttemptJson<'a>>,
+    superseding_successes: BudgetedSection<AuditItem<'a>>,
+    patch_artifacts: BudgetedSection<AuditItem<'a>>,
     /// `AgentSession` record IDs reached via `AUTHORED_BY` from a failure — the
     /// citable provenance when a `Failure` carries no `agent_id`/`session_id`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -7841,6 +7883,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             at_head,
             all_history,
             supersession,
+            max_records,
         } => {
             // Sidecar-index fast path (issue #447): the plain context bundle is a
             // `ByName` closure. With `--repo-path` the freshness hint needs the
@@ -7887,6 +7930,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 supersession,
                 at_head,
                 all_history,
+                max_records,
             )
         }
         QuerySubcommand::Bench {
@@ -7957,9 +8001,10 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             verified_only,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_memory_cmd(&records, &id_or_handle, verified_only)
+            query_memory_cmd(&records, &id_or_handle, verified_only, max_records)
         }
         QuerySubcommand::BeliefTimeline {
             target,
@@ -8006,6 +8051,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             at_head,
             all_history,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
@@ -8017,6 +8063,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at_head,
                 all_history,
+                max_records,
             )
         }
         QuerySubcommand::FailureHotspots {
@@ -8103,6 +8150,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             at_head,
             all_history,
             format: _format,
+            max_records,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
@@ -8115,6 +8163,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 depth,
                 at_head,
                 all_history,
+                max_records,
             )
         }
         QuerySubcommand::TransitiveCallers {

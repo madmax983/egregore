@@ -20,11 +20,11 @@ eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
-eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N]
 eg query task     <HANDLE> --graph <PATH>
-eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
-eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
-eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
+eg query memory   <HANDLE> --graph <PATH>   [--verified-only] [--max-records N]
+eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N]
+eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-records N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query transitive-callees <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query diagram <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-nodes N] [--at <COMMIT> | --as-of <RFC3339>] [--format mermaid|dot|json|text]
@@ -295,6 +295,54 @@ One JSON object per line (JSONL). Field names are stable across releases. Machin
 ### `--format text`
 
 One human-readable line per result for terminal use. The exact format is not stable and must not be parsed by scripts.
+
+---
+
+## Record budget (`--max-records`, issue #211)
+
+The composite evidence answers — `eg query context`, `eg query memory`,
+`eg query failures`, and `eg query change-impact` — accept `--max-records N`
+to cap the total number of evidence records across every section of the
+answer. This is a record budget, not a token budget: it bounds rows, and it
+never re-ranks or paginates.
+
+**Allocation.** Sections fill sequentially in envelope order (the order the
+sections appear in the JSON envelope). Each section keeps the top-ranked
+prefix of its already-deterministic ordering — `min(section length, remaining
+budget)` — and the remainder flows to the next section. For `N >= 1`, an
+evidence-bearing answer keeps at least one record; for `N = 0` every section
+is emptied but the omissions are still reported.
+
+**Omission accounting.** A section that keeps everything renders as the bare
+record array, byte-identical to the un-budgeted answer. A section that loses
+records renders as an object with the counts:
+
+```json
+"source_facts": {
+  "returned": 2,
+  "total": 5,
+  "records": [ "...", "..." ]
+}
+```
+
+`returned` is the kept prefix length, `total` is the section's natural
+length, and `records` holds the kept rows. No record is ever silently
+dropped. A naturally-empty section keeps its old shape (omitted when the
+field is `skip_serializing_if`-gated); a non-empty section budgeted to zero
+renders `{"returned": 0, "total": N, "records": []}`, which is
+distinguishable from true absence.
+
+**Envelope counts.** For envelopes that already carry `page` (`memory`,
+`failures`, `change-impact`), the top-level `page.returned` is the number of
+records kept across all sections, and `page.has_more` is `true` when the
+budget omitted anything. (`context` has no `page` envelope; its sections
+report their own `returned`/`total`.) Budgeting never changes found/no-match
+status or exit codes: a match with all records budgeted away still exits `0`,
+and a no-match still exits `2`.
+
+Omitted for brevity: `eg query change-impact` reports its separate per-group
+row cap in the `truncations` ledger independently of the record budget; the
+budget divides what that cap leaves.
 
 ---
 

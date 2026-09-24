@@ -1,5 +1,7 @@
 use super::*;
 
+use super::record_budget::RecordBudget;
+
 /// Renders a resolved [`query::SymbolContext`] into the serializable section
 /// views, reusing the existing per-record builders (`context_source_fact`,
 /// `context_observation`, `context_linked_item`). `.copied()` collapses the
@@ -162,6 +164,7 @@ pub(crate) fn query_context_cmd(
     supersession: crate::temporal_status::SupersessionMode,
     at_head: bool,
     all_history: bool,
+    max_records: Option<usize>,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store; `--all-history` opts into the union. Pre-filter drops
@@ -220,18 +223,21 @@ pub(crate) fn query_context_cmd(
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
+    // Record budget (issue #211): sections fill sequentially in envelope
+    // order; each keeps its top-ranked prefix and the remainder flows on.
+    let mut budget = RecordBudget::new(max_records);
     let response = ContextResponse {
         ok: true,
         symbol_name,
         freshness: freshness_code,
-        source_facts: sections.source_facts,
-        topology_edges: sections.topology_edges,
-        observations,
-        project_state: sections.project_state,
-        artifacts: sections.artifacts,
-        verification_evidence: sections.verification_evidence,
-        drift_history,
-        unresolved: sections.unresolved,
+        source_facts: budget.section(sections.source_facts),
+        topology_edges: budget.section(sections.topology_edges),
+        observations: budget.section(observations),
+        project_state: budget.section(sections.project_state),
+        artifacts: budget.section(sections.artifacts),
+        verification_evidence: budget.section(sections.verification_evidence),
+        drift_history: budget.section(drift_history),
+        unresolved: budget.section(sections.unresolved),
         excluded,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),

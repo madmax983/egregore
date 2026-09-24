@@ -128,6 +128,7 @@ mod query_who_constructs;
 mod query_who_imports;
 mod range_delta_repo_gating;
 mod range_deltas;
+mod record_budget;
 mod redaction;
 mod redaction_report;
 mod refresh;
