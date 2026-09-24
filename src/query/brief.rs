@@ -121,7 +121,7 @@ pub struct BriefDriftWarning<'a> {
 // Five booleans is the honest shape here: the struct serializes directly into
 // the briefing's `store_coverage` map, one flag per trust-section domain.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StoreCoverage {
     /// At least one code-graph record (`Symbol`/`File`/`Module`/`Import`).
     pub code_graph: bool,
@@ -133,6 +133,91 @@ pub struct StoreCoverage {
     pub artifact: bool,
     /// At least one verification record (`Verification`/`TestRun`/…).
     pub verification: bool,
+}
+
+impl StoreCoverage {
+    /// Computes store-level domain presence over `records` for the
+    /// `query context` / `query task` lanes (issue #196).
+    ///
+    /// Classification follows [`classify_node`](super::context::classify_node)
+    /// — the exact contract the context/task trust sections use — so a flag
+    /// can never disagree with its section: `agent_memory` is set only by
+    /// node kinds that can render in `observations`
+    /// (`Observation`/`Decision`/`Failure`), and likewise for the other four
+    /// domains. Edges, tombstones, and infrastructure nodes (`Repository`,
+    /// `Agent`, `Commit`, `ScanCoverage`, …) never set a flag.
+    ///
+    /// This differs deliberately from [`compute_store_coverage`] (the
+    /// `eg brief` lane), which counts agent-memory-adjacent infrastructure
+    /// kinds toward its broader sections. Each lane's flags match the
+    /// sections that lane renders.
+    ///
+    /// Tombstone-naive by design: presence answers "was this domain ever
+    /// ingested into this store", not "does the current-state view show a
+    /// live record". A domain whose records were all forgotten still reports
+    /// present — the absence is per-entity, not per-store. It synthesizes no
+    /// records and asserts nothing about the code itself.
+    ///
+    /// Stops scanning at the first record that completes all five flags.
+    #[must_use]
+    pub fn from_records(records: &[GraphRecord]) -> Self {
+        let mut coverage = Self::default();
+        for record in records {
+            let GraphRecord::Node { kind, .. } = record else {
+                continue;
+            };
+            coverage.mark(super::context::classify_node(*kind));
+            if coverage.is_complete() {
+                break;
+            }
+        }
+        coverage
+    }
+
+    /// Computes store-level domain presence from sidecar-index kind keys
+    /// (issue #447 fast path): the index's `by_kind` lane maps each
+    /// `PascalCase` [`NodeKind`] spelling to its record offsets, so presence
+    /// is answerable without parsing any record bodies.
+    ///
+    /// Keys resolve through [`NodeKind::ALL`] + [`NodeKind::as_str`] — the
+    /// same spellings the index builder wrote — into the same
+    /// [`classify_node`](super::context::classify_node) contract as
+    /// [`from_records`](Self::from_records), so the two constructors agree on
+    /// every store. Unrecognized kind strings (an index written by a newer
+    /// binary) are skipped.
+    #[must_use]
+    pub fn from_index_kind_keys<'a>(kinds: impl Iterator<Item = &'a str>) -> Self {
+        let mut coverage = Self::default();
+        for key in kinds {
+            let Some(kind) = NodeKind::ALL.into_iter().find(|k| k.as_str() == key) else {
+                continue;
+            };
+            coverage.mark(super::context::classify_node(kind));
+            if coverage.is_complete() {
+                break;
+            }
+        }
+        coverage
+    }
+
+    /// Marks the flag for one classified section.
+    const fn mark(&mut self, section: Option<super::context::ContextSection>) {
+        match section {
+            Some(super::context::ContextSection::SourceFact) => self.code_graph = true,
+            Some(super::context::ContextSection::Observation) => self.agent_memory = true,
+            Some(super::context::ContextSection::ProjectState) => self.project = true,
+            Some(super::context::ContextSection::Artifact) => self.artifact = true,
+            Some(super::context::ContextSection::VerificationEvidence) => {
+                self.verification = true;
+            }
+            None => {}
+        }
+    }
+
+    /// `true` once every domain flag is set; used for the early exit.
+    const fn is_complete(self) -> bool {
+        self.code_graph && self.agent_memory && self.project && self.artifact && self.verification
+    }
 }
 
 /// Trust-separated briefing over a working-tree diff.
@@ -972,5 +1057,222 @@ mod tests {
         let brief = brief_working_set(&records, &diff, &index, None);
         assert_eq!(brief.changed_symbols.len(), 1);
         assert_eq!(brief.changed_symbols[0].record_id, "sym-1");
+    }
+
+    /// Minimal node fixture for the `StoreCoverage::from_records` lane tests.
+    fn coverage_node(id: &str, kind: NodeKind) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            "coverage test".to_owned(),
+        )
+    }
+
+    #[test]
+    fn coverage_from_records_empty_store_reports_all_domains_absent() {
+        let coverage = StoreCoverage::from_records(&[]);
+        assert_eq!(coverage.code_graph, false);
+        assert_eq!(coverage.agent_memory, false);
+        assert_eq!(coverage.project, false);
+        assert_eq!(coverage.artifact, false);
+        assert_eq!(coverage.verification, false);
+    }
+
+    #[test]
+    fn coverage_from_records_codegraph_only_store() {
+        let records = vec![
+            coverage_node("c:1", NodeKind::Symbol),
+            coverage_node("c:2", NodeKind::File),
+            coverage_node("c:3", NodeKind::Module),
+            coverage_node("c:4", NodeKind::Import),
+        ];
+        let coverage = StoreCoverage::from_records(&records);
+        assert!(coverage.code_graph);
+        assert!(!coverage.agent_memory);
+        assert!(!coverage.project);
+        assert!(!coverage.artifact);
+        assert!(!coverage.verification);
+    }
+
+    #[test]
+    fn coverage_from_records_each_domain_kind_sets_its_flag() {
+        // Every kind the context/task sections classify must flip exactly
+        // its domain's flag — and no other.
+        let records = vec![
+            coverage_node("m:1", NodeKind::Observation),
+            coverage_node("m:2", NodeKind::Decision),
+            coverage_node("m:3", NodeKind::Failure),
+            coverage_node("p:1", NodeKind::Task),
+            coverage_node("p:2", NodeKind::AcceptanceCriterion),
+            coverage_node("p:3", NodeKind::LocalTask),
+            coverage_node("p:4", NodeKind::GitHubIssue),
+            coverage_node("p:5", NodeKind::PR),
+            coverage_node("p:6", NodeKind::Review),
+            coverage_node("p:7", NodeKind::ExternalIdentity),
+            coverage_node("p:8", NodeKind::ReviewStateTransition),
+            coverage_node("a:1", NodeKind::Artifact),
+            coverage_node("a:2", NodeKind::PatchArtifact),
+            coverage_node("a:3", NodeKind::FileEdit),
+            coverage_node("v:1", NodeKind::Verification),
+            coverage_node("v:2", NodeKind::CommandEvidence),
+            coverage_node("v:3", NodeKind::TestRun),
+            coverage_node("v:4", NodeKind::CommandRun),
+            coverage_node("v:5", NodeKind::CIStatus),
+            coverage_node("v:6", NodeKind::BenchmarkRun),
+            coverage_node("v:7", NodeKind::CoverageReport),
+            coverage_node("v:8", NodeKind::ProofResult),
+        ];
+        let coverage = StoreCoverage::from_records(&records);
+        assert!(coverage.agent_memory, "memory kinds must set agent_memory");
+        assert!(coverage.project, "project kinds must set project");
+        assert!(coverage.artifact, "artifact kinds must set artifact");
+        assert!(
+            coverage.verification,
+            "verification kinds must set verification"
+        );
+        assert!(
+            !coverage.code_graph,
+            "no codegraph kind present: flag must stay false"
+        );
+    }
+
+    #[test]
+    fn coverage_from_records_infrastructure_sets_no_flags() {
+        // Kinds no context/task section renders — including the
+        // agent-memory-adjacent infrastructure the `eg brief` lane counts —
+        // must not flip any flag in this lane.
+        let records = vec![
+            coverage_node("i:1", NodeKind::Repository),
+            coverage_node("i:2", NodeKind::Agent),
+            coverage_node("i:3", NodeKind::AgentSession),
+            coverage_node("i:4", NodeKind::Commit),
+            coverage_node("i:5", NodeKind::ScanCoverage),
+            coverage_node("i:6", NodeKind::SemanticDrift),
+            coverage_node("i:7", NodeKind::Diagnostic),
+            coverage_node("i:8", NodeKind::ExternalLink),
+            GraphRecord::Tombstone {
+                id: "tomb:1".to_owned(),
+                schema_version: crate::ir::SCHEMA_VERSION,
+                deleted_id: "m:1".to_owned(),
+                summary: "forget".to_owned(),
+                producer: None,
+            },
+            GraphRecord::Edge {
+                id: "e:1".to_owned(),
+                schema_version: crate::ir::SCHEMA_VERSION,
+                label: EdgeLabel::Defines,
+                source: "i:1".to_owned(),
+                target: "i:2".to_owned(),
+                confidence: None,
+                resolution: None,
+                frame_resolution: None,
+                frame_index: None,
+                basis: None,
+                call_site_spans: None,
+                is_exhaustive: None,
+                temporal: None,
+                summary: "edge".to_owned(),
+                producer: None,
+            },
+        ];
+        let coverage = StoreCoverage::from_records(&records);
+        assert!(
+            !coverage.code_graph
+                && !coverage.agent_memory
+                && !coverage.project
+                && !coverage.artifact
+                && !coverage.verification,
+            "infrastructure records must not flip any domain flag"
+        );
+    }
+
+    #[test]
+    fn coverage_from_records_tombstoned_domain_still_counts_as_present() {
+        // Tombstone-naive by design: the domain WAS ingested into this store,
+        // so an empty section reads as entity-absent, not domain-absent.
+        let records = vec![
+            coverage_node("m:1", NodeKind::Observation),
+            GraphRecord::Tombstone {
+                id: "tomb:1".to_owned(),
+                schema_version: crate::ir::SCHEMA_VERSION,
+                deleted_id: "m:1".to_owned(),
+                summary: "forget".to_owned(),
+                producer: None,
+            },
+        ];
+        let coverage = StoreCoverage::from_records(&records);
+        assert!(
+            coverage.agent_memory,
+            "a tombstoned observation still proves the domain was ingested"
+        );
+    }
+
+    #[test]
+    fn coverage_from_index_kind_keys_agrees_with_from_records() {
+        let records = vec![
+            coverage_node("c:1", NodeKind::Symbol),
+            coverage_node("m:1", NodeKind::Failure),
+            coverage_node("p:1", NodeKind::Task),
+            coverage_node("a:1", NodeKind::Artifact),
+            coverage_node("v:1", NodeKind::TestRun),
+            coverage_node("i:1", NodeKind::Repository),
+        ];
+        let from_records = StoreCoverage::from_records(&records);
+        let keys: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node { kind, .. } => Some(kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        let from_keys = StoreCoverage::from_index_kind_keys(keys.into_iter());
+        assert_eq!(
+            from_records, from_keys,
+            "index-key constructor must agree with the record constructor"
+        );
+        assert!(from_keys.code_graph);
+        assert!(from_keys.agent_memory);
+        assert!(from_keys.project);
+        assert!(from_keys.artifact);
+        assert!(from_keys.verification);
+    }
+
+    #[test]
+    fn coverage_from_index_kind_keys_ignores_unknown_kinds() {
+        let coverage = StoreCoverage::from_index_kind_keys(["NotAKind", "Symbol"].into_iter());
+        assert!(coverage.code_graph);
+        assert!(!coverage.agent_memory);
+    }
+
+    #[test]
+    fn coverage_serialization_is_canonical_declaration_order() {
+        let coverage = StoreCoverage {
+            code_graph: true,
+            ..StoreCoverage::default()
+        };
+        let json = serde_json::to_string(&coverage).expect("coverage serializes");
+        assert_eq!(
+            json,
+            r#"{"code_graph":true,"agent_memory":false,"project":false,"artifact":false,"verification":false}"#,
+            "store_coverage must serialize as a canonical key-ordered map"
+        );
+    }
+
+    #[test]
+    fn coverage_repeated_calls_render_byte_identical() {
+        let records = vec![
+            coverage_node("c:1", NodeKind::Symbol),
+            coverage_node("m:1", NodeKind::Observation),
+        ];
+        let first = serde_json::to_string(&StoreCoverage::from_records(&records))
+            .expect("coverage serializes");
+        for _ in 0..5 {
+            let again = serde_json::to_string(&StoreCoverage::from_records(&records))
+                .expect("coverage serializes");
+            assert_eq!(first, again, "store_coverage must be deterministic");
+        }
     }
 }

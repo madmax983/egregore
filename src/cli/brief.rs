@@ -143,7 +143,7 @@ pub(crate) fn print_brief_report(
         in_flight_tasks: brief.in_flight_tasks.clone(),
         verification_evidence: brief.verification_evidence.clone(),
         drift_warnings: brief.drift_warnings.clone(),
-        store_coverage: brief.store_coverage.clone(),
+        store_coverage: brief.store_coverage,
         staleness,
     };
     match format {

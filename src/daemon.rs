@@ -10884,6 +10884,12 @@ fn handle_verb_observations_for_symbol(
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
+    // Issue #196: store-level trust-domain presence, computed over the whole
+    // store BEFORE the as_of.valid_time filter below narrows the view — the
+    // signal answers "does this store contain the domain", not "does the
+    // point-in-time slice".
+    let store_coverage = graph_query::StoreCoverage::from_records(&records);
+
     // Apply as_of.valid_time: exclude records whose valid_time is after the cutoff.
     // Records with no valid_time are excluded from point-in-time queries (consistent
     // with other temporal verbs).
@@ -11004,6 +11010,8 @@ fn handle_verb_observations_for_symbol(
             "drift_history": s.drift_history,
             "unresolved": s.unresolved,
             "excluded": excluded,
+            // Issue #196: store-level trust-domain presence (computed pre-filter above).
+            "store_coverage": store_coverage,
         }),
     )
 }
@@ -11033,6 +11041,10 @@ fn handle_verb_criteria_for_task(
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
+
+    // Issue #196: store-level trust-domain presence, computed over the whole
+    // store BEFORE the as_of.valid_time filter below narrows the view.
+    let store_coverage = graph_query::StoreCoverage::from_records(&records);
 
     if let Some(as_of) = as_of_valid_time {
         let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
@@ -11279,6 +11291,8 @@ fn handle_verb_criteria_for_task(
             "reviews": reviews,
             "external_links": external_links,
             "unresolved": unresolved,
+            // Issue #196: store-level trust-domain presence (computed pre-filter above).
+            "store_coverage": store_coverage,
         }),
     )
 }

@@ -158,6 +158,9 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
         external_links,
         unresolved,
         excluded: Vec::new(),
+        // Issue #196: `query task` loads the whole store (`load_query_records`,
+        // never the #447 selected closure), so coverage reads the full corpus.
+        store_coverage: query::StoreCoverage::from_records(records),
     };
 
     let output =

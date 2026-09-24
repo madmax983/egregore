@@ -157,6 +157,7 @@ pub(crate) fn apply_supersession<'a>(
     (filtered, excluded)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_context_cmd(
     records: &[GraphRecord],
     symbol_name: &str,
@@ -165,6 +166,7 @@ pub(crate) fn query_context_cmd(
     at_head: bool,
     all_history: bool,
     max_records: Option<usize>,
+    store_coverage: query::StoreCoverage,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store; `--all-history` opts into the union. Pre-filter drops
@@ -242,6 +244,7 @@ pub(crate) fn query_context_cmd(
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,
+        store_coverage,
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;

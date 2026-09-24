@@ -6691,6 +6691,11 @@ pub(crate) struct ContextResponse<'a> {
     corpus_mode_source: &'static str,
     /// One-line human description of the corpus that was read.
     corpus_disclaimer: String,
+    /// Store-level trust-domain presence (issue #196): which of the five
+    /// domains the store contains at least one record in. Lets a reader tell
+    /// an empty section that means "domain absent from this store" apart from
+    /// one that means "domain present, no records for this entity".
+    store_coverage: query::StoreCoverage,
 }
 
 /// Full task context query response envelope.
@@ -6710,6 +6715,11 @@ pub(crate) struct TaskContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Store-level trust-domain presence (issue #196): which of the five
+    /// domains the store contains at least one record in. Lets a reader tell
+    /// an empty section that means "domain absent from this store" apart from
+    /// one that means "domain present, no records for this entity".
+    store_coverage: query::StoreCoverage,
 }
 
 /// One semantic drift item in the `semantic_drift` section of a subsystem response.
@@ -8035,6 +8045,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 owner_hint.as_deref(),
             );
+            // Issue #196: `store_coverage` must describe the whole store, not
+            // the #447 sidecar-selected closure. When a valid sidecar index
+            // served the closure, answer from its validated `by_kind` keys
+            // (no record parsing); otherwise `records` is already the whole
+            // store (cold scan, `Whole` selector, or `--data-dir`).
+            let store_coverage = graph.as_deref().map_or_else(
+                || query::StoreCoverage::from_records(&records),
+                |path| match crate::graph_index::GraphIndex::load_for(path) {
+                    Ok(index) if !index.body.has_temporal_history => {
+                        query::StoreCoverage::from_index_kind_keys(
+                            index.body.by_kind.keys().map(String::as_str),
+                        )
+                    }
+                    _ => query::StoreCoverage::from_records(&records),
+                },
+            );
             query_context_cmd(
                 &records,
                 &name,
@@ -8043,6 +8069,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at_head,
                 all_history,
                 max_records,
+                store_coverage,
             )
         }
         QuerySubcommand::Bench {

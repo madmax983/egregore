@@ -349,6 +349,64 @@ budget divides what that cap leaves.
 
 ---
 
+## Store coverage (`store_coverage`, issue #196)
+
+The composite evidence answers — `eg query context` and `eg query task` —
+carry a top-level `store_coverage` map on every successful answer:
+
+```json
+"store_coverage": {
+  "code_graph": true,
+  "agent_memory": false,
+  "project": false,
+  "artifact": false,
+  "verification": false
+}
+```
+
+Each boolean states whether the store contains at least one record in that
+trust-section domain. It resolves the ambiguity of an empty section: an
+empty `observations` array with `"agent_memory": false` means the
+agent-memory domain was never ingested into this store (domain-absent);
+the same empty array with `"agent_memory": true` means the domain is present
+but this entity genuinely has no linked records there (entity-absent).
+
+Shortest workflow that produces the signal:
+
+```sh
+eg scan ./my-repo --out graph.jsonl
+eg query context my_symbol --graph graph.jsonl
+```
+
+A scan-only store reports `code_graph: true` and every other domain
+`false` — that is the expected, honest shape of a structural-only store, not
+a failure. Populate the other domains (`eg write observation`, `eg write
+artifact`, `eg write verification`, `eg import-local-tasks`, …) and the
+flags flip as each domain's first record lands.
+
+Interpretation rules:
+
+- `false` + empty section → "domain not present in this store". Never read it
+  as "untested", "no failures", "safe", or "correct" — the signal is
+  structural only. A store with no verification records cannot tell you
+  anything about whether the code was tested; it tells you only that no
+  verification records were ingested.
+- `true` + empty section → "domain present, no records for this entity".
+- The flags are tombstone-naive: they answer "was this domain ever ingested",
+  not "does a live record exist right now". Forgetting every record of a
+  domain does not flip its flag back to `false`.
+- Error envelopes (`no_match`, `ambiguous_handle`, `unsupported_handle`)
+  never carry `store_coverage` — the signal exists only on successful
+  answers.
+- Five consecutive queries over an unchanged store render byte-identical
+  `store_coverage` within each lane. The CLI (`--graph` / `--data-dir`)
+  serializes the map in the fixed declaration order (`code_graph`,
+  `agent_memory`, `project`, `artifact`, `verification`); the MCP and daemon
+  lanes serialize the same five values with alphabetical key order. The
+  boolean values are identical across all lanes for the same store.
+
+---
+
 ## Corpus scope (issue #427)
 
 Every lane on this page discloses the corpus its answer was computed over via the

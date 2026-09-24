@@ -176,3 +176,5 @@ mod watch;
 mod query_diagnostics;
 // Appended (issue #240); kept at the end to minimize cross-lane merge conflicts.
 mod query_dead_code;
+// Appended (issue #196); kept at the end to minimize cross-lane merge conflicts.
+mod query_store_coverage;

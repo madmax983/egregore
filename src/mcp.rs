@@ -500,6 +500,10 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         "verification_evidence": verification_evidence,
         "drift_history": drift_history,
         "unresolved": unresolved,
+        // Issue #196: store-level domain presence. The twins always receive
+        // the full record slice (`get_all_records`), so `from_records` reads
+        // the whole store.
+        "store_coverage": crate::query::StoreCoverage::from_records(records),
     })
 }
 
@@ -651,6 +655,8 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         "reviews": reviews,
         "external_links": external_links,
         "unresolved": unresolved,
+        // Issue #196: store-level domain presence; see the symbol twin.
+        "store_coverage": crate::query::StoreCoverage::from_records(records),
     })
 }
 
