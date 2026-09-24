@@ -540,6 +540,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "risk-markers",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "valid_time"],
+        },
+    ),
+    (
         "redaction-audit",
         LaneStatic {
             store_mode: StoreMode::Structural,

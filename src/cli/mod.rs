@@ -74,6 +74,7 @@ mod records;
 mod redaction_audit;
 mod repair_cmd;
 mod resolve_frames;
+mod risk_markers;
 mod scan;
 mod scan_logs;
 mod schema;
@@ -185,6 +186,7 @@ pub(crate) use records::*;
 pub(crate) use redaction_audit::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
+pub(crate) use risk_markers::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
 pub(crate) use schema::*;
@@ -3576,6 +3578,67 @@ pub(crate) enum QuerySubcommand {
         /// so a gap removed at a later commit still appears (once per commit,
         /// distinguished by `git_commit`). Mutually exclusive with --at-head
         /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Surface stub and panic-risk macro markers as a code-triage lane (issue #210).
+    ///
+    /// Returns every persisted `Diagnostic` macro-invocation node whose macro
+    /// name is in the closed known-risk set — `todo!`, `unimplemented!`,
+    /// `unreachable!` (category `stub`) and `panic!` (category `panic`) — as
+    /// citable rows, one per marker, with no scan or recompute. Each row
+    /// carries the stable category, the macro name, the `Diagnostic` record
+    /// ID, the repo-relative file/span handle, and the enclosing symbol's
+    /// handle when a `DEFINES` owner exists (explicit `null` at module top
+    /// level).
+    ///
+    /// Classification is exact and conservative over the closed set:
+    /// path-qualified names reduce to their final `::` segment
+    /// (`std::panic!` is still a `panic!`), matching is exact (no substring
+    /// matches: `mytodo!` and `panic_info!` never classify), and a benign
+    /// macro (`println!`, `vec!`, `format!`, …) is never returned as a risk
+    /// marker. `assert!`/`assert_eq!` and `.unwrap()`/`.expect()` are
+    /// deliberately outside the set (see `eg query unwrap-expect`).
+    ///
+    /// A scope with zero risk markers is an explicit success (exit 0) with an
+    /// empty `markers` array and `empty_reason` `no_markers_in_scope` —
+    /// distinct from unknown/no-match/error. Rows are advisory: each asserts
+    /// only that a marker of the given category exists at the span, never
+    /// that the surrounding code is correct or incorrect.
+    ///
+    /// Documented in `docs/cli/risk-markers.md`.
+    RiskMarkers {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a marker removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
         /// Output format.
@@ -8989,6 +9052,44 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 file.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        QuerySubcommand::RiskMarkers {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane (issue #210): same throwaway-copy
+            // `--data-dir` contract as the other read-only lanes.
+            // Config fallback (issue #261): explicit `--data-dir` wins; the
+            // config-pinned dir applies only when neither `--graph` nor
+            // `--data-dir` was passed, so `--graph` plus a pinned store never
+            // reads as "both provided".
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_risk_markers_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
                 at_head,
                 all_history,
                 format,

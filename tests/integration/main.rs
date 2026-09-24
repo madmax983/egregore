@@ -108,6 +108,7 @@ mod query_path;
 mod query_public_api;
 mod query_recency;
 mod query_redaction_audit;
+mod query_risk_markers;
 mod query_subsystem;
 mod query_symbol_roles;
 mod query_symbols;
