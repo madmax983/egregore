@@ -148,11 +148,10 @@ pub(crate) fn scope_and_rank_semantic_matches(
                 .is_some_and(|p| crate::query::path_is_under_prefix(p, prefix))
         });
     }
-    matches.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.record_id.cmp(&b.record_id))
-    });
+    // Single definition of the semantic total order (issue #199): the adapter
+    // already sorted the pool, and the `--under` retain above preserves that
+    // order, so this re-sort is belt-and-braces before the truncation boundary.
+    matches.sort_by(crate::adapters::compare_semantic_matches);
     // Return the scoped candidate count BEFORE truncation (issue #263): the
     // abstention verdict reports `total_candidates` over the full pool, not
     // the `--limit` window.
@@ -1210,15 +1209,11 @@ pub(crate) fn query_semantic_context(
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
     }
-    // Canonical ordering before truncation: equal-score ANN results can be
-    // returned in arbitrary order, so sort by score descending then record ID
-    // ascending so repeated runs choose the same rows at the `limit` boundary
-    // and emit byte-identical output.
-    matches.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.record_id.cmp(&b.record_id))
-    });
+    // Canonical total order before truncation (issue #199): the adapter already
+    // sorted the full pool, and the retains above preserve that order, so this
+    // re-sort is belt-and-braces — equal-score ANN rows can never swap
+    // positions across runs.
+    matches.sort_by(crate::adapters::compare_semantic_matches);
     matches.truncate(limit);
 
     let leads: Vec<query::SemanticLead> = matches

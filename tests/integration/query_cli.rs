@@ -3167,3 +3167,82 @@ fn test_query_context_supersession_include_but_flag() {
     let obs_u = get_obs("U");
     assert_eq!(obs_u["temporal_status"], "current");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #199 — deterministic, stable ordering of query results
+// ---------------------------------------------------------------------------
+
+/// Builds a fixture graph whose `scan_*` symbols are inserted in an order
+/// that differs from the documented output order (path, span start line,
+/// record ID), so the test actually exercises the sort.
+fn fixture_graph_with_unordered_scan_symbols() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+
+    let mut graph = Graph::new();
+    // Insertion order: gamma, alpha, beta. Canonical output order must be
+    // alpha (line 10), beta (line 20), gamma (line 30).
+    for (name, start_line) in [("scan_gamma", 30), ("scan_alpha", 10), ("scan_beta", 20)] {
+        let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", name]);
+        graph.push(GraphRecord::symbol(
+            sym_id,
+            "fn",
+            "src/lib.rs".to_owned(),
+            span(start_line, start_line + 5),
+            name.to_owned(),
+            format!("Rust function {name}"),
+        ));
+    }
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_symbol_output_is_byte_stable_across_repeated_runs() {
+    // Issue #199: the same structural query against an unchanged store must
+    // yield byte-identical ordered `record_id` lists on every run — here
+    // asserted end to end through the CLI (`query symbols` glob lane),
+    // 20 consecutive invocations.
+    let (_temp, graph) = fixture_graph_with_unordered_scan_symbols();
+
+    let run_once = || {
+        egregore()
+            .args(["query", "symbols", "scan_*", "--graph"])
+            .arg(&graph)
+            .args(["--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let reference = run_once();
+    let reference_text = String::from_utf8(reference.clone()).expect("stdout is UTF-8");
+    let start_lines: Vec<u64> = reference_text
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value =
+                serde_json::from_str(line).expect("each row is a JSON object");
+            assert!(row["record_id"].is_string(), "row has record_id");
+            row["span"]["start_line"]
+                .as_u64()
+                .expect("row has span.start_line")
+        })
+        .collect();
+    assert_eq!(
+        start_lines,
+        vec![10, 20, 30],
+        "rows must be in canonical (path, span start line, record ID) order"
+    );
+
+    for run in 0..20 {
+        let stdout = run_once();
+        assert_eq!(
+            stdout, reference,
+            "run {run}: `eg query symbols` output must be byte-identical across runs"
+        );
+    }
+}

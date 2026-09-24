@@ -1,6 +1,7 @@
 //! Embedded `AletheiaDB` adapter.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
@@ -76,6 +77,29 @@ pub struct SemanticMatch {
     pub score: f32,
     /// Source span when available.
     pub span: Option<SourceSpan>,
+}
+
+/// Canonical total order for semantic result rows (issue #199).
+///
+/// Score descending, then record ID ascending. Scores compare with
+/// [`f32::total_cmp`] (not `partial_cmp`), so NaN takes a deterministic
+/// position instead of collapsing to `Equal`; record IDs are unique per
+/// result row, so this is a true total order — no two distinct records can
+/// ever swap positions across runs, and the order is observable from the
+/// output (both keys are printed on every row).
+///
+/// This is the single definition of the semantic tiebreak: every lane that
+/// emits semantic results sorts by this comparator
+/// ([`EmbeddedAletheiaSink::semantic_search`] applies it to the full
+/// candidate pool before the limit truncation; the CLI lanes re-apply it
+/// after their kind/scope filters as belt-and-braces).
+#[cfg(feature = "embeddings")]
+#[must_use]
+pub fn compare_semantic_matches(left: &SemanticMatch, right: &SemanticMatch) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.record_id.cmp(&right.record_id))
 }
 
 /// Graph sink backed by an embedded `AletheiaDB` store.
@@ -457,7 +481,12 @@ impl EmbeddedAletheiaSink {
 
     /// Searches for nodes whose stored embedding is most similar to `query_vector`.
     ///
-    /// Returns up to `limit` results ordered by descending similarity.
+    /// Returns up to `limit` results in the canonical total order
+    /// ([`compare_semantic_matches`]: score descending, then record ID
+    /// ascending). The order is imposed on the full filtered candidate pool
+    /// BEFORE the `limit` truncation, so both the row sequence and the set of
+    /// rows kept at the truncation boundary are stable across runs against an
+    /// unchanged store (issue #199).
     ///
     /// # Errors
     ///
@@ -494,8 +523,13 @@ impl EmbeddedAletheiaSink {
                     message: error.to_string(),
                 })?;
             let raw_len = raw.len();
-            results.clear();
-            let mut seen_record_ids = std::collections::BTreeSet::new();
+            // Collect the WHOLE filtered pool for this fetch window: truncating
+            // to `limit` in raw HNSW order would bake the engine's tie-order
+            // instability into the result SET at the boundary (issue #199).
+            // The deterministic dedupe below keeps, per record ID, the row
+            // that sorts first canonically (highest score) rather than
+            // whichever raw hit the index happened to surface first.
+            let mut pool = Vec::new();
             for (node_id, score) in raw {
                 let Ok(node) = self.db.get_node(node_id) else {
                     continue;
@@ -529,9 +563,6 @@ impl EmbeddedAletheiaSink {
                 if !is_current {
                     continue;
                 }
-                if !seen_record_ids.insert(record_id.clone()) {
-                    continue;
-                }
                 let kind = node
                     .get_property("kind")
                     .and_then(|v| v.as_str())
@@ -545,7 +576,7 @@ impl EmbeddedAletheiaSink {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 let span = span_from_properties(|key| node.get_property(key));
-                results.push(SemanticMatch {
+                pool.push(SemanticMatch {
                     record_id,
                     kind,
                     name,
@@ -553,10 +584,20 @@ impl EmbeddedAletheiaSink {
                     score,
                     span,
                 });
-                if results.len() == limit {
-                    break;
-                }
             }
+            // Canonical total order BEFORE truncation (issue #199): equal-score
+            // HNSW hits arrive in an unstable raw order, so the rows kept at
+            // the `limit` boundary — and their sequence — are decided here by
+            // (score desc, record ID asc), never by index traversal order.
+            pool.sort_by(compare_semantic_matches);
+            // Deterministic dedupe: one row per record ID. The same record can
+            // surface via two node versions (latest + non-temporal, issue
+            // #229); after the canonical sort those rows are adjacent and the
+            // first is the highest-scored, so keeping it is deterministic.
+            let mut seen_record_ids = BTreeSet::new();
+            pool.retain(|m| seen_record_ids.insert(m.record_id.clone()));
+            pool.truncate(limit);
+            results = pool;
             if results.len() == limit || raw_len < raw_limit {
                 break;
             }
@@ -7414,6 +7455,152 @@ mod tests {
                 matches.iter().any(|m| m.record_id == symbol_id),
                 "semantic search should find the symbol after temporal re-emit, got {:?}",
                 matches.iter().map(|m| &m.record_id).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Issue #199: the canonical semantic total order (score descending, then
+    /// record ID ascending) is a true total order — score dominates, ties
+    /// break on the record ID, and NaN scores take a deterministic position
+    /// via `total_cmp` instead of collapsing to `Equal`.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn compare_semantic_matches_is_a_total_order() {
+        let make = |record_id: &str, score: f32| SemanticMatch {
+            record_id: record_id.to_owned(),
+            kind: None,
+            name: None,
+            repo_relative_path: None,
+            score,
+            span: None,
+        };
+        // Score dominates: the higher-scored row sorts first.
+        assert_eq!(
+            compare_semantic_matches(&make("b", 0.9), &make("a", 0.5)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("b", 0.9)),
+            Ordering::Greater
+        );
+        // Tied scores break by record ID ascending — observable in the output.
+        assert_eq!(
+            compare_semantic_matches(&make("b", 0.5), &make("a", 0.5)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("b", 0.5)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("a", 0.5), &make("a", 0.5)),
+            Ordering::Equal
+        );
+        // NaN never collapses to Equal: `total_cmp` ranks it deterministically
+        // (above every finite score in descending order), then record ID.
+        assert_eq!(
+            compare_semantic_matches(&make("n", f32::NAN), &make("a", 1.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semantic_matches(&make("n", f32::NAN), &make("z", f32::NAN)),
+            Ordering::Less
+        );
+    }
+
+    /// Issue #199: HNSW returns equal-score hits in an unstable order, so
+    /// `semantic_search` must impose the canonical total order BEFORE the
+    /// limit truncation — otherwise tied rows swap positions run to run and
+    /// the truncation boundary keeps a varying set.
+    ///
+    /// All three symbols carry byte-identical vectors, so their cosine scores
+    /// tie exactly; insertion order is deliberately NOT record-ID order.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_applies_canonical_total_order_at_score_ties() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tie-order-store");
+        let ids = ["tie/zeta", "tie/alpha", "tie/mike"];
+        let records: Vec<GraphRecord> = ids
+            .iter()
+            .map(|id| current_symbol_record(id, "tied symbol", 20))
+            .collect();
+        let mut vectors = EmbeddingVectorMap::new();
+        for record in &records {
+            vectors.insert(
+                EmbeddingVectorKey::from_record(record).expect("symbol should be embeddable"),
+                vec![1.0, 0.0],
+            );
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            for record in &records {
+                sink.write_record(record).expect("tied symbol should write");
+            }
+        }
+        let sink =
+            EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+        let matches = sink
+            .semantic_search(&[1.0, 0.0], 10)
+            .expect("semantic search should succeed");
+        let order: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["tie/alpha", "tie/mike", "tie/zeta"],
+            "tied scores must break by record ID ascending, got {order:?}"
+        );
+    }
+
+    /// Issue #199: the same semantic query against an unchanged store must
+    /// return byte-identical ordered rows (record ID, score bits, span) on
+    /// every run — the regression pin for the cross-run stability contract.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_is_byte_stable_across_repeated_runs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("stability-store");
+        let ids = ["tie/zeta", "tie/alpha", "tie/mike", "tie/beta"];
+        let records: Vec<GraphRecord> = ids
+            .iter()
+            .map(|id| current_symbol_record(id, "tied symbol", 20))
+            .collect();
+        let mut vectors = EmbeddingVectorMap::new();
+        for record in &records {
+            vectors.insert(
+                EmbeddingVectorKey::from_record(record).expect("symbol should be embeddable"),
+                vec![1.0, 0.0],
+            );
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+                .expect("semantic store should open");
+            for record in &records {
+                sink.write_record(record).expect("tied symbol should write");
+            }
+        }
+        let sink =
+            EmbeddedAletheiaSink::open_unleased(&data_dir).expect("embedded store should open");
+        let fingerprint = |matches: &[SemanticMatch]| {
+            matches
+                .iter()
+                .map(|m| (m.record_id.clone(), m.score.to_bits(), m.span))
+                .collect::<Vec<_>>()
+        };
+        let reference = fingerprint(
+            &sink
+                .semantic_search(&[1.0, 0.0], 10)
+                .expect("semantic search should succeed"),
+        );
+        for run in 0..20 {
+            let rows = fingerprint(
+                &sink
+                    .semantic_search(&[1.0, 0.0], 10)
+                    .expect("semantic search should succeed"),
+            );
+            assert_eq!(
+                rows, reference,
+                "run {run}: semantic results must be byte-identical across runs"
             );
         }
     }

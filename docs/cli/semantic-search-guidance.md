@@ -181,6 +181,20 @@ A high similarity score means the embedding model judged the query text and the 
 
 Always confirm retrieved handles using `eg query context <symbol>` or by reading the source directly. Use `eg query symbol` for exact navigation and verification evidence from `eg query context` for trust-separated facts.
 
+### Ordering is a stable contract (issue #199)
+
+Row order is deterministic, not a ranking accident: every semantic answer is
+sorted by score descending, then `record_id` ascending — a total order, so no
+two distinct records ever swap positions across runs. The sort is applied to
+the full candidate pool *before* the `--limit` cut, which matters because the
+underlying HNSW vector index returns equal-score hits in an unstable raw
+order (float cosine scores tie constantly). Re-running the identical query
+against an unchanged store yields byte-identical ordered rows
+(`record_id`, `score`, span) — on the embedded lane and the `--daemon` lane
+alike. This governs **order stability, not ranking quality** (calibrated
+separately under #58/#106): a model change is still expected to change
+scores. Full contract: [Result ordering contract](query.md#result-ordering-contract-issue-199).
+
 ## Corpus File
 
 The relevance corpus lives at `corpus/semantic_relevance_corpus.json`. It contains 30 natural-language queries across six classes:

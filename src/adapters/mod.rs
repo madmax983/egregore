@@ -21,6 +21,8 @@ pub mod preflight;
 pub use aletheiadb::EmbeddedAletheiaSink;
 #[cfg(feature = "embeddings")]
 pub use aletheiadb::SemanticMatch;
+#[cfg(feature = "embeddings")]
+pub use aletheiadb::compare_semantic_matches;
 /// Result type for adapter operations.
 pub type AdapterResult<T> = std::result::Result<T, AdapterError>;
 

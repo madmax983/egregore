@@ -585,6 +585,55 @@ Egregore guarantees cross-platform and cross-producer byte-for-byte stable scans
 
 ---
 
+## Result ordering contract (issue #199)
+
+The sections above pin determinism on the **write** side. This section pins it
+on the **read** side: the same query against an unchanged store returns rows in
+a stable, reproducible order on every run, on every machine, so answers can be
+cached, asserted on in regression tests, and reproduced elsewhere without the
+ranking quietly reshuffling.
+
+**The guarantee.** Every query lane emits its rows in a documented canonical
+total order, and the order is decided **before** any `--limit` truncation — so
+both the row sequence and the set of rows kept at the truncation boundary are
+stable:
+
+| Lane | Canonical order (total — no two distinct rows ever swap) |
+|---|---|
+| `eg query semantic`, `semantic-memory`, `semantic-context` (embedded and `--daemon`) | score **descending**, then `record_id` **ascending** |
+| `eg query symbol` (pattern) | `repo_relative_path`, then span start line, then `record_id` |
+| `eg query symbol --at` | `record_id` |
+| `eg query file` | span start line, then `record_id` |
+| `eg query drift` | drift score **descending**, then `record_id` |
+
+**The tiebreaker is observable.** When two or more rows share an identical
+score, the secondary key (`record_id`, a stable content-derived ID printed on
+every row) decides their order — you can see the tiebreak in the output, and
+re-running the query reproduces it exactly. Float scores compare with
+`total_cmp`, so even NaN takes a deterministic position instead of collapsing
+to "equal".
+
+**What is (and is not) promised.**
+
+- Re-running the identical invocation against an **unchanged store** yields
+  byte-identical ordered `record_id` lists — 20/20 on the fixture corpus.
+  This covers the semantic path too: the vector index is approximate (HNSW),
+  and equal-score hits arrive in an unstable raw order, so the canonical
+  sort is applied to the full candidate pool *before* the top-N cut.
+- The contract governs **order stability, not ranking quality**: whether the
+  ranking is *good* is calibrated separately (issues #58/#106). A model
+  change is expected to change scores (issues #167/#104).
+- The contract assumes an **unchanged store snapshot** (concurrent-writer
+  visibility is owned by #197) and covers whatever subset `--limit` /
+  `--max-records` returns — the subset itself is stably ordered.
+- **Across independently built stores** (same JSONL ingested twice, or two
+  OS targets): identical score multisets produce identical orders. The
+  approximate vector index may, in rare cases, return a marginally different
+  candidate *set* at the truncation boundary across independent builds;
+  that residual ANN divergence is explicitly out of contract.
+
+---
+
 ## Owning-package scope (`--package`, issue #117)
 
 Every code fact carries `crate_attribution` — the owning Cargo package's name
@@ -1248,7 +1297,7 @@ Find code nodes by natural-language similarity using dense vector embeddings.
 eg query semantic <QUERY> --data-dir <DIR> [--limit N] [--format json|text]
 ```
 
-The query string is embedded with the same model used during ingest and compared against stored vectors using cosine similarity. Results are returned in descending similarity order.
+The query string is embedded with the same model used during ingest and compared against stored vectors using cosine similarity. Results are returned in the canonical total order — score descending, then `record_id` ascending — applied to the full candidate pool before the `--limit` cut, so tied rows never swap positions across runs. See [Result ordering contract (issue #199)](#result-ordering-contract-issue-199).
 
 The embedded store **must** have been populated with `eg ingest --embed`. A store created without `--embed` contains no embedding vectors and returns no results.
 
