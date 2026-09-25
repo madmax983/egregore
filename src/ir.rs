@@ -344,7 +344,7 @@ pub struct NodeProvenance {
 /// How a `Repository` node's stable ID was determined.
 ///
 /// Documented in `docs/schema/repository-identity.md`.
-#[derive(schemars::JsonSchema, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
     /// Derived from the lowest-name-sorted git remote URL (normalized).
@@ -356,6 +356,19 @@ pub enum IdentitySource {
     LocalPath,
     /// Supplied directly by the operator via `--repo-id-override`.
     OperatorOverride,
+}
+
+impl IdentitySource {
+    /// Closed `snake_case` vocabulary for operator-facing output (issue #193).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::LocalRootCommit => "local_root_commit",
+            Self::LocalPath => "local_path",
+            Self::OperatorOverride => "operator_override",
+        }
+    }
 }
 
 /// Identity payload carried on every `Repository` node.

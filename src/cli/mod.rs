@@ -73,6 +73,7 @@ mod record_budget;
 mod records;
 mod redaction_audit;
 mod repair_cmd;
+mod repos;
 mod resolve_frames;
 mod risk_markers;
 mod scan;
@@ -186,6 +187,7 @@ pub(crate) use recency::*;
 pub(crate) use records::*;
 pub(crate) use redaction_audit::*;
 pub(crate) use repair_cmd::*;
+pub(crate) use repos::*;
 pub(crate) use resolve_frames::*;
 pub(crate) use risk_markers::*;
 pub(crate) use scan::*;
@@ -823,6 +825,28 @@ pub(crate) enum Commands {
         /// newline-delimited `json` for embedded `--data-dir` inspection.
         #[arg(long)]
         format: Option<OutputFormat>,
+    },
+    /// Catalog a store's repositories with the selectors that scope repository-scoped queries (issue #193).
+    ///
+    /// Reads an embedded `--data-dir` store directly — no daemon, no network,
+    /// no embeddings — and lists every live repository with its stable record
+    /// ID, its `identity_source`, the human-usable scope selector the `--repo`
+    /// query lanes accept verbatim, a node count, and a recency hint. The
+    /// read is strictly read-only and the output is byte-identical across
+    /// runs on an unchanged store. When two repositories share a human
+    /// selector, the collision is surfaced with each repository's distinct
+    /// stable ID rather than silently de-duplicated. An empty store reports
+    /// an explicit empty roster with the stable `empty_repository_roster`
+    /// diagnostic. See `docs/cli/repos.md` for the documented JSON contract.
+    Repos {
+        /// Graph JSONL path to catalog.
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Output format: newline-delimited `json` (default) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     /// Brief an agent on graph evidence scoped to the working-tree diff (issue #214).
     ///
@@ -5936,6 +5960,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Repos {
+            graph,
+            data_dir,
+            format,
+        } => repos_cmd(graph.as_deref(), data_dir.as_deref(), format),
         Commands::Brief {
             repo_path,
             graph,

@@ -1223,7 +1223,7 @@ fn final_report(
 /// Builds the report's repository identity block.
 #[cfg(feature = "embedded-aletheiadb")]
 fn repository_block(identity: &identity::RepositoryIdentity, repo_path: &Path) -> InitRepository {
-    let identity_source = serde_json::to_value(&identity.payload.identity_source)
+    let identity_source = serde_json::to_value(identity.payload.identity_source)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());

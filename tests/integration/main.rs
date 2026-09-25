@@ -136,6 +136,7 @@ mod redaction;
 mod redaction_report;
 mod refresh;
 mod repair;
+mod repo_catalog;
 mod repo_scope;
 mod resolve_frames;
 mod review_coverage;
