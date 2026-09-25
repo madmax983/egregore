@@ -1,0 +1,614 @@
+//! Frozen MCP tool I/O contract — issue #194.
+//!
+//! The `eg mcp` server is the surface coding agents actually connect to, but
+//! its tool payloads were previously shaped only by implementation accident.
+//! This module freezes them:
+//!
+//! - [`MCP_CONTRACT_VERSION`] — the contract counter, advertised to agents in
+//!   the server info (`initialize` response) so they can read it without
+//!   inspecting source. Distinct from the rmcp protocol version negotiated in
+//!   `initialize` and from record `schema_version`.
+//! - [`response_schema`] — the published JSON Schema (Draft 2020-12) for each
+//!   shipped tool's *success* response. A conformance test
+//!   (`tests/integration/mcp_contract.rs`) asserts that the real output of
+//!   every shipped tool validates against its schema.
+//! - [`error_schema`] — the published schema for the stable error envelope,
+//!   so an agent can deterministically distinguish "symbol/task not found"
+//!   from "store missing or unreadable".
+//!
+//! The human-readable contract — per-tool inputs, per-field stability tiers
+//! (`stable` vs `provisional`), the breaking-vs-additive definition, and the
+//! release gate for new tools — lives in `docs/schema/mcp.md`; this module is
+//! its machine-readable twin and must be updated in the same commit.
+//!
+//! Versioning rule: `MCP_CONTRACT_VERSION` bumps **only** when a documented
+//! breaking-change class lands (field removal, rename, type change, or
+//! semantic change of an existing field, or an error-code identifier change).
+//! Additive changes — new tools, new optional input parameters, new response
+//! fields, new error codes — never bump it, and the schemas below declare
+//! `additionalProperties: true` at every object level so additive fields
+//! validate against the frozen schema.
+
+use serde_json::{Value, json};
+
+/// The frozen MCP tool I/O contract version.
+///
+/// Starts at 1. Bumps **only** on a breaking-change class (see the module
+/// docs and `docs/schema/mcp.md`): field removal, field rename, field type
+/// change, semantic change of an existing field, or an error-code identifier
+/// change. Additive changes (new tools, new optional parameters, new response
+/// fields, new error codes) never bump it.
+///
+/// This is deliberately a plain integer counter, not a semver triple: it is
+/// distinct from the crate/protocol version and from record `schema_version`.
+pub const MCP_CONTRACT_VERSION: u32 = 1;
+
+/// Tool names covered by the frozen contract, in `tool_router` registration
+/// order. Any new MCP tool (e.g. #181, #182, #183, #188) must extend this
+/// list and register its schema here before it ships.
+pub const MCP_CONTRACT_TOOLS: [&str; 4] = [
+    "inspect_store",
+    "symbol_context",
+    "task_evidence",
+    "store_freshness",
+];
+
+/// Returns the published JSON Schema (Draft 2020-12) for a shipped tool's
+/// success response (`ok: true`), or `None` for an unknown tool name.
+///
+/// Over the wire, success responses also carry the `freshness` object from
+/// issue #220 (the store-freshness verdict stamp); the schemas below include
+/// it, and the conformance test stamps it exactly the way the tool methods
+/// do before validating.
+///
+/// Every object level declares `additionalProperties: true`: additive
+/// response fields validate against the frozen schema, so an additive-only
+/// tool addition never breaks conformance and never bumps
+/// [`MCP_CONTRACT_VERSION`].
+#[must_use]
+pub fn response_schema(tool_name: &str) -> Option<Value> {
+    match tool_name {
+        "inspect_store" => Some(inspect_store_schema()),
+        "symbol_context" => Some(symbol_context_schema()),
+        "task_evidence" => Some(task_evidence_schema()),
+        "store_freshness" => Some(store_freshness_schema()),
+        _ => None,
+    }
+}
+
+/// Returns the published JSON Schema (Draft 2020-12) for the stable error
+/// envelope (`ok: false`).
+///
+/// Every MCP tool error — `no_match`, `ambiguous_handle`,
+/// `unsupported_handle`, `missing_argument`, `daemon_not_running`,
+/// `daemon_stale` — shares this envelope: `{"ok": false, "error": {"code":
+/// ..., ...}}`. The `code` is stable; code-specific detail fields ride
+/// alongside it under `error`.
+#[must_use]
+pub fn error_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Egregore MCP tool error envelope",
+        "description": "Stable error shape shared by every eg mcp tool (issue #194).",
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["ok", "error"],
+        "properties": {
+            "ok": { "const": false },
+            "error": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["code"],
+                "properties": {
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "field": { "type": "string" },
+                    "symbol_name": { "type": "string" },
+                    "id_or_handle": { "type": "string" },
+                    "handle": { "type": "string" },
+                    "candidates": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        }
+    })
+}
+
+// ── Shared fragments ────────────────────────────────────────────────────────
+
+fn str_or_null() -> Value {
+    json!({ "type": ["string", "null"] })
+}
+
+fn int_or_null() -> Value {
+    json!({ "type": ["integer", "null"] })
+}
+
+fn bool_schema() -> Value {
+    json!({ "type": "boolean" })
+}
+
+fn trust_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "source_derived", "verification_evidence", "agent_verified",
+            "agent_unverified", "agent_contradicted", "project_state",
+            "artifact", "runtime_observation", "other"
+        ]
+    })
+}
+
+fn span_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": true,
+        "required": ["start_byte", "end_byte", "start_line", "end_line"],
+        "properties": {
+            "start_byte": { "type": "integer" },
+            "end_byte": { "type": "integer" },
+            "start_line": { "type": "integer" },
+            "end_line": { "type": "integer" },
+            "start_column": int_or_null(),
+            "end_column": int_or_null()
+        }
+    })
+}
+
+fn evidence_link_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "target_record_id": str_or_null(),
+            "target_domain": { "type": "string" },
+            "relation": { "type": "string" },
+            "confidence": { "type": "string" }
+        }
+    })
+}
+
+fn evidence_links_schema() -> Value {
+    json!({ "type": "array", "items": evidence_link_schema() })
+}
+
+/// Every returned record carries `record_id` (the stable, evidence-cited
+/// handle) and a `trust` class from the closed vocabulary the CLI and daemon
+/// use (`crate::query::TrustClass`).
+fn record_header_properties() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        ("record_id".to_owned(), json!({ "type": "string" })),
+        ("kind".to_owned(), json!({ "type": "string" })),
+        ("trust".to_owned(), trust_schema()),
+    ])
+}
+
+fn extend_props(
+    props: &mut serde_json::Map<String, Value>,
+    extra: impl IntoIterator<Item = (&'static str, Value)>,
+) {
+    props.extend(extra.into_iter().map(|(k, v)| (k.to_owned(), v)));
+}
+
+fn source_fact_schema() -> Value {
+    let mut props = record_header_properties();
+    extend_props(
+        &mut props,
+        [
+            ("name", str_or_null()),
+            ("repo_relative_path", str_or_null()),
+            ("span", span_schema()),
+            ("git_commit", str_or_null()),
+            ("valid_time", str_or_null()),
+            ("language", str_or_null()),
+            ("symbol_kind", str_or_null()),
+        ],
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust"],
+        "properties": props
+    })
+}
+
+fn observation_schema() -> Value {
+    let mut props = record_header_properties();
+    extend_props(
+        &mut props,
+        [
+            ("summary", str_or_null()),
+            ("text", str_or_null()),
+            ("provenance_handle", str_or_null()),
+            ("agent_id", str_or_null()),
+            ("session_id", str_or_null()),
+            ("observed_at", str_or_null()),
+            ("confidence", str_or_null()),
+            ("failure_kind", str_or_null()),
+            ("exit_code", int_or_null()),
+            ("evidence_links", evidence_links_schema()),
+        ],
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust"],
+        "properties": props
+    })
+}
+
+fn output_handle_citation_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": true,
+        "properties": {
+            "hash": { "type": "string" },
+            "bytes": { "type": "integer" }
+        }
+    })
+}
+
+fn patch_handle_citation_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": true,
+        "properties": { "path": { "type": "string" } }
+    })
+}
+
+/// The generic linked-item row (tasks, acceptance criteria, artifacts,
+/// verification evidence, reviews, external links). Citation metadata only —
+/// never inlined payloads (redaction, issue #53).
+fn linked_item_schema() -> Value {
+    let mut props = record_header_properties();
+    extend_props(
+        &mut props,
+        [
+            ("summary", str_or_null()),
+            ("title", str_or_null()),
+            ("name", str_or_null()),
+            ("text", str_or_null()),
+            ("status", str_or_null()),
+            ("verification_kind", str_or_null()),
+            ("exit_code", int_or_null()),
+            ("executed_at", str_or_null()),
+            ("evidence_quality", str_or_null()),
+            ("source_artifact_path", str_or_null()),
+            ("source_artifact_hash", str_or_null()),
+            ("stdout_handle", output_handle_citation_schema()),
+            ("stderr_handle", output_handle_citation_schema()),
+            ("repo_relative_path", str_or_null()),
+            ("edit_kind", str_or_null()),
+            ("patch_status", str_or_null()),
+            ("patch_handle", patch_handle_citation_schema()),
+            ("patch_bytes_hash", str_or_null()),
+            ("patch_bytes_size", int_or_null()),
+            (
+                "target_files",
+                json!({ "type": ["array", "null"], "items": { "type": "string" } }),
+            ),
+            ("validation_summary", str_or_null()),
+            ("base_commit", str_or_null()),
+            ("producer_session_id", str_or_null()),
+            ("body_handle", output_handle_citation_schema()),
+            ("author", str_or_null()),
+            ("url", str_or_null()),
+            ("system_native_id", str_or_null()),
+            ("evidence_links", evidence_links_schema()),
+        ],
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust"],
+        "properties": props
+    })
+}
+
+/// An acceptance-criterion row is a linked item that may carry its resolved
+/// verification record when its status is `verified`.
+fn acceptance_criterion_schema() -> Value {
+    let mut schema = linked_item_schema();
+    schema["properties"]["verification_record"] = json!({
+        "type": "object",
+        "additionalProperties": true
+    });
+    schema
+}
+
+fn topology_edge_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "trust", "label", "source_id", "target_id"],
+        "properties": {
+            "record_id": { "type": "string" },
+            "trust": trust_schema(),
+            "label": { "type": "string" },
+            "source_id": { "type": "string" },
+            "target_id": { "type": "string" },
+            "summary": str_or_null(),
+            "git_commit": str_or_null(),
+            "valid_time": str_or_null()
+        }
+    })
+}
+
+/// One `drift_history` row: the same citable handle the CLI and daemon
+/// render, plus the closed-vocabulary trust class.
+fn drift_row_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "record_id", "trust", "score", "before_commit", "after_commit",
+            "before_valid_time", "after_valid_time", "embedding_model"
+        ],
+        "properties": {
+            "record_id": { "type": "string" },
+            "trust": trust_schema(),
+            "score": { "type": "number" },
+            "before_commit": { "type": "string" },
+            "after_commit": { "type": "string" },
+            "before_valid_time": { "type": "string" },
+            "after_valid_time": { "type": "string" },
+            "embedding_model": { "type": "string" },
+            "repo_relative_path": { "type": "string" },
+            "span": span_schema()
+        }
+    })
+}
+
+fn unresolved_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "source_record_id", "target_handle", "relation",
+            "target_domain", "verification_status"
+        ],
+        "properties": {
+            "source_record_id": { "type": "string" },
+            "target_handle": { "type": "string" },
+            "relation": { "type": "string" },
+            "target_domain": { "type": "string" },
+            "verification_status": { "const": "unresolved" }
+        }
+    })
+}
+
+/// Store-level domain presence (issue #196): `false` + empty section means
+/// the domain is absent from the store; `true` + empty section means the
+/// entity has no records in that domain.
+fn store_coverage_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["code_graph", "agent_memory", "project", "artifact", "verification"],
+        "properties": {
+            "code_graph": bool_schema(),
+            "agent_memory": bool_schema(),
+            "project": bool_schema(),
+            "artifact": bool_schema(),
+            "verification": bool_schema()
+        }
+    })
+}
+
+/// The `freshness` trust-signal object stamped onto every successful tool
+/// response (issue #220). Reuses the #186 contract vocabulary — no new
+/// vocabulary is introduced here.
+fn freshness_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "verdict", "fresh", "repository_id", "repo_path",
+            "stored_snapshot", "current_head", "current_dirty", "message"
+        ],
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["fresh", "stale_head", "stale_dirty", "unknown"]
+            },
+            "fresh": bool_schema(),
+            "repository_id": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "stored_snapshot": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": ["head", "dirty", "repository_id", "scanned_at"],
+                        "properties": {
+                            "head": snapshot_head_schema(),
+                            "dirty": bool_schema(),
+                            "repository_id": { "type": "string" },
+                            "scanned_at": { "type": "string" }
+                        }
+                    },
+                    {
+                        "description": "Explicit marker for a pre-stamping store — never a silent absence, never a false `fresh`.",
+                        "type": "object",
+                        "required": ["state"],
+                        "properties": { "state": { "const": "pre_stamping" } }
+                    }
+                ]
+            },
+            "current_head": snapshot_head_schema(),
+            "current_dirty": bool_schema(),
+            "message": { "type": "string" }
+        }
+    })
+}
+
+fn snapshot_head_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["state"],
+        "properties": {
+            "state": { "type": "string", "enum": ["commit", "no_git", "unborn_head"] },
+            "sha": { "type": "string" }
+        }
+    })
+}
+
+fn schema_head(tool: &str, description: &str) -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": format!("Egregore MCP tool response: {tool}"),
+        "description": description,
+    })
+}
+
+/// Merges two JSON objects. Both arguments are always objects by construction;
+/// a non-object `extra` is ignored rather than panicking.
+fn merge_objects(mut base: Value, extra: Value) -> Value {
+    let Value::Object(extra_map) = extra else {
+        return base;
+    };
+    if let Value::Object(base_map) = &mut base {
+        base_map.extend(extra_map);
+    }
+    base
+}
+
+// ── Per-tool success schemas ────────────────────────────────────────────────
+
+fn inspect_store_schema() -> Value {
+    let schema = schema_head(
+        "inspect_store",
+        "Structured store-inspection summary (issue #194).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "ok", "records", "nodes", "edges", "tombstones", "diagnostics",
+            "domain_counts", "schema_versions", "unknown_schema_versions",
+            "repositories", "freshness"
+        ],
+        "properties": {
+            "ok": { "const": true },
+            "snapshot_timestamp": str_or_null(),
+            "records": { "type": "integer" },
+            "nodes": { "type": "integer" },
+            "edges": { "type": "integer" },
+            "tombstones": { "type": "integer" },
+            "diagnostics": { "type": "integer" },
+            "domain_counts": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": { "type": "integer" }
+                }
+            },
+            "schema_versions": {
+                "type": "object",
+                "additionalProperties": { "type": "integer" }
+            },
+            "unknown_schema_versions": {
+                "type": "object",
+                "additionalProperties": { "type": "integer" }
+            },
+            "repositories": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["id", "identity_summary"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "identity_summary": { "type": "string" }
+                    }
+                }
+            },
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+fn symbol_context_schema() -> Value {
+    let schema = schema_head(
+        "symbol_context",
+        "Evidence-backed symbol context, trust-separated by domain (issue #194).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "ok", "symbol_name", "source_facts", "topology_edges",
+            "observations", "project_state", "artifacts",
+            "verification_evidence", "drift_history", "unresolved",
+            "store_coverage", "freshness"
+        ],
+        "properties": {
+            "ok": { "const": true },
+            "symbol_name": { "type": "string" },
+            "source_facts": { "type": "array", "items": source_fact_schema() },
+            "topology_edges": { "type": "array", "items": topology_edge_schema() },
+            "observations": { "type": "array", "items": observation_schema() },
+            "project_state": { "type": "array", "items": linked_item_schema() },
+            "artifacts": { "type": "array", "items": linked_item_schema() },
+            "verification_evidence": { "type": "array", "items": linked_item_schema() },
+            "drift_history": { "type": "array", "items": drift_row_schema() },
+            "unresolved": { "type": "array", "items": unresolved_schema() },
+            "store_coverage": store_coverage_schema(),
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+fn task_evidence_schema() -> Value {
+    let schema = schema_head(
+        "task_evidence",
+        "Evidence-backed task context, trust-separated by domain (issue #194).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "ok", "task_id", "tasks", "acceptance_criteria", "source_facts",
+            "observations", "artifacts", "verification_evidence", "reviews",
+            "external_links", "unresolved", "store_coverage", "freshness"
+        ],
+        "properties": {
+            "ok": { "const": true },
+            "task_id": { "type": "string" },
+            "tasks": { "type": "array", "items": linked_item_schema() },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": acceptance_criterion_schema()
+            },
+            "source_facts": { "type": "array", "items": source_fact_schema() },
+            "observations": { "type": "array", "items": observation_schema() },
+            "artifacts": { "type": "array", "items": linked_item_schema() },
+            "verification_evidence": { "type": "array", "items": linked_item_schema() },
+            "reviews": { "type": "array", "items": linked_item_schema() },
+            "external_links": { "type": "array", "items": linked_item_schema() },
+            "unresolved": { "type": "array", "items": unresolved_schema() },
+            "store_coverage": store_coverage_schema(),
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+fn store_freshness_schema() -> Value {
+    let schema = schema_head(
+        "store_freshness",
+        "Store-freshness verdict for the whole store (issue #194).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["ok", "freshness"],
+        "properties": {
+            "ok": { "const": true },
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}

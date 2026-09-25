@@ -84,6 +84,10 @@ pub mod manifest_deps;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
+/// Frozen MCP tool I/O contract: versioned schemas for the `eg mcp` tool
+/// payloads (issue #194).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod mcp_contract;
 /// Agent-memory health report to flag reviewability risk (issue #94).
 pub mod memory_health;
 /// Agent-memory recall evaluation harness (issue #91).

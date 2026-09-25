@@ -58,6 +58,7 @@ use crate::{
     GraphRecord, NodeKind,
     daemon::DaemonClient,
     ir::EdgeLabel,
+    mcp_contract::MCP_CONTRACT_VERSION,
     query,
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
 };
@@ -165,14 +166,7 @@ impl EgregoreMcpServer {
     #[must_use]
     pub fn symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
         if args.symbol_name.is_empty() {
-            let err = json!({
-                "ok": false,
-                "error": {
-                    "code": "missing_argument",
-                    "field": "symbol_name",
-                    "message": "symbol_name is required and must be non-empty"
-                }
-            });
+            let err = missing_argument_error("symbol_name");
             return serde_json::to_string(&err).unwrap_or_default();
         }
         let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
@@ -262,13 +256,15 @@ impl ServerHandler for EgregoreMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
+            .with_instructions(format!(
                 "Read-only Egregore knowledge graph tools. \
                 Connect to a running local daemon (`eg daemon`) to query the \
                 code-graph, agent observations, and task evidence. \
                 All tools return structured JSON with `ok`, `error`, and \
-                trust-separated data sections.",
-            )
+                trust-separated data sections. \
+                mcp_contract_version={MCP_CONTRACT_VERSION} (frozen tool I/O \
+                contract, issue #194; see docs/schema/mcp.md)."
+            ))
     }
 }
 
@@ -1016,6 +1012,20 @@ fn unresolved_to_json(u: &query::UnresolvedRef) -> Value {
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
+
+/// Builds the stable `missing_argument` error payload for an empty required
+/// tool argument (issue #194: the shape is part of the frozen contract).
+#[must_use]
+pub fn missing_argument_error(field: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "missing_argument",
+            "field": field,
+            "message": format!("{field} is required and must be non-empty")
+        }
+    })
+}
 
 fn daemon_error(msg: &str) -> Value {
     let code = if msg.to_lowercase().contains("stale") || msg.to_lowercase().contains("metadata") {

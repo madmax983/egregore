@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "eg"
 path = "src/bin/eg.rs"
 
+[[example]]
+name = "gen_mcp_schemas"
+required-features = ["embedded-aletheiadb"]
+
 [features]
 default = ["embedded-aletheiadb", "embeddings"]
 embedded-aletheiadb = [
@@ -112,6 +116,9 @@ tempfile = "3.27.0"
 # fixtures use only upstream's public `config::durable_config_for_data_dir` +
 # `AletheiaDB`, so no Egregore-private item is exposed to make them work.
 aletheiadb = { version = "0.2.0", default-features = false }
+# JSON Schema validation for the MCP tool I/O contract conformance tests
+# (issue #194). Draft 2020-12; pure Rust.
+jsonschema = "0.33"
 
 [profile.dev]
 debug = 1
