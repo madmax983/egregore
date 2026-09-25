@@ -2061,11 +2061,18 @@ pub(crate) enum QuerySubcommand {
     /// Missing evidence links are surfaced as `unresolved` items.
     ///
     /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
-    /// stdout and exits with code 2. No synthesized prose; no hallucinated
+    /// stdout and exits with code 2. On ambiguity (issue #192): emits
+    /// `{"ok":false,"error":{"code":"ambiguous_symbol","candidates":[...],...}}`
+    /// to stdout and exits with code 1. No synthesized prose; no hallucinated
     /// fallback records.
     Context {
         /// Symbol name to look up.
         name: String,
+        /// Disambiguation selector (issue #192): a candidate `record_id` or
+        /// `file:span` handle from an `ambiguous_symbol` response, to get
+        /// context scoped to exactly that symbol.
+        #[arg(long)]
+        candidate: Option<String>,
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
         graph: Option<PathBuf>,
@@ -8094,6 +8101,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             all_history,
             supersession,
             max_records,
+            candidate,
         } => {
             // Sidecar-index fast path (issue #447): the plain context bundle is a
             // `ByName` closure. With `--repo-path` the freshness hint needs the
@@ -8158,6 +8166,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 max_records,
                 store_coverage,
+                candidate.as_deref(),
             )
         }
         QuerySubcommand::Bench {

@@ -8,7 +8,7 @@
       "properties": {
         "candidates": {
           "items": {
-            "type": "string"
+            "type": ["string", "object"]
           },
           "type": "array"
         },

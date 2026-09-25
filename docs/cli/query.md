@@ -20,7 +20,7 @@ eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
-eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N]
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only] [--max-records N]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N]
@@ -983,6 +983,58 @@ directory-first triage ("what's happening under `src/adapters`?"); use
 `error-context` (when available) for error-first triage ("what does this
 signature touch?"). This lane is the health report; `error-context` is the
 error's neighborhood.
+
+---
+
+## eg query context
+
+Evidence-backed context for a **symbol** (issue #38), trust-separated into
+`source_facts`, `topology_edges`, `observations`, `project_state`, `artifacts`,
+`verification_evidence`, `drift_history`, and `unresolved` (see
+[The context bundle](#the-context-bundle)).
+
+```text
+eg query context <NAME> --graph <PATH> [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
+```
+
+### Ambiguous names (issue #192)
+
+A name shared by two or more **distinct** symbols (e.g. `Foo::new` and
+`Bar::new`) is never merged into one blended answer — that would attribute one
+symbol's history, decisions, and evidence to another. Instead the command
+prints a disambiguation envelope to stdout and exits `1`:
+
+```json
+{"ok":false,"error":{"code":"ambiguous_symbol","symbol_name":"new",
+ "message":"the name matches more than one distinct symbol; re-run with --candidate <record_id|file:span handle>",
+ "candidates":[
+   {"record_id":"codegraph:v4:...","symbol_name":"new",
+    "repo_relative_path":"src/bar.rs","span":{...},
+    "file_span_handle":"src/bar.rs:30-35"},
+   {"record_id":"codegraph:v4:...","symbol_name":"new",
+    "repo_relative_path":"src/foo.rs","span":{...},
+    "file_span_handle":"src/foo.rs:10-15"}]}}
+```
+
+One entry per distinct symbol identity (distinct stable record IDs, ADR 0004),
+deterministically ordered by repo-relative path, then span start line, then
+record ID. Tombstoned symbols and historical (temporal) snapshots follow the
+usual current-state vs history rules — only the identities a plain recall
+would have merged count toward ambiguity.
+
+Re-run with `--candidate` holding one candidate's `record_id` or
+`file:span` handle (`path:start_line-end_line`) for context scoped to exactly
+that symbol — zero records belonging to a sibling symbol appear in any
+section. An unresolvable `--candidate` is a `no_match` (exit `2`), never a
+guess.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Context printed (single match, or `--candidate` re-query). |
+| `1` | `ambiguous_symbol` — the name matches more than one distinct symbol; the envelope lists the candidates. |
+| `2` | `no_match` — no symbol carries the name (or the `--candidate` selector resolved to nothing). |
 
 ---
 

@@ -81,6 +81,11 @@ pub struct InspectStoreArgs {
 pub struct SymbolContextArgs {
     /// Exact symbol name to look up.
     pub symbol_name: String,
+    /// Disambiguation selector (issue #192): pass one candidate's `record_id`
+    /// or `file:span` handle from an `ambiguous_symbol` response to get
+    /// context scoped to exactly that symbol. When present, `symbol_name`
+    /// may be empty — the candidate alone identifies the symbol.
+    pub candidate: Option<String>,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
     /// Working-tree path the store freshness verdict is computed against
@@ -152,6 +157,13 @@ impl EgregoreMcpServer {
     /// Returns evidence-backed context for a named code symbol, trust-separated
     /// by domain into `source_facts`, `observations`, `project_state`,
     /// `artifacts`, `verification_evidence`, and `drift_history`.
+    ///
+    /// When the name resolves to more than one distinct symbol, the tool does
+    /// NOT merge them: it returns `{"ok":false,"error":{"code":
+    /// "ambiguous_symbol","candidates":[...]}}` — one candidate per identity,
+    /// each with its stable `record_id` and repo-relative `file:span` handle.
+    /// Pass one candidate's `record_id` or `file:span` handle back as
+    /// `candidate` to get context scoped to exactly that symbol.
     #[tool(
         description = "Returns evidence-backed context for a named code symbol, \
             trust-separated into sections: source_facts (deterministic \
@@ -159,13 +171,18 @@ impl EgregoreMcpServer {
             truth), project_state (tasks/ACs), artifacts, \
             verification_evidence, and drift_history (semantic-drift \
             measurements). Every item carries a record_id and at \
-            least one citation handle. Successful responses carry a \
+            least one citation handle. A name shared by several distinct \
+            symbols is never merged: the tool returns an `ambiguous_symbol` \
+            error enumerating one candidate per identity (stable record_id \
+            plus repo-relative file:span handle); pass one candidate's \
+            record_id or file:span handle back as `candidate` for context \
+            scoped to exactly that symbol. Successful responses carry a \
             `freshness` object (verdict, stored source-snapshot identity, \
             working-tree state) so agents can gate trust in the cited handles."
     )]
     #[must_use]
     pub fn symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
-        if args.symbol_name.is_empty() {
+        if args.symbol_name.is_empty() && args.candidate.is_none() {
             let err = missing_argument_error("symbol_name");
             return serde_json::to_string(&err).unwrap_or_default();
         }
@@ -183,7 +200,11 @@ impl EgregoreMcpServer {
                 return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
             }
         };
-        let mut payload = tool_symbol_context_from_records(&records, &args.symbol_name);
+        let mut payload = tool_symbol_context_from_records_with_candidate(
+            &records,
+            &args.symbol_name,
+            args.candidate.as_deref(),
+        );
         stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
         serde_json::to_string(&payload).unwrap_or_default()
     }
@@ -431,11 +452,98 @@ pub fn tool_inspect_store_from_records(
 /// class (issue #114) from the same closed vocabulary the CLI and daemon use;
 /// see `crate::query::TrustClass` and `docs/cli/query.md`.
 ///
-/// Returns `{"ok":false,"error":{"code":"no_match"}}` when the symbol is absent.
-/// Output ordering is deterministic (sorted by record ID within each section).
+/// Returns `{"ok":false,"error":{"code":"no_match"}}` when the symbol is absent,
+/// and `{"ok":false,"error":{"code":"ambiguous_symbol","candidates":[...]}}`
+/// when the name resolves to more than one distinct symbol identity (issue
+/// #192) — the identities are enumerated, never merged. Output ordering is
+/// deterministic (sorted by record ID within each section).
 #[must_use]
 pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &str) -> Value {
+    tool_symbol_context_from_records_with_candidate(records, symbol_name, None)
+}
+
+/// Builds an evidence-backed symbol context for a record slice, with an
+/// optional disambiguation selector (issue #192).
+///
+/// When `candidate` is `Some`, it selects exactly one symbol — either a
+/// stable `record_id` or a `file:span` handle (`path:start_line-end_line`)
+/// from a previous `ambiguous_symbol` response — and the context is anchored
+/// on that symbol alone via [`query::record_context`]. An unresolvable
+/// selector is a `no_match`, never a guess.
+///
+/// When `candidate` is `None`, the name is resolved with
+/// [`query::symbol_context`]: a name shared by distinct identities returns
+/// the `ambiguous_symbol` disambiguation error instead of a blended answer.
+#[must_use]
+pub fn tool_symbol_context_from_records_with_candidate(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    candidate: Option<&str>,
+) -> Value {
+    // Disambiguated re-query: anchor on exactly one symbol identity.
+    if let Some(selector) = candidate {
+        let anchor = records
+            .iter()
+            .find(|r| {
+                r.id() == selector
+                    && matches!(
+                        r,
+                        GraphRecord::Node {
+                            kind: NodeKind::Symbol,
+                            ..
+                        }
+                    )
+            })
+            .or_else(|| query::resolve_symbol_file_span_handle(records, selector));
+        let Some(anchor) = anchor else {
+            return json!({
+                "ok": false,
+                "error": { "code": "no_match", "candidate": selector }
+            });
+        };
+        let ctx = query::record_context(records, anchor.id());
+        if ctx.is_no_match() {
+            return json!({
+                "ok": false,
+                "error": { "code": "no_match", "candidate": selector }
+            });
+        }
+        let name = match anchor {
+            GraphRecord::Node { name: Some(n), .. } => n.as_str(),
+            _ => selector,
+        };
+        return symbol_context_payload(records, &ctx, name);
+    }
+
     let ctx = query::symbol_context(records, symbol_name);
+
+    // Issue #192: a name shared by distinct symbols is reported, never merged.
+    // The error code is the symbol-domain analogue of `task_evidence`'s
+    // `ambiguous_handle`.
+    if ctx.is_ambiguous() {
+        let candidates: Vec<Value> = ctx
+            .candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "record_id": c.record_id,
+                    "symbol_name": c.symbol_name,
+                    "repo_relative_path": c.repo_relative_path,
+                    "span": c.span,
+                    "file_span_handle": c.file_span_handle(),
+                })
+            })
+            .collect();
+        return json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_symbol",
+                "symbol_name": symbol_name,
+                "message": "the name matches more than one distinct symbol; pass one candidate's record_id or file:span handle as `candidate`",
+                "candidates": candidates,
+            }
+        });
+    }
 
     if ctx.is_no_match() {
         return json!({
@@ -444,6 +552,17 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         });
     }
 
+    symbol_context_payload(records, &ctx, symbol_name)
+}
+
+/// Renders the `ok:true` symbol-context payload from a resolved
+/// [`query::SymbolContext`], shared by the name-recall and the disambiguated
+/// re-query paths so both lanes emit the identical envelope shape.
+fn symbol_context_payload(
+    records: &[GraphRecord],
+    ctx: &query::SymbolContext<'_>,
+    symbol_name: &str,
+) -> Value {
     let trust = query::TrustIndex::build(records);
 
     let source_facts: Vec<Value> = ctx

@@ -310,6 +310,7 @@ fn daemon_failure_shape_conforms_and_differs_from_no_match() {
         EgregoreMcpServer::new(Path::new("/nonexistent-egregore-data-dir-issue-194").to_path_buf());
     let raw = server.symbol_context(Parameters(SymbolContextArgs {
         symbol_name: "alpha_fn".to_owned(),
+        candidate: None,
         data_dir: None,
         repo_path: None,
     }));
@@ -360,4 +361,43 @@ fn published_schema_files_match_registered_schemas() {
         error_schema(),
         "checked-in error.schema.json drifted from mcp_contract::error_schema"
     );
+}
+
+// ── Issue #192: ambiguous_symbol error envelope ─────────────────────────────
+
+/// The `ambiguous_symbol` disambiguation error shares the published error
+/// envelope: it must validate against `error_schema()` exactly like
+/// `no_match` and `ambiguous_handle` do.
+#[test]
+fn ambiguous_symbol_error_conforms_to_published_error_schema() {
+    use aletheia_egregore::mcp::tool_symbol_context_from_records_with_candidate;
+
+    let sym_a = GraphRecord::symbol(
+        "codegraph:v4:aaaa0001build".to_owned(),
+        "function",
+        "src/a.rs".to_owned(),
+        span(1, 9),
+        "build".to_owned(),
+        "Rust function build in a".to_owned(),
+    )
+    .with_valid_time_inferred("2026-01-01T00:00:00Z");
+    let sym_b = GraphRecord::symbol(
+        "codegraph:v4:bbbb0002build".to_owned(),
+        "function",
+        "src/b.rs".to_owned(),
+        span(11, 19),
+        "build".to_owned(),
+        "Rust function build in b".to_owned(),
+    )
+    .with_valid_time_inferred("2026-01-01T00:00:00Z");
+    let records = vec![sym_a, sym_b];
+
+    let payload = tool_symbol_context_from_records_with_candidate(&records, "build", None);
+    assert_eq!(payload["ok"], Value::from(false));
+    assert_eq!(payload["error"]["code"], Value::from("ambiguous_symbol"));
+    assert_valid(&error_schema(), &payload, "symbol_context ambiguous_symbol");
+
+    // The code is stable and distinct from the sibling contracts.
+    assert_ne!(payload["error"]["code"], Value::from("no_match"));
+    assert_ne!(payload["error"]["code"], Value::from("ambiguous_handle"));
 }

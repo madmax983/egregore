@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use super::{
     evidence_link_triple_handle, is_bfs_relay_node, is_cross_domain_label, is_forward_only_label,
 };
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
+use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
 /// An evidence link target that could not be resolved in the current store.
 ///
@@ -21,12 +21,62 @@ pub struct UnresolvedRef {
     pub target_domain: String,
 }
 
+/// One distinct symbol identity sharing a queried name.
+///
+/// Surfaced in [`SymbolContext::candidates`] when a name resolves to more
+/// than one distinct symbol identity (issue #192). The caller picks one by
+/// [`SymbolCandidate::record_id`] or [`SymbolCandidate::file_span_handle`]
+/// and re-queries (via [`record_context`] or the `candidate` selector on the
+/// `symbol_context` MCP tool / `--candidate` on `eg query context`) for
+/// context scoped to exactly that symbol.
+///
+/// The struct is `Serialize` so the MCP and CLI lanes can render the
+/// disambiguation list without a second mapping step.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
+pub struct SymbolCandidate<'a> {
+    /// Stable record ID of the symbol node (ADR 0004).
+    pub record_id: &'a str,
+    /// The queried symbol name (identical for every candidate).
+    pub symbol_name: &'a str,
+    /// Repo-relative defining path, when the symbol carries one.
+    pub repo_relative_path: Option<&'a str>,
+    /// Source span of the symbol definition, when recorded.
+    pub span: Option<&'a SourceSpan>,
+}
+
+impl SymbolCandidate<'_> {
+    /// Repo-relative `file:span` handle for this candidate:
+    /// `path:start_line-end_line`.
+    ///
+    /// Falls back to the bare repo-relative path when the symbol carries no
+    /// span, and to the record ID when it carries no path either. The
+    /// `path:start_line-end_line` form round-trips through
+    /// [`resolve_symbol_file_span_handle`]; the fallbacks are display-only.
+    #[must_use]
+    pub fn file_span_handle(&self) -> String {
+        match (self.repo_relative_path, self.span) {
+            (Some(path), Some(span)) => {
+                format!("{path}:{}-{}", span.start_line, span.end_line)
+            }
+            (Some(path), None) => path.to_owned(),
+            (None, _) => self.record_id.to_owned(),
+        }
+    }
+}
+
 /// Evidence-backed symbol context returned by [`symbol_context`].
 ///
 /// Sections are kept separate so the caller can present source facts
 /// (deterministic) differently from observations (subjective) without
 /// mixing trust levels. An [`Observation`] node MUST NOT appear in
 /// [`SymbolContext::source_facts`].
+///
+/// When the queried name resolves to more than one distinct symbol identity,
+/// the recall is *ambiguous* (issue #192): every section is empty and
+/// [`SymbolContext::candidates`] enumerates the identities instead. Merging
+/// the sections would attribute one symbol's history to another, so the
+/// sections are NEVER populated on an ambiguous result — check
+/// [`SymbolContext::is_ambiguous`] before inspecting them.
 ///
 /// [`Observation`]: crate::ir::NodeKind::Observation
 #[derive(Debug, Default, Clone)]
@@ -63,13 +113,21 @@ pub struct SymbolContext<'a> {
     /// Evidence link targets referenced by agent-memory nodes that are absent
     /// from this store slice. Surfaced explicitly per AC5.
     pub unresolved: Vec<UnresolvedRef>,
+    /// Disambiguation candidates, populated ONLY when the queried name
+    /// resolves to more than one distinct symbol identity (issue #192).
+    ///
+    /// One entry per distinct identity, deterministically ordered by
+    /// (repo-relative path, span start line, record ID). Every section is
+    /// empty on an ambiguous result — the sections are never a merge of
+    /// several identities. Empty for no-match and single-match results.
+    pub candidates: Vec<SymbolCandidate<'a>>,
 }
 
 impl SymbolContext<'_> {
     /// Returns `true` when no symbol with the queried name exists in the store.
     ///
-    /// Callers MUST check this before inspecting sections — all sections are
-    /// empty for a no-match result.
+    /// Callers MUST check [`SymbolContext::is_ambiguous`] first: an ambiguous
+    /// name has empty sections but is a match, not a no-match.
     #[must_use]
     pub const fn is_no_match(&self) -> bool {
         self.source_facts.is_empty()
@@ -78,6 +136,19 @@ impl SymbolContext<'_> {
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
             && self.unresolved.is_empty()
+            && self.candidates.is_empty()
+    }
+
+    /// Returns `true` when the queried name resolved to more than one
+    /// distinct symbol identity (issue #192).
+    ///
+    /// The sections are empty on an ambiguous result; the identities are
+    /// enumerated in [`SymbolContext::candidates`] instead of being merged.
+    /// Callers MUST check this before inspecting sections — and before
+    /// `is_no_match`, which is `false` for ambiguous results.
+    #[must_use]
+    pub const fn is_ambiguous(&self) -> bool {
+        !self.candidates.is_empty()
     }
 }
 
@@ -137,29 +208,198 @@ pub(super) enum ContextSection {
     VerificationEvidence,
 }
 
+/// Builds the ambiguous-recall result for issue #192: one
+/// [`SymbolCandidate`] per distinct symbol identity, sections left empty.
+///
+/// `symbol_ids` is the exact set of identities the current-state recall
+/// would otherwise have merged (tombstone and temporal rules already
+/// applied), so ambiguity detection counts precisely those. Candidates cite
+/// the current-state (non-temporal) record's path/span when one exists,
+/// falling back to any version so a historical-only identity still gets a
+/// handle. Ordered by (repo-relative path, span start line, record ID) for
+/// a deterministic, human-scannable disambiguation list.
+fn ambiguous_symbol_context<'a>(
+    records: &'a [GraphRecord],
+    symbol_name: &'a str,
+    symbol_ids: &BTreeSet<&'a str>,
+) -> SymbolContext<'a> {
+    /// Path/span/name of the current-state record for `id`, falling back to
+    /// any version present in the slice.
+    fn current_record_parts<'a>(
+        records: &'a [GraphRecord],
+        id: &str,
+    ) -> Option<(Option<&'a str>, Option<&'a SourceSpan>, Option<&'a str>)> {
+        let mut fallback: Option<(Option<&'a str>, Option<&'a SourceSpan>, Option<&'a str>)> = None;
+        for record in records {
+            let GraphRecord::Node {
+                id: record_id,
+                kind: NodeKind::Symbol,
+                name,
+                repo_relative_path,
+                span,
+                temporal,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if record_id.as_str() != id {
+                continue;
+            }
+            let parts = (
+                repo_relative_path.as_deref(),
+                span.as_ref(),
+                name.as_deref(),
+            );
+            if temporal.is_none() {
+                return Some(parts);
+            }
+            fallback.get_or_insert(parts);
+        }
+        fallback
+    }
+
+    let mut candidates: Vec<SymbolCandidate<'a>> = symbol_ids
+        .iter()
+        .copied()
+        .filter_map(|id| {
+            let (repo_relative_path, span, name) = current_record_parts(records, id)?;
+            Some(SymbolCandidate {
+                record_id: id,
+                symbol_name: name.unwrap_or(symbol_name),
+                repo_relative_path,
+                span,
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        (
+            a.repo_relative_path,
+            a.span.map(|s| s.start_line),
+            a.record_id,
+        )
+            .cmp(&(
+                b.repo_relative_path,
+                b.span.map(|s| s.start_line),
+                b.record_id,
+            ))
+    });
+
+    SymbolContext {
+        symbol_name: symbol_name.to_owned(),
+        candidates,
+        ..Default::default()
+    }
+}
+
+/// Resolves a `file:span` handle (`path:start_line-end_line`, as produced by
+/// [`SymbolCandidate::file_span_handle`]) back to the symbol record.
+///
+/// This is the re-query half of the issue #192 disambiguation contract: a
+/// caller holding a candidate handle anchors [`record_context`] on the
+/// returned record for context scoped to exactly that symbol.
+///
+/// Returns `None` when the handle is malformed, matches no live symbol, or
+/// matches more than one distinct identity — ambiguity is never resolved
+/// implicitly. Tombstoned current-state records do not resolve (a historical
+/// temporal version survives its current-state tombstone, mirroring the
+/// recall's liveness rules).
+#[must_use]
+pub fn resolve_symbol_file_span_handle<'a>(
+    records: &'a [GraphRecord],
+    handle: &str,
+) -> Option<&'a GraphRecord> {
+    // Split at the LAST colon so paths containing colons keep working.
+    let (path, span_part) = handle.rsplit_once(':')?;
+    let (start_text, end_text) = span_part.split_once('-')?;
+    if path.is_empty() {
+        return None;
+    }
+    let start_line: usize = start_text.parse().ok()?;
+    let end_line: usize = end_text.parse().ok()?;
+
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut found: Option<&'a GraphRecord> = None;
+    let mut found_id: Option<&str> = None;
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::Symbol,
+            repo_relative_path: Some(record_path),
+            span: Some(record_span),
+            temporal,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if record_path.as_str() != path
+            || record_span.start_line != start_line
+            || record_span.end_line != end_line
+        {
+            continue;
+        }
+        // Current-state liveness: a tombstoned record resolves only via a
+        // surviving historical version.
+        if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
+            continue;
+        }
+        match found_id {
+            // Same identity in two versions (current + temporal): one answer.
+            Some(known) if known == id.as_str() => {}
+            // Two distinct identities, one handle: fail closed.
+            Some(_) => return None,
+            None => {
+                found_id = Some(id.as_str());
+                found = Some(record);
+            }
+        }
+    }
+    found
+}
+
 /// Returns all known context for a named symbol, separated by trust domain.
 ///
 /// # Algorithm
 ///
 /// 1. Collect all `Symbol` node IDs for `symbol_name`.
-/// 2. Add those symbol nodes to `source_facts`.
-/// 3. Scan every other record:
+/// 2. Issue #192: when the name resolves to two or more distinct symbol
+///    identities, the recall is ambiguous — return an empty-sectioned
+///    [`SymbolContext`] whose [`SymbolContext::candidates`] enumerates the
+///    identities instead of merging them. Distinct identities are distinct
+///    stable record IDs (ADR 0004); tombstone and temporal rules from step 1
+///    decide which identities count, so the ambiguity set is exactly what
+///    the recall would otherwise have blended.
+/// 3. Add those symbol nodes to `source_facts`.
+/// 4. Scan every other record:
 ///    a. Edges: if source or target is a known symbol ID, follow the other
 ///    end and classify the referenced node.
 ///    b. Nodes with `evidence_links`: for each link whose `target_record_id`
 ///    is a known symbol ID, classify the linking node.
-/// 4. Collect any evidence link targets that are not present in the store
+/// 5. Collect any evidence link targets that are not present in the store
 ///    slice into `unresolved`.
 ///
 /// Output ordering within each section is sorted by record ID for determinism
 /// (AC7).
 ///
 /// An empty [`SymbolContext`] where [`SymbolContext::is_no_match`] returns
-/// `true` is returned when the symbol is not found. The caller MUST use
-/// `is_no_match()` — there is no panic or error path.
+/// `true` is returned when the symbol is not found. Callers MUST check
+/// [`SymbolContext::is_ambiguous`] before `is_no_match` — an ambiguous name
+/// has empty sections but is a match, not a no-match. There is no panic or
+/// error path.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> SymbolContext<'a> {
+pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &'a str) -> SymbolContext<'a> {
     // Step 0: collect tombstoned IDs so deleted symbols yield no-match, not
     // stale context. This mirrors the current-state filter used by the other
     // query paths (query symbol, query file).
@@ -219,6 +459,15 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             symbol_name: symbol_name.to_owned(),
             ..Default::default()
         };
+    }
+
+    // Issue #192: distinct symbol identities sharing one name are never
+    // merged. When the name resolves to two or more distinct identities — the
+    // exact set the current-state recall below would otherwise have blended
+    // into one answer — report the ambiguity and enumerate the candidates
+    // instead of populating the sections.
+    if symbol_ids.len() >= 2 {
+        return ambiguous_symbol_context(records, symbol_name, &symbol_ids);
     }
 
     // Build a lookup map: record_id → record for fast classification checks.
@@ -1076,6 +1325,8 @@ fn context_from_seeds<'a>(
             });
             u
         },
+        // Single-match recall: no disambiguation needed (issue #192).
+        candidates: Vec::new(),
     }
 }
 

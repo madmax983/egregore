@@ -106,7 +106,10 @@ pub fn error_schema() -> Value {
                     "symbol_name": { "type": "string" },
                     "id_or_handle": { "type": "string" },
                     "handle": { "type": "string" },
-                    "candidates": { "type": "array", "items": { "type": "string" } }
+                    // `ambiguous_handle` carries plain handle strings;
+                    // `ambiguous_symbol` (issue #192) carries one object per
+                    // distinct identity (record_id + file:span handle).
+                    "candidates": { "type": "array", "items": { "type": ["string", "object"] } }
                 }
             }
         }

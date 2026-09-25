@@ -157,27 +157,73 @@ pub(crate) fn apply_supersession<'a>(
     (filtered, excluded)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn query_context_cmd(
-    records: &[GraphRecord],
-    symbol_name: &str,
-    freshness: Option<(String, &'static str)>,
-    supersession: crate::temporal_status::SupersessionMode,
-    at_head: bool,
-    all_history: bool,
-    max_records: Option<usize>,
-    store_coverage: query::StoreCoverage,
-) -> Result<()> {
-    // Corpus-mode selection (issue #456): head-anchor by default over a
-    // scan-history store; `--all-history` opts into the union. Pre-filter drops
-    // off-HEAD records BEFORE building the cross-domain context bundle.
-    let index = query::RepositoryIndex::build(records);
-    let (corpus_mode, corpus_mode_source, filtered) =
-        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
-    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
-
+/// Issue #192: resolve the symbol context for a name, reporting ambiguity
+/// instead of merging when the name matches distinct symbols. When
+/// `candidate` is `Some`, re-query for exactly that identity (a stable
+/// record ID or a `file:span` handle); otherwise look the name up directly.
+/// Exits the process with a JSON error envelope when the recall is
+/// ambiguous or matches nothing.
+fn resolve_symbol_or_candidate<'a>(
+    records: &'a [GraphRecord],
+    symbol_name: &'a str,
+    candidate: Option<&'a str>,
+) -> Result<(query::SymbolContext<'a>, &'a str)> {
+    if let Some(selector) = candidate {
+        let anchor = records
+            .iter()
+            .find(|r| {
+                r.id() == selector
+                    && matches!(
+                        r,
+                        GraphRecord::Node {
+                            kind: NodeKind::Symbol,
+                            ..
+                        }
+                    )
+            })
+            .or_else(|| query::resolve_symbol_file_span_handle(records, selector));
+        let Some(anchor) = anchor else {
+            emit_no_match_candidate(selector)?;
+            std::process::exit(2);
+        };
+        let ctx = query::record_context(records, anchor.id());
+        if ctx.is_no_match() {
+            emit_no_match_candidate(selector)?;
+            std::process::exit(2);
+        }
+        let name = match anchor {
+            GraphRecord::Node { name: Some(n), .. } => n.as_str(),
+            _ => selector,
+        };
+        return Ok((ctx, name));
+    }
     let ctx = query::symbol_context(records, symbol_name);
-
+    if ctx.is_ambiguous() {
+        let candidates: Vec<serde_json::Value> = ctx
+            .candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "record_id": c.record_id,
+                    "symbol_name": c.symbol_name,
+                    "repo_relative_path": c.repo_relative_path,
+                    "span": c.span,
+                    "file_span_handle": c.file_span_handle(),
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_symbol",
+                "symbol_name": symbol_name,
+                "message": "the name matches more than one distinct symbol; re-run with --candidate <record_id|file:span handle>",
+                "candidates": candidates,
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(1);
+    }
     if ctx.is_no_match() {
         let envelope = serde_json::json!({
             "ok": false,
@@ -189,6 +235,45 @@ pub(crate) fn query_context_cmd(
         println!("{}", serde_json::to_string(&envelope)?);
         std::process::exit(2);
     }
+    Ok((ctx, symbol_name))
+}
+
+/// Emit the `no_match` envelope for an unresolvable `--candidate` selector.
+fn emit_no_match_candidate(selector: &str) -> Result<()> {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "no_match",
+            "candidate": selector,
+        }
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_context_cmd(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    freshness: Option<(String, &'static str)>,
+    supersession: crate::temporal_status::SupersessionMode,
+    at_head: bool,
+    all_history: bool,
+    max_records: Option<usize>,
+    store_coverage: query::StoreCoverage,
+    candidate: Option<&str>,
+) -> Result<()> {
+    // Corpus-mode selection (issue #456): head-anchor by default over a
+    // scan-history store; `--all-history` opts into the union. Pre-filter drops
+    // off-HEAD records BEFORE building the cross-domain context bundle.
+    let index = query::RepositoryIndex::build(records);
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
+    // Issue #192: a name shared by distinct symbols is reported, never merged;
+    // `--candidate` re-queries for exactly one of them.
+    let (ctx, display_name) = resolve_symbol_or_candidate(records, symbol_name, candidate)?;
 
     let trust = query::TrustIndex::build(records);
     let sections = build_context_sections(&ctx, &trust);
@@ -230,7 +315,7 @@ pub(crate) fn query_context_cmd(
     let mut budget = RecordBudget::new(max_records);
     let response = ContextResponse {
         ok: true,
-        symbol_name,
+        symbol_name: display_name,
         freshness: freshness_code,
         source_facts: budget.section(sections.source_facts),
         topology_edges: budget.section(sections.topology_edges),
