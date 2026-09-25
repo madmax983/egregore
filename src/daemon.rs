@@ -10583,6 +10583,18 @@ fn context_observation_to_json(
         )
 }
 
+/// Renders one agent-authored `Decision` record (issue #191) to JSON,
+/// reusing the shared [`graph_query::context_decision`] builder so the
+/// daemon lane emits the same row shape as the CLI and MCP lanes.
+fn context_decision_to_json(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    trust: &graph_query::TrustIndex<'_>,
+) -> Option<serde_json::Value> {
+    graph_query::context_decision(record, records, trust)
+        .and_then(|decision| serde_json::to_value(&decision).ok())
+}
+
 fn context_linked_item_to_json(
     record: &GraphRecord,
     trust: &graph_query::TrustIndex<'_>,
@@ -10650,6 +10662,7 @@ struct ContextSections {
     source_facts: Vec<serde_json::Value>,
     topology_edges: Vec<serde_json::Value>,
     observations: Vec<serde_json::Value>,
+    decisions: Vec<serde_json::Value>,
     project_state: Vec<serde_json::Value>,
     artifacts: Vec<serde_json::Value>,
     verification_evidence: Vec<serde_json::Value>,
@@ -10665,18 +10678,13 @@ fn build_context_sections(
 ) -> ContextSections {
     let mut rem = limit;
 
-    let source_facts: Vec<_> = ctx
-        .source_facts
-        .iter()
-        .take(rem)
-        .map(|r| context_source_fact_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(source_facts.len());
+    let source_facts = take_section(&mut rem, ctx.source_facts.iter(), |r| {
+        Some(context_source_fact_to_json(r, trust))
+    });
 
-    let topology_edges: Vec<_> = ctx
-        .topology_edges
-        .iter()
-        .filter_map(|r| {
+    let topology_edges = take_section(
+        &mut rem,
+        ctx.topology_edges.iter().filter_map(|r| {
             if let GraphRecord::Edge {
                 id,
                 label,
@@ -10698,79 +10706,75 @@ fn build_context_sections(
             } else {
                 None
             }
-        })
-        .take(rem)
-        .collect();
-    rem = rem.saturating_sub(topology_edges.len());
+        }),
+        Some,
+    );
 
-    let observations: Vec<_> = ctx
-        .observations
-        .iter()
-        .take(rem)
-        .map(|r| context_observation_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(observations.len());
+    let observations = take_section(&mut rem, ctx.observations.iter(), |r| {
+        Some(context_observation_to_json(r, trust))
+    });
 
-    let project_state: Vec<_> = ctx
-        .project_state
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(project_state.len());
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions = take_section(&mut rem, ctx.decisions.iter(), |r| {
+        context_decision_to_json(r, records, trust)
+    });
 
-    let artifacts: Vec<_> = ctx
-        .artifacts
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(artifacts.len());
+    let project_state = take_section(&mut rem, ctx.project_state.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
 
-    let verification_evidence: Vec<_> = ctx
-        .verification_evidence
-        .iter()
-        .take(rem)
-        .map(|r| context_linked_item_to_json(r, trust))
-        .collect();
-    rem = rem.saturating_sub(verification_evidence.len());
+    let artifacts = take_section(&mut rem, ctx.artifacts.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
+
+    let verification_evidence = take_section(&mut rem, ctx.verification_evidence.iter(), |r| {
+        Some(context_linked_item_to_json(r, trust))
+    });
 
     let drift_history_records: Vec<&GraphRecord> =
         ctx.drift_history.iter().take(rem).copied().collect();
     let resolved_drift_targets =
         graph_query::resolve_drift_targets(records, &drift_history_records);
-    let drift_history: Vec<_> = drift_history_records
-        .iter()
-        .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved, trust))
-        .collect();
-    rem = rem.saturating_sub(drift_history.len());
+    let drift_history = take_section(
+        &mut rem,
+        drift_history_records.iter().zip(resolved_drift_targets),
+        |(r, resolved)| context_drift_to_json(r, resolved, trust),
+    );
 
-    let unresolved: Vec<_> = ctx
-        .unresolved
-        .iter()
-        .take(rem)
-        .map(|u| {
-            json!({
-                "source_record_id": u.source_record_id,
-                "target_handle": u.target_handle,
-                "relation": u.relation,
-                "target_domain": u.target_domain,
-                "verification_status": "unresolved",
-            })
-        })
-        .collect();
+    let unresolved = take_section(&mut rem, ctx.unresolved.iter(), |u| {
+        Some(json!({
+            "source_record_id": u.source_record_id,
+            "target_handle": u.target_handle,
+            "relation": u.relation,
+            "target_domain": u.target_domain,
+            "verification_status": "unresolved",
+        }))
+    });
 
     ContextSections {
         source_facts,
         topology_edges,
         observations,
+        decisions,
         project_state,
         artifacts,
         verification_evidence,
         drift_history,
         unresolved,
     }
+}
+
+/// Takes up to `*rem` items, maps each to a JSON row, and deducts the
+/// produced count from the section budget.
+fn take_section<T>(
+    rem: &mut usize,
+    items: impl Iterator<Item = T>,
+    f: impl FnMut(T) -> Option<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let out: Vec<_> = items.take(*rem).filter_map(f).collect();
+    *rem = rem.saturating_sub(out.len());
+    out
 }
 
 fn apply_supersession_json(
@@ -10991,8 +10995,13 @@ fn handle_verb_observations_for_symbol(
     let trust = graph_query::TrustIndex::build(&records);
     let s = build_context_sections(&records, &ctx, limit, &trust);
 
-    let (observations, excluded) =
+    let (observations, mut excluded) =
         apply_supersession_json(s.observations, trust.resolver(), supersession);
+    // Decisions get their own supersession pass (issue #191): same
+    // temporal-status semantics, surfaced in the decisions section.
+    let (decisions, decision_excluded) =
+        apply_supersession_json(s.decisions, trust.resolver(), supersession);
+    excluded.extend(decision_excluded);
 
     HttpResponse::success(
         Some(request_id),
@@ -11004,6 +11013,7 @@ fn handle_verb_observations_for_symbol(
             "source_facts": s.source_facts,
             "topology_edges": s.topology_edges,
             "observations": observations,
+            "decisions": decisions,
             "project_state": s.project_state,
             "artifacts": s.artifacts,
             "verification_evidence": s.verification_evidence,
@@ -11228,6 +11238,16 @@ fn handle_verb_criteria_for_task(
         .collect();
     rem = rem.saturating_sub(observations.len());
 
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<_> = ctx
+        .decisions
+        .iter()
+        .take(rem)
+        .filter_map(|r| context_decision_to_json(r, &records, &trust))
+        .collect();
+    rem = rem.saturating_sub(decisions.len());
+
     let artifacts: Vec<_> = ctx
         .artifacts
         .iter()
@@ -11286,6 +11306,7 @@ fn handle_verb_criteria_for_task(
             "acceptance_criteria": acceptance_criteria,
             "source_facts": source_facts,
             "observations": observations,
+            "decisions": decisions,
             "artifacts": artifacts,
             "verification_evidence": verification_evidence,
             "reviews": reviews,

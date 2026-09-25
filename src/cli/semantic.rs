@@ -1324,9 +1324,12 @@ pub(crate) fn query_semantic_context(
         .matches
         .iter()
         .map(|m| {
-            let sections = build_context_sections(&m.context, &trust);
-            let (observations, excluded) =
+            let sections = build_context_sections(&records, &m.context, &trust);
+            let (observations, mut excluded) =
                 apply_supersession(sections.observations, resolver, supersession);
+            let (decisions, decision_excluded) =
+                apply_supersession(sections.decisions, resolver, supersession);
+            excluded.extend(decision_excluded);
             let repository_id = index.owner_of(&m.lead.record_id);
             SemanticContextMatch {
                 record_id: &m.lead.record_id,
@@ -1346,6 +1349,7 @@ pub(crate) fn query_semantic_context(
                 source_facts: sections.source_facts,
                 topology_edges: sections.topology_edges,
                 observations,
+                decisions,
                 project_state: sections.project_state,
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,

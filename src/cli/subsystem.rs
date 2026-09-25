@@ -81,6 +81,20 @@ pub(crate) fn query_subsystem_cmd(
     let (observations, excluded) =
         apply_supersession(raw_observations, trust.resolver(), supersession);
 
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`. The author selector (issue
+    // #195) is documented as observations-only, so it does not scope
+    // this section.
+    let raw_decisions: Vec<ContextDecision<'_>> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| context_decision(r, records, &trust))
+        .collect();
+    let (decisions, decision_excluded) =
+        apply_supersession(raw_decisions, trust.resolver(), supersession);
+    let mut excluded_all = excluded;
+    excluded_all.extend(decision_excluded);
+
     // Report the active author selector on the envelope (issue #195) so an
     // empty `observations` array under an active scope is an explicit empty
     // result — not an error and not a silent fallback to unscoped recall.
@@ -213,6 +227,7 @@ pub(crate) fn query_subsystem_cmd(
         source_facts,
         topology_edges,
         observations,
+        decisions,
         author_scope: author_scope_report,
         project_state,
         artifacts,
@@ -220,7 +235,7 @@ pub(crate) fn query_subsystem_cmd(
         semantic_drift,
         log_signatures,
         unresolved,
-        excluded,
+        excluded: excluded_all,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,

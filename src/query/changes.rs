@@ -382,6 +382,214 @@ pub fn redacted_context_observation<'a>(
     })
 }
 
+/// One resolved `EXPLAINS_CHANGE` / `REFERENCES_TASK` evidence handle on a
+/// decision row (issue #191).
+///
+/// Only targets present in the recalled store slice resolve — a handle whose
+/// target record is absent from the slice is omitted here, never invented.
+/// Absent targets are already reported in the context answer's `unresolved`
+/// section, so dropping them here loses no information.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DecisionEvidenceHandle<'a> {
+    /// Graph edge relation: `EXPLAINS_CHANGE` or `REFERENCES_TASK`.
+    pub relation: &'static str,
+    /// Stable record ID of the resolved target.
+    pub target_record_id: &'a str,
+    /// Kind of the resolved target (e.g. `Commit`, `Task`).
+    pub target_kind: &'static str,
+}
+
+/// One item in the `decisions` section of a context answer (issue #191).
+///
+/// Trust contract: a decision is agent-authored and evidence-backed, but it
+/// is a deliberate judgment — never deterministic source truth. Consumers
+/// must treat `decision_text` and `rationale_summary` as claims to verify,
+/// not facts to cite.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextDecision<'a> {
+    /// Stable record ID of the `Decision` node.
+    pub record_id: &'a str,
+    /// Node kind string (`"Decision"`).
+    pub kind: &'static str,
+    /// Derived trust class (issue #114): one of `agent_verified`,
+    /// `agent_unverified`, or `agent_contradicted` for an agent-authored claim.
+    /// Always present — `domain` says where the record lives, `trust` says how
+    /// much weight it has earned. See `crate::query::TrustClass`.
+    pub trust: super::TrustClass,
+    /// Human-readable one-line summary of the record.
+    pub summary: String,
+    /// The decision statement, verbatim from the record.
+    ///
+    /// Always serialized — `null` when the record predates this field
+    /// (issue #191 never fabricates a value). The MCP contract requires the
+    /// key on every decision row.
+    pub decision_text: Option<&'a str>,
+    /// Why the agent made the decision, verbatim from the record.
+    ///
+    /// Always serialized — `null` when the record predates this field
+    /// (issue #191 never fabricates a value). The MCP contract requires the
+    /// key on every decision row.
+    pub rationale_summary: Option<&'a str>,
+    /// `"<agent_id>:<session_id>"`, or `agent_id` alone when the session is
+    /// unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_handle: Option<String>,
+    /// Authoring agent identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<&'a str>,
+    /// Authoring session identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<&'a str>,
+    /// When the decision was recorded (RFC3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<&'a str>,
+    /// Agent-stated confidence, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<&'a str>,
+    /// Resolved `EXPLAINS_CHANGE` / `REFERENCES_TASK` evidence handles.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_handles: Vec<DecisionEvidenceHandle<'a>>,
+    /// Temporal status label (`current`, `superseded`, …) when supersession
+    /// was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_status: Option<String>,
+    /// Records that supersede this decision, when supersession was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    /// Records that contradict this decision, when supersession was evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+}
+
+/// Helper function to convert a `Decision` GraphRecord to ContextDecision.
+///
+/// `trust` carries the [`super::TrustIndex`]-derived class (issue #114); the
+/// index is a required argument so no caller can render a context row without a
+/// trust label. `records` is the store slice the decision was recalled from
+/// and is used to resolve the `EXPLAINS_CHANGE` / `REFERENCES_TASK` evidence
+/// handles, from both graph edges and inline `evidence_links`.
+///
+/// `decision_text` and `rationale_summary` are schema-bounded short strings
+/// (like `summary`), so they are surfaced verbatim: the changes lane's
+/// redaction policy targets unbounded payloads (observation `text`,
+/// stdout/stderr bytes, patch bytes), not the rationale that justifies this
+/// section's existence.
+///
+/// Returns `None` for non-`Decision` records.
+#[must_use]
+pub fn context_decision<'a>(
+    record: &'a GraphRecord,
+    records: &'a [GraphRecord],
+    trust: &super::TrustIndex<'_>,
+) -> Option<ContextDecision<'a>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        decision_text,
+        rationale_summary,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    if *kind != NodeKind::Decision {
+        return None;
+    }
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
+    // Target-kind lookup over the recalled slice: only present targets
+    // resolve to a handle.
+    let target_kinds: BTreeMap<&str, &'static str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id: target_id,
+                kind: target_kind,
+                ..
+            } => Some((target_id.as_str(), target_kind.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut evidence_handles: Vec<DecisionEvidenceHandle<'a>> = Vec::new();
+    // Graph edges: decision --EXPLAINS_CHANGE|REFERENCES_TASK--> target.
+    for r in records {
+        if let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = r
+            && source.as_str() == id.as_str()
+            && matches!(label, EdgeLabel::ExplainsChange | EdgeLabel::ReferencesTask)
+            && let Some(target_kind) = target_kinds.get(target.as_str())
+        {
+            evidence_handles.push(DecisionEvidenceHandle {
+                relation: label.as_str(),
+                target_record_id: target.as_str(),
+                target_kind,
+            });
+        }
+    }
+    // Inline evidence_links carrying the same relations.
+    if let GraphRecord::Node {
+        evidence_links: Some(links),
+        ..
+    } = record
+    {
+        for link in links {
+            let relation = match link.relation.as_str() {
+                "EXPLAINS_CHANGE" => "EXPLAINS_CHANGE",
+                "REFERENCES_TASK" => "REFERENCES_TASK",
+                _ => continue,
+            };
+            if let Some(target_id) = link.target_record_id.as_deref()
+                && let Some(target_kind) = target_kinds.get(target_id)
+            {
+                evidence_handles.push(DecisionEvidenceHandle {
+                    relation,
+                    target_record_id: target_id,
+                    target_kind,
+                });
+            }
+        }
+    }
+    // Deterministic order: relation, then target record ID. Collapse exact
+    // duplicates (the same handle reachable via both an edge and an inline
+    // link).
+    evidence_handles.sort_by(|a, b| {
+        a.relation
+            .cmp(b.relation)
+            .then_with(|| a.target_record_id.cmp(b.target_record_id))
+    });
+    evidence_handles
+        .dedup_by(|a, b| a.relation == b.relation && a.target_record_id == b.target_record_id);
+    Some(ContextDecision {
+        record_id: id,
+        kind: kind.as_str(),
+        trust: trust.classify(record),
+        summary: summary.to_owned(),
+        decision_text: decision_text.as_deref(),
+        rationale_summary: rationale_summary.as_deref(),
+        provenance_handle,
+        agent_id: agent_id.as_deref(),
+        session_id: session_id.as_deref(),
+        observed_at: observed_at.as_deref(),
+        confidence: confidence.as_deref(),
+        evidence_handles,
+        temporal_status: None,
+        superseded_by: None,
+        contradicted_by: None,
+    })
+}
+
 /// Helper function to convert a GraphRecord to ContextLinkedItem.
 ///
 /// `trust` carries the [`super::TrustIndex`]-derived class (issue #114).
@@ -605,7 +813,17 @@ pub struct ChangesContext<'a> {
     pub drift_records: Vec<ChangesDriftItem<'a>>,
 
     /// Subjective agent observations referencing nodes in the range.
+    ///
+    /// Section contract (issue #191): this section holds `Observation` and
+    /// `Failure` records only. `Decision` records never appear here — they
+    /// surface in [`ChangesContext::decisions`].
     pub observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale referencing nodes in the
+    /// range (issue #191).
+    ///
+    /// Trust contract: decisions are agent-authored and evidence-backed, but
+    /// they are deliberate judgments — never deterministic source truth.
+    pub decisions: Vec<ContextDecision<'a>>,
     /// Task and project management state referencing nodes in the range.
     pub project_state: Vec<ContextLinkedItem<'a>>,
     /// Persistent generated artifacts referencing nodes in the range.
@@ -1229,6 +1447,7 @@ pub fn changes_context<'a>(
     }
 
     let mut observations = BTreeSet::new();
+    let mut decisions = BTreeSet::new();
     let mut project_state = BTreeSet::new();
     let mut artifacts = BTreeSet::new();
     let mut verification_evidence = BTreeSet::new();
@@ -1337,6 +1556,7 @@ pub fn changes_context<'a>(
 
     let classify_and_insert_change = |record_id: &'a str,
                                       observations: &mut BTreeSet<&'a str>,
+                                      decisions: &mut BTreeSet<&'a str>,
                                       project_state: &mut BTreeSet<&'a str>,
                                       artifacts: &mut BTreeSet<&'a str>,
                                       verification_evidence: &mut BTreeSet<&'a str>|
@@ -1353,6 +1573,10 @@ pub fn changes_context<'a>(
         match classify_node(*kind) {
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::Decision) => {
+                decisions.insert(record_id);
                 true
             }
             Some(ContextSection::ProjectState) => {
@@ -1384,6 +1608,7 @@ pub fn changes_context<'a>(
                         let was_classified = classify_and_insert_change(
                             target,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -1407,6 +1632,7 @@ pub fn changes_context<'a>(
                         let was_classified = classify_and_insert_change(
                             source,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -1443,6 +1669,7 @@ pub fn changes_context<'a>(
                                     let was_classified = classify_and_insert_change(
                                         target_id.as_str(),
                                         &mut observations,
+                                        &mut decisions,
                                         &mut project_state,
                                         &mut artifacts,
                                         &mut verification_evidence,
@@ -1491,6 +1718,7 @@ pub fn changes_context<'a>(
                         let was_classified = classify_and_insert_change(
                             source,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -1517,6 +1745,14 @@ pub fn changes_context<'a>(
         if let Some(rec) = by_id.get(id) {
             if let Some(obs) = redacted_context_observation(rec, &trust) {
                 output_observations.push(obs);
+            }
+        }
+    }
+    let mut output_decisions = Vec::new();
+    for id in decisions {
+        if let Some(rec) = by_id.get(id) {
+            if let Some(decision) = context_decision(rec, records, &trust) {
+                output_decisions.push(decision);
             }
         }
     }
@@ -1751,6 +1987,7 @@ pub fn changes_context<'a>(
         tombstones,
         drift_records,
         observations: output_observations,
+        decisions: output_decisions,
         project_state: output_project_state,
         artifacts: output_artifacts,
         verification_evidence: output_verification_evidence,

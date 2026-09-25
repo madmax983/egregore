@@ -259,6 +259,110 @@
       },
       "type": "array"
     },
+    "decisions": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decision_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "evidence_handles": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "relation": {
+                  "type": "string"
+                },
+                "target_kind": {
+                  "type": "string"
+                },
+                "target_record_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "relation",
+                "target_record_id",
+                "target_kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provenance_handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rationale_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "trust",
+          "decision_text",
+          "rationale_summary"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "drift_history": {
       "items": {
         "additionalProperties": true,
@@ -1337,6 +1441,7 @@
     "source_facts",
     "topology_edges",
     "observations",
+    "decisions",
     "project_state",
     "artifacts",
     "verification_evidence",

@@ -641,6 +641,9 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         role: None,
         id,
         kind: NodeKind::Agent,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -775,6 +778,9 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         role: None,
         id,
         kind: NodeKind::AgentSession,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -1054,6 +1060,9 @@ pub fn build_observation_records(
         role: None,
         id: obs_id.clone(),
         kind: NodeKind::Observation,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -1326,6 +1335,9 @@ pub fn build_failure_records(
         role: None,
         id: failure_id.clone(),
         kind: NodeKind::Failure,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -1585,6 +1597,9 @@ pub fn build_command_evidence_records(
         role: None,
         id: cmd_id.clone(),
         kind: NodeKind::CommandEvidence,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -1844,6 +1859,9 @@ pub fn build_artifact_records(
         role: None,
         id: art_id.clone(),
         kind: NodeKind::PatchArtifact,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: ARTIFACT_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -2076,6 +2094,9 @@ pub fn build_verification_records(
         role: None,
         id: ver_id.clone(),
         kind: NodeKind::Verification,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: VERIFICATION_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,

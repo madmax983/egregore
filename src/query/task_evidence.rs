@@ -37,7 +37,20 @@ pub struct TaskEvidenceContext<'a> {
     /// Code-graph files or symbols linked to the task.
     pub source_facts: Vec<&'a GraphRecord>,
     /// Agent-authored observations and failures referencing the task.
+    ///
+    /// Section contract (issue #191): this section holds `Observation` and
+    /// `Failure` records only. `Decision` records never appear here — they
+    /// surface in [`TaskEvidenceContext::decisions`].
     pub observations: Vec<&'a GraphRecord>,
+    /// Agent-authored `Decision` nodes referencing the task, carrying
+    /// `decision_text` and `rationale_summary` (issue #191).
+    ///
+    /// Trust contract: decisions are agent-authored and evidence-backed, but
+    /// they are deliberate judgments — never deterministic source truth.
+    /// Treat the rationale as a claim to verify before reusing, not as a
+    /// fact to cite. A decision never appears in
+    /// [`TaskEvidenceContext::observations`].
+    pub decisions: Vec<&'a GraphRecord>,
     /// Artifact handles (`Artifact`, `PatchArtifact`, etc.) linked to the task.
     pub artifacts: Vec<&'a GraphRecord>,
     /// Verification evidence (`Verification`, `CommandRun`, etc.) linked to the task.
@@ -58,6 +71,7 @@ impl TaskEvidenceContext<'_> {
             && self.acceptance_criteria.is_empty()
             && self.source_facts.is_empty()
             && self.observations.is_empty()
+            && self.decisions.is_empty()
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
             && self.reviews.is_empty()
@@ -393,6 +407,7 @@ pub fn task_evidence_context<'a>(
     let mut acceptance_criteria = BTreeSet::new();
     let mut source_facts = BTreeSet::new();
     let mut observations = BTreeSet::new();
+    let mut decisions = BTreeSet::new();
     let mut artifacts = BTreeSet::new();
     let mut verification_evidence = BTreeSet::new();
     let mut reviews = BTreeSet::new();
@@ -455,8 +470,13 @@ pub fn task_evidence_context<'a>(
                 EdgeLabel::ReferencesTask if target == task_id => {
                     if let Some(GraphRecord::Node { kind, .. }) = by_id.get(source.as_str()) {
                         match kind {
-                            NodeKind::Observation | NodeKind::Decision | NodeKind::Failure => {
+                            NodeKind::Observation | NodeKind::Failure => {
                                 observations.insert(source.as_str());
+                            }
+                            // Section contract (issue #191): decisions get
+                            // their own section, never observations.
+                            NodeKind::Decision => {
+                                decisions.insert(source.as_str());
                             }
                             NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
                                 artifacts.insert(source.as_str());
@@ -490,8 +510,13 @@ pub fn task_evidence_context<'a>(
                 .any(|link| link.target_record_id.as_deref() == Some(task_id));
             if links_to_task {
                 match kind {
-                    NodeKind::Observation | NodeKind::Decision | NodeKind::Failure => {
+                    NodeKind::Observation | NodeKind::Failure => {
                         observations.insert(id.as_str());
+                    }
+                    // Section contract (issue #191): decisions get their own
+                    // section, never observations.
+                    NodeKind::Decision => {
+                        decisions.insert(id.as_str());
                     }
                     NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
                         artifacts.insert(id.as_str());
@@ -520,6 +545,9 @@ pub fn task_evidence_context<'a>(
     for id in &observations {
         visited.insert(*id);
     }
+    for id in &decisions {
+        visited.insert(*id);
+    }
     for id in &artifacts {
         visited.insert(*id);
     }
@@ -541,6 +569,7 @@ pub fn task_evidence_context<'a>(
     let classify_and_insert_task = |record_id: &'a str,
                                     source_facts: &mut BTreeSet<&'a str>,
                                     observations: &mut BTreeSet<&'a str>,
+                                    decisions: &mut BTreeSet<&'a str>,
                                     artifacts: &mut BTreeSet<&'a str>,
                                     verification_evidence: &mut BTreeSet<&'a str>,
                                     reviews: &mut BTreeSet<&'a str>|
@@ -565,6 +594,10 @@ pub fn task_evidence_context<'a>(
             }
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::Decision) => {
+                decisions.insert(record_id);
                 true
             }
             Some(ContextSection::Artifact) => {
@@ -614,6 +647,7 @@ pub fn task_evidence_context<'a>(
                             id,
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut artifacts,
                             &mut verification_evidence,
                             &mut reviews,
@@ -656,6 +690,7 @@ pub fn task_evidence_context<'a>(
                                         target_id.as_str(),
                                         &mut source_facts,
                                         &mut observations,
+                                        &mut decisions,
                                         &mut artifacts,
                                         &mut verification_evidence,
                                         &mut reviews,
@@ -801,6 +836,7 @@ pub fn task_evidence_context<'a>(
         acceptance_criteria: resolve(&acceptance_criteria),
         source_facts: resolve(&source_facts),
         observations: resolve(&observations),
+        decisions: resolve(&decisions),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
         reviews: resolve(&reviews),
@@ -1145,5 +1181,238 @@ mod liveness_tests {
             !ctx.verification_evidence.iter().any(|r| r.id() == run_id),
             "a tombstoned ToolCall with no re-ingest must not relay the BFS"
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_section_tests {
+    //! Issue #191: `Decision` records linked to a task must surface in a
+    //! dedicated `decisions` section — never flattened into `observations`.
+    //!
+    //! The section exists: `TaskEvidenceContext::decisions` carries
+    //! `Decision` records, `TaskEvidenceContext::observations` never does.
+    use super::*;
+    use crate::ir::{AGENT_MEMORY_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION};
+    use crate::query::{TrustIndex, context_decision};
+
+    const TASK_ID: &str = "project:v1:task-dec-191";
+    const DEC_EDGE_ID: &str = "agent_memory:v1:dec-task-edge";
+    const DEC_LINK_ID: &str = "agent_memory:v1:dec-task-link";
+    const OBS_ID: &str = "agent_memory:v1:obs-task-191";
+
+    fn bare_task() -> GraphRecord {
+        GraphRecord::node(
+            TASK_ID.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            Some("a task".to_owned()),
+            "task".to_owned(),
+        )
+        .with_domain("project", PROJECT_SCHEMA_VERSION)
+    }
+
+    fn decision_node(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+    }
+
+    fn observation_node() -> GraphRecord {
+        GraphRecord::node(
+            OBS_ID.to_owned(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            "observation text".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+    }
+
+    fn references_task_edge(decision_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::ReferencesTask,
+            decision_id.to_owned(),
+            TASK_ID.to_owned(),
+            Some("1.0".to_owned()),
+            "decision references task".to_owned(),
+        )
+    }
+
+    /// Fixture: one decision linked to the task via a `REFERENCES_TASK`
+    /// edge, one via an inline `evidence_links` entry, plus a plain
+    /// observation via edge — both linkage mechanisms the recall layer
+    /// supports.
+    fn fixture() -> Vec<GraphRecord> {
+        let mut linked = decision_node(DEC_LINK_ID);
+        if let GraphRecord::Node { evidence_links, .. } = &mut linked {
+            *evidence_links = Some(vec![crate::ir::EvidenceLink {
+                target_record_id: Some(TASK_ID.to_owned()),
+                target_domain: "project".to_owned(),
+                relation: "REFERENCES_TASK".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        vec![
+            bare_task(),
+            decision_node(DEC_EDGE_ID),
+            references_task_edge(DEC_EDGE_ID),
+            linked,
+            observation_node(),
+            references_task_edge(OBS_ID),
+        ]
+    }
+
+    #[test]
+    fn task_evidence_keeps_decision_out_of_observations() {
+        let records = fixture();
+        let ctx = task_evidence_context(&records, TASK_ID);
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            !obs_ids.contains(&DEC_EDGE_ID) && !obs_ids.contains(&DEC_LINK_ID),
+            "Decision records must not appear in observations: {obs_ids:?}"
+        );
+    }
+
+    #[test]
+    fn task_evidence_surfaces_decisions_in_dedicated_section() {
+        // The dedicated-section half of the contract: both task-linked
+        // decisions — via `REFERENCES_TASK` edge and via inline
+        // `evidence_links` — must appear in `decisions` (issue #191 AC1/AC3).
+        let records = fixture();
+        let ctx = task_evidence_context(&records, TASK_ID);
+        let dec_ids: Vec<&str> = ctx.decisions.iter().map(|r| r.id()).collect();
+        assert!(
+            dec_ids.contains(&DEC_EDGE_ID) && dec_ids.contains(&DEC_LINK_ID),
+            "both task-linked decisions must surface in the decisions section: {dec_ids:?}"
+        );
+        assert!(
+            !ctx.is_no_match(),
+            "a task with linked decisions is not a no-match"
+        );
+    }
+
+    #[test]
+    fn task_evidence_keeps_observation_in_observations() {
+        // Companion: the fix must not move observations out of observations.
+        let records = fixture();
+        let ctx = task_evidence_context(&records, TASK_ID);
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            obs_ids.contains(&OBS_ID),
+            "Observation records stay in observations: {obs_ids:?}"
+        );
+        assert!(!ctx.is_no_match());
+    }
+
+    #[test]
+    fn task_decision_row_retains_rationale_and_resolves_references_task() {
+        // Issue #191 AC2/AC6: the task-linked decision row must carry the
+        // non-empty rationale and resolve the `REFERENCES_TASK` handle —
+        // via the inline `evidence_links` entry and via the graph edge.
+        let task_id = "project:v1:task-191";
+        let task = GraphRecord::node(
+            task_id.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            None,
+            "the task".to_owned(),
+        )
+        .with_domain("project", PROJECT_SCHEMA_VERSION);
+
+        let mut via_link = GraphRecord::node(
+            "agent_memory:v1:dec-link".to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_rationale_summary("the task's acceptance criteria changed");
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            evidence_links,
+            ..
+        } = &mut via_link
+        {
+            *agent_id = Some("agent-2".to_owned());
+            *session_id = Some("sess-2".to_owned());
+            *evidence_links = Some(vec![crate::ir::EvidenceLink {
+                target_record_id: Some(task_id.to_owned()),
+                target_domain: "project".to_owned(),
+                relation: "REFERENCES_TASK".to_owned(),
+                confidence: "0.8".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+
+        let mut via_edge = GraphRecord::node(
+            "agent_memory:v1:dec-edge".to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_rationale_summary("the old plan no longer applies");
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            ..
+        } = &mut via_edge
+        {
+            *agent_id = Some("agent-2".to_owned());
+            *session_id = Some("sess-2".to_owned());
+        }
+        let edge = GraphRecord::edge(
+            EdgeLabel::ReferencesTask,
+            "agent_memory:v1:dec-edge".to_owned(),
+            task_id.to_owned(),
+            Some("0.8".to_owned()),
+            "decision references task".to_owned(),
+        );
+
+        let records = vec![task, via_link, via_edge, edge];
+        let trust = TrustIndex::build(&records);
+        for id in ["agent_memory:v1:dec-link", "agent_memory:v1:dec-edge"] {
+            let record = records.iter().find(|r| r.id() == id).unwrap();
+            let row = context_decision(record, &records, &trust)
+                .unwrap_or_else(|| panic!("{id} must build a decision row"));
+            assert!(
+                row.rationale_summary.is_some_and(|r| !r.is_empty()),
+                "rationale_summary must be non-empty for {id}"
+            );
+            assert_eq!(row.provenance_handle.as_deref(), Some("agent-2:sess-2"));
+            let refs: Vec<_> = row
+                .evidence_handles
+                .iter()
+                .filter(|h| h.relation == "REFERENCES_TASK")
+                .collect();
+            assert_eq!(
+                refs.len(),
+                1,
+                "one REFERENCES_TASK handle expected for {id}"
+            );
+            assert_eq!(refs[0].target_record_id, task_id);
+            assert_eq!(refs[0].target_kind, "Task");
+        }
     }
 }

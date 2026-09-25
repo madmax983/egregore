@@ -2606,13 +2606,13 @@ fn query_context_linked_item_carries_summary() {
 }
 
 // ---------------------------------------------------------------------------
-// query context — Decision observation carries summary field
+// query context — Decision row carries summary field (issue #191)
 // ---------------------------------------------------------------------------
 //
-// Finding (line 1710): Decision records are classified into observations but do
-// not populate the Observation-only `text` field. Their human-readable content
-// is in GraphRecord::summary. Without a summary field in ContextObservation,
-// consumers cannot understand the Decision item without reloading the raw graph.
+// Decision records surface in their own `decisions` section — never in
+// `observations` — and the row carries the record's `summary` field (Decision
+// records use summary, not text, for their human-readable content) so
+// consumers can understand the decision without reloading the raw graph.
 
 #[test]
 fn query_context_decision_carries_summary() {
@@ -2689,17 +2689,26 @@ fn query_context_decision_carries_summary() {
     let json: serde_json::Value =
         serde_json::from_slice(&output).expect("valid JSON from query context");
 
-    let dec_item = json["observations"]
+    // Section contract (issue #191): decisions never appear in observations.
+    let observations = json["observations"].as_array().expect("observations array");
+    assert!(
+        observations
+            .iter()
+            .all(|o| o["record_id"].as_str() != Some(dec_id.as_str())),
+        "Decision must not appear in observations"
+    );
+
+    let dec_item = json["decisions"]
         .as_array()
-        .expect("observations array")
+        .expect("decisions array")
         .iter()
-        .find(|o| o["record_id"].as_str() == Some(&dec_id))
-        .expect("Decision must appear in observations");
+        .find(|o| o["record_id"].as_str() == Some(dec_id.as_str()))
+        .expect("Decision must appear in the dedicated decisions section");
 
     assert_eq!(
         dec_item["summary"].as_str(),
         Some("approved approach: use streaming parser for decision_ctx_fn"),
-        "Decision must carry summary field in observation output (Decision records \
+        "Decision must carry summary field in decision output (Decision records \
          use summary, not text, for their human-readable content)"
     );
 }

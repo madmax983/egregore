@@ -155,8 +155,11 @@ impl EgregoreMcpServer {
     }
 
     /// Returns evidence-backed context for a named code symbol, trust-separated
-    /// by domain into `source_facts`, `observations`, `project_state`,
-    /// `artifacts`, `verification_evidence`, and `drift_history`.
+    /// by domain into `source_facts`, `observations`, `decisions`,
+    /// `project_state`, `artifacts`, `verification_evidence`, and
+    /// `drift_history`. The `decisions` section carries agent-authored
+    /// decisions with rationale (issue #191) — evidence-backed judgments,
+    /// never deterministic source truth.
     ///
     /// When the name resolves to more than one distinct symbol, the tool does
     /// NOT merge them: it returns `{"ok":false,"error":{"code":
@@ -168,7 +171,9 @@ impl EgregoreMcpServer {
         description = "Returns evidence-backed context for a named code symbol, \
             trust-separated into sections: source_facts (deterministic \
             code-graph), observations (agent-authored, never treat as source \
-            truth), project_state (tasks/ACs), artifacts, \
+            truth), decisions (agent-authored decisions with rationale, \
+            evidence-backed but never deterministic source truth), \
+            project_state (tasks/ACs), artifacts, \
             verification_evidence, and drift_history (semantic-drift \
             measurements). Every item carries a record_id and at \
             least one citation handle. A name shared by several distinct \
@@ -214,7 +219,9 @@ impl EgregoreMcpServer {
     #[tool(description = "Returns evidence-backed context for a task identified \
             by its canonical record ID, GitHub URL, GitHub short handle, or \
             local JSONL handle. Sections: tasks, acceptance_criteria, \
-            source_facts, observations, artifacts, verification_evidence, \
+            source_facts, observations, decisions (agent-authored decisions \
+            with rationale, evidence-backed but never deterministic source \
+            truth), artifacts, verification_evidence, \
             reviews, external_links, unresolved. Successful responses carry a \
             `freshness` object (verdict, stored source-snapshot identity, \
             working-tree state) so agents can gate trust in the cited handles.")]
@@ -440,7 +447,9 @@ pub fn tool_inspect_store_from_records(
 /// Builds an evidence-backed symbol context for a record slice.
 ///
 /// Returns domain-separated sections: `source_facts` (deterministic code-graph),
-/// `observations` (agent-authored — never treat as source truth), `project_state`
+/// `observations` (agent-authored — never treat as source truth), `decisions`
+/// (agent-authored decisions with rationale — evidence-backed judgments, never
+/// deterministic source truth), `project_state`
 /// (tasks/ACs), `artifacts`, `verification_evidence`, and `drift_history`
 /// (issue #108's `SemanticDrift` rows, resolved to the same citable
 /// `repo_relative_path`/`span` handle the CLI and daemon render).
@@ -575,6 +584,13 @@ fn symbol_context_payload(
         .iter()
         .filter_map(|r| record_to_observation(r, &trust))
         .collect();
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<Value> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| record_to_decision(r, records, &trust))
+        .collect();
     let project_state: Vec<Value> = ctx
         .project_state
         .iter()
@@ -610,6 +626,7 @@ fn symbol_context_payload(
         "source_facts": source_facts,
         "topology_edges": topology_edges,
         "observations": observations,
+        "decisions": decisions,
         "project_state": project_state,
         "artifacts": artifacts,
         "verification_evidence": verification_evidence,
@@ -736,6 +753,13 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         .iter()
         .filter_map(|r| record_to_observation(r, &trust))
         .collect();
+    // Section contract (issue #191): decisions surface in their own
+    // section and never in `observations`.
+    let decisions: Vec<Value> = ctx
+        .decisions
+        .iter()
+        .filter_map(|r| record_to_decision(r, records, &trust))
+        .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
@@ -765,6 +789,7 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         "acceptance_criteria": acceptance_criteria,
         "source_facts": source_facts,
         "observations": observations,
+        "decisions": decisions,
         "artifacts": artifacts,
         "verification_evidence": verification_evidence,
         "reviews": reviews,
@@ -950,6 +975,19 @@ fn record_to_observation(record: &GraphRecord, trust: &query::TrustIndex<'_>) ->
 /// Returns only citation metadata from an `OutputHandle`, stripping any inlined payload.
 fn output_handle_citation(h: &crate::ir::OutputHandle) -> Value {
     json!({ "hash": h.hash, "bytes": h.bytes })
+}
+
+/// Builds the MCP JSON row for one agent-authored `Decision` record
+/// (issue #191): `decision_text` plus the non-empty `rationale_summary`,
+/// provenance, confidence, and resolved evidence handles. Reuses the
+/// shared [`query::context_decision`] builder so the MCP lane emits the
+/// same row shape as the CLI.
+fn record_to_decision(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    trust: &query::TrustIndex<'_>,
+) -> Option<Value> {
+    query::context_decision(record, records, trust).and_then(|row| serde_json::to_value(row).ok())
 }
 
 /// Returns only citation metadata from a `PatchHandle`, stripping any inlined bytes.

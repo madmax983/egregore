@@ -204,7 +204,10 @@ impl StoreCoverage {
     const fn mark(&mut self, section: Option<super::context::ContextSection>) {
         match section {
             Some(super::context::ContextSection::SourceFact) => self.code_graph = true,
-            Some(super::context::ContextSection::Observation) => self.agent_memory = true,
+            Some(
+                super::context::ContextSection::Observation
+                | super::context::ContextSection::Decision,
+            ) => self.agent_memory = true,
             Some(super::context::ContextSection::ProjectState) => self.project = true,
             Some(super::context::ContextSection::Artifact) => self.artifact = true,
             Some(super::context::ContextSection::VerificationEvidence) => {
@@ -472,6 +475,7 @@ pub fn brief_working_set<'a>(
     // Merge evidence across anchors with the existing linkage surfaces.
     let mut source_fact_ids: BTreeSet<&str> = BTreeSet::new();
     let mut observation_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut decision_ids: BTreeSet<&str> = BTreeSet::new();
     let mut task_records: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     let mut verification_records: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     for anchor in &anchor_ids {
@@ -481,6 +485,9 @@ pub fn brief_working_set<'a>(
         }
         for observation in context.observations {
             observation_ids.insert(observation.id());
+        }
+        for decision in context.decisions {
+            decision_ids.insert(decision.id());
         }
         for task in context.project_state {
             task_records.entry(task.id()).or_insert(task);
@@ -513,9 +520,10 @@ pub fn brief_working_set<'a>(
         });
     }
 
-    // `record_context` merges observations, decisions, and failures into one
-    // observation set: split them back out. Failures are reported under
-    // `prior_failures`, never duplicated here.
+    // `record_context` separates decisions into their own section (issue
+    // #191), so no split-out is needed: observations and decisions arrive
+    // pre-separated. Failures are reported under `prior_failures`, never
+    // duplicated here.
     for id in observation_ids {
         let Some(record) = by_id.get(id).copied() else {
             continue;
@@ -524,10 +532,20 @@ pub fn brief_working_set<'a>(
             continue;
         };
         let row = redacted_context_observation(record, &trust);
-        match (kind, row) {
-            (NodeKind::Observation, Some(row)) => brief.observations.push(row),
-            (NodeKind::Decision, Some(row)) => brief.decisions.push(row),
-            _ => {}
+        if let (NodeKind::Observation, Some(row)) = (kind, row) {
+            brief.observations.push(row);
+        }
+    }
+    for id in decision_ids {
+        let Some(record) = by_id.get(id).copied() else {
+            continue;
+        };
+        let GraphRecord::Node { kind, .. } = record else {
+            continue;
+        };
+        let row = redacted_context_observation(record, &trust);
+        if let (NodeKind::Decision, Some(row)) = (kind, row) {
+            brief.decisions.push(row);
         }
     }
 
@@ -1074,11 +1092,11 @@ mod tests {
     #[test]
     fn coverage_from_records_empty_store_reports_all_domains_absent() {
         let coverage = StoreCoverage::from_records(&[]);
-        assert_eq!(coverage.code_graph, false);
-        assert_eq!(coverage.agent_memory, false);
-        assert_eq!(coverage.project, false);
-        assert_eq!(coverage.artifact, false);
-        assert_eq!(coverage.verification, false);
+        assert!(!coverage.code_graph);
+        assert!(!coverage.agent_memory);
+        assert!(!coverage.project);
+        assert!(!coverage.artifact);
+        assert!(!coverage.verification);
     }
 
     #[test]
@@ -1221,14 +1239,11 @@ mod tests {
             coverage_node("i:1", NodeKind::Repository),
         ];
         let from_records = StoreCoverage::from_records(&records);
-        let keys: Vec<&str> = records
-            .iter()
-            .filter_map(|r| match r {
+        let from_keys =
+            StoreCoverage::from_index_kind_keys(records.iter().filter_map(|r| match r {
                 GraphRecord::Node { kind, .. } => Some(kind.as_str()),
                 _ => None,
-            })
-            .collect();
-        let from_keys = StoreCoverage::from_index_kind_keys(keys.into_iter());
+            }));
         assert_eq!(
             from_records, from_keys,
             "index-key constructor must agree with the record constructor"

@@ -6646,7 +6646,8 @@ pub(crate) struct ContextSourceFact<'a> {
 /// `provenance_handle` (or `agent_id`/`session_id`), `observed_at`,
 /// `confidence`, and the evidence links.
 use crate::query::{
-    ContextLinkedItem, ContextObservation, context_linked_item, context_observation,
+    ContextDecision, ContextLinkedItem, ContextObservation, context_decision, context_linked_item,
+    context_observation,
 };
 
 /// One unresolved evidence link target, surfaced per AC5.
@@ -6735,6 +6736,9 @@ pub(crate) struct ContextResponse<'a> {
     #[serde(skip_serializing_if = "BudgetedSection::is_empty")]
     topology_edges: BudgetedSection<ContextTopologyEdge<'a>>,
     observations: BudgetedSection<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191). Always
+    /// present; empty when no decisions link to the symbol.
+    decisions: BudgetedSection<ContextDecision<'a>>,
     project_state: BudgetedSection<ContextLinkedItem<'a>>,
     artifacts: BudgetedSection<ContextLinkedItem<'a>>,
     verification_evidence: BudgetedSection<ContextLinkedItem<'a>>,
@@ -6768,6 +6772,8 @@ pub(crate) struct TaskContextResponse<'a> {
     acceptance_criteria: Vec<ContextLinkedItem<'a>>,
     source_facts: Vec<ContextSourceFact<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191).
+    decisions: Vec<ContextDecision<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -6870,6 +6876,8 @@ pub(crate) struct SubsystemResponse<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191).
+    decisions: Vec<ContextDecision<'a>>,
     /// Author selector applied to `observations` (issue #195). `None`
     /// (omitted) when recall was unscoped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6935,6 +6943,9 @@ pub(crate) struct SemanticContextMatch<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191). Always
+    /// present; empty when no decisions link to the match.
+    decisions: Vec<ContextDecision<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
@@ -10860,6 +10871,7 @@ pub(crate) struct ContextSections<'a> {
     source_facts: Vec<ContextSourceFact<'a>>,
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    decisions: Vec<ContextDecision<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,

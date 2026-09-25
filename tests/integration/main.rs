@@ -95,6 +95,7 @@ mod query_cli;
 mod query_conflicts;
 mod query_cycles;
 mod query_debt_markers;
+mod query_decisions;
 mod query_dep_usage;
 mod query_deprecated_symbols;
 mod query_diagram;

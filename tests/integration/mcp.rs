@@ -361,6 +361,10 @@ fn symbol_context_separates_source_facts_from_observations() {
         result["observations"].is_array(),
         "must include observations array; got {result}"
     );
+    assert!(
+        result["decisions"].is_array(),
+        "must include decisions array (issue #191); got {result}"
+    );
 }
 
 /// inspect_store must attribute records to their domain (codegraph vs agent_memory).

@@ -1220,7 +1220,7 @@ pub struct StackFrame {
 }
 
 /// One JSONL graph record.
-// Node carries 10 optional provenance strings for agent-memory nodes.
+// Node carries 12 optional provenance strings for agent-memory nodes.
 // These are None for all code-graph nodes, so the memory cost is only
 // paid by agent-memory records that actually populate them.
 #[allow(clippy::large_enum_variant)]
@@ -1419,6 +1419,15 @@ pub enum GraphRecord {
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// The decision statement (Decision nodes; issue #191). Additive:
+        /// absent on records produced before the IR read it (unknown, never
+        /// fabricated).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_text: Option<String>,
+        /// Why the agent made the decision (Decision nodes; issue #191).
+        /// Additive: absent on records produced before the IR read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale_summary: Option<String>,
         /// ID of the record that supersedes this one.
         #[serde(skip_serializing_if = "Option::is_none")]
         superseded_by: Option<String>,
@@ -1941,6 +1950,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2076,6 +2087,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2210,6 +2223,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2349,6 +2364,8 @@ impl GraphRecord {
             repository_identity: None,
             source_snapshot: None,
             text: None,
+            decision_text: None,
+            rationale_summary: None,
             superseded_by: None,
             agent_id: None,
             agent_kind: None,
@@ -2744,6 +2761,52 @@ impl GraphRecord {
             *note = Some(marker_note.to_owned());
         }
         self
+    }
+
+    /// Stamps the decision statement on a `Decision` node (issue #191).
+    #[must_use]
+    pub fn with_decision_text(mut self, decision_text: &str) -> Self {
+        if let Self::Node {
+            decision_text: field,
+            ..
+        } = &mut self
+        {
+            *field = Some(decision_text.to_owned());
+        }
+        self
+    }
+
+    /// Stamps the decision rationale on a `Decision` node (issue #191).
+    #[must_use]
+    pub fn with_rationale_summary(mut self, rationale_summary: &str) -> Self {
+        if let Self::Node {
+            rationale_summary: field,
+            ..
+        } = &mut self
+        {
+            *field = Some(rationale_summary.to_owned());
+        }
+        self
+    }
+
+    /// Returns the decision statement when present (issue #191).
+    #[must_use]
+    pub fn decision_text(&self) -> Option<&str> {
+        match self {
+            Self::Node { decision_text, .. } => decision_text.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Returns the decision rationale when present (issue #191).
+    #[must_use]
+    pub fn rationale_summary(&self) -> Option<&str> {
+        match self {
+            Self::Node {
+                rationale_summary, ..
+            } => rationale_summary.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Returns the debt-marker note text when present.
@@ -5259,5 +5322,63 @@ mod symbol_role_tests {
         assert!(!json.contains("\"role\""), "unstamped record omits role");
         let back: GraphRecord = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.role(), None);
+    }
+}
+
+#[cfg(test)]
+mod decision_fields_tests {
+    //! Issue #191: the `Decision` record schema
+    //! (`docs/schema/agent-memory.md`, "Decision record shape") requires
+    //! `decision_text` and `rationale_summary`, but the IR drops them on read
+    //! — so the recall layer can never surface rationale. These fields are
+    //! additive reads over data that already exists, not a schema change.
+    use super::*;
+
+    /// A Decision JSONL line in the traj-importer shape (schema-required
+    /// `decision_text` / `rationale_summary` present).
+    fn decision_jsonl() -> &'static str {
+        r#"{"record_type":"node","id":"agent_memory:v1:dec-191","kind":"Decision","schema_version":1,"summary":"decision summary","domain":"agent_memory","decision_text":"Use BTreeMap for deterministic ordering","rationale_summary":"HashMap iteration order made the ordering tests flaky","confidence":"0.9","agent_id":"agent-1","session_id":"sess-1","source_handle":"traj-abc123"}"#
+    }
+
+    #[test]
+    fn decision_text_and_rationale_survive_ir_round_trip() {
+        // RED: the IR has no fields for these, so they are silently dropped.
+        let record: GraphRecord =
+            serde_json::from_str(decision_jsonl()).expect("Decision JSONL deserializes");
+        let json = serde_json::to_string(&record).expect("serializes");
+        assert!(
+            json.contains("Use BTreeMap for deterministic ordering"),
+            "decision_text must survive the IR round trip, not be dropped: {json}"
+        );
+        assert!(
+            json.contains("HashMap iteration order made the ordering tests flaky"),
+            "rationale_summary must survive the IR round trip, not be dropped: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_records_without_decision_fields_still_deserialize() {
+        // Additive per docs/schema/schema-versioning.md §2: records produced
+        // before the IR read these fields deserialize fine; the unstamped
+        // record omits the fields, never fabricates them.
+        let json = decision_jsonl()
+            .replace(
+                ",\"decision_text\":\"Use BTreeMap for deterministic ordering\"",
+                "",
+            )
+            .replace(
+                ",\"rationale_summary\":\"HashMap iteration order made the ordering tests flaky\"",
+                "",
+            );
+        let record: GraphRecord = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&record).expect("serializes");
+        assert!(
+            !json.contains("decision_text"),
+            "unstamped record omits decision_text: {json}"
+        );
+        assert!(
+            !json.contains("rationale_summary"),
+            "unstamped record omits rationale_summary: {json}"
+        );
     }
 }

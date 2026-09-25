@@ -149,7 +149,8 @@ Evidence-backed context for a named code symbol, trust-separated by domain.
 | `symbol_name` | string | stable | Echo of the query |
 | `source_facts` | array | stable | Deterministic code-graph rows (§5.1) |
 | `topology_edges` | array | provisional | Code-graph topology edges (§5.4); section is newer than the rest |
-| `observations` | array | stable | Agent-authored rows (§5.2) — never treat as source truth |
+| `observations` | array | stable | Agent-authored rows (§5.2) — never treat as source truth. `Decision` records never appear here; see `decisions` |
+| `decisions` | array | provisional | Agent-authored decision rows (§5.9) with rationale — evidence-backed judgments, never deterministic source truth; added by #191 |
 | `project_state` | array | stable | Tasks/ACs linked to the symbol (§5.3) |
 | `artifacts` | array | stable | §5.3 |
 | `verification_evidence` | array | stable | §5.3 |
@@ -183,7 +184,8 @@ GitHub short handle, or local JSONL handle.
 | `tasks` | array | stable | The anchor task row(s) (§5.3) |
 | `acceptance_criteria` | array | stable | Linked-item rows (§5.3); a row with `status: "verified"` may carry a nested `verification_record` object (provisional) |
 | `source_facts` | array | stable | §5.1 |
-| `observations` | array | stable | §5.2 |
+| `observations` | array | stable | §5.2. `Decision` records never appear here; see `decisions` |
+| `decisions` | array | provisional | §5.9; added by #191 |
 | `artifacts` | array | stable | §5.3 |
 | `verification_evidence` | array | stable | §5.3 |
 | `reviews` | array | stable | §5.3 |
@@ -305,6 +307,34 @@ Every error shares one stable envelope:
 The agent rule: `no_match` ⇒ the entity does not exist; `daemon_not_running`
 / `daemon_stale` ⇒ the store cannot be read. The two are never conflated.
 Error `code` identifiers are stable; adding a new code is additive.
+
+### 5.9 Decision row (provisional)
+
+Agent-authored decision with rationale (issue #191). `record_id`, `kind`,
+`trust` as in §5.1 (all stable). `summary` (string, stable) is the
+one-line record summary. `decision_text` (string|null, stable) is the
+decision's human-readable statement; `rationale_summary` (string|null,
+stable) is its rationale — both keys always present on a surfaced row,
+`null` only when the record predates the field (never fabricated).
+`provenance_handle` (`"<agent_id>:<session_id>"`, falling back to
+`agent_id` alone), `agent_id`, `session_id`, `observed_at`, `confidence`
+(all string|null, stable). `evidence_handles` (array of resolved decision
+evidence handles, stable) — each `{ relation, target_record_id,
+target_kind }` with `relation` one of `EXPLAINS_CHANGE` or
+`REFERENCES_TASK`, resolved from graph edges and inline `evidence_links`
+to targets present in the current store slice; targets that cannot be
+resolved are omitted from the row and stay in the shared `unresolved`
+array (§5.6) — never invented.
+
+Trust contract: decisions are agent-authored and evidence-backed, but
+they are deliberate judgments — **never deterministic source truth**.
+A decision row's `trust` class is one of the agent-memory classes
+(`agent_verified`, `agent_unverified`, `agent_contradicted`); the
+rationale is a claim to verify before reusing, not a fact to cite.
+Decisions never appear in the `observations` section (§5.2): the two
+sections are disjoint by construction. `Failure` records stay in
+`observations` — the section contract is "`Observation` and `Failure`",
+documented explicitly so the routing is never ambiguous.
 
 ---
 

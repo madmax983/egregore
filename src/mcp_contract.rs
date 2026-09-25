@@ -239,6 +239,55 @@ fn observation_schema() -> Value {
     })
 }
 
+/// One row of the `decisions` section (issue #191): agent-authored decision
+/// with `decision_text`, non-empty `rationale_summary`, provenance,
+/// optional `confidence`, and resolved decision evidence handles.
+///
+/// The property names mirror the emitted [`query::ContextDecision`] row
+/// exactly: `observed_at` (the record's timestamp, as on every
+/// agent-memory row) and `evidence_handles` (resolved `EXPLAINS_CHANGE` /
+/// `REFERENCES_TASK` handles). Targets absent from the recalled slice are
+/// omitted here and reported in the answer-level `unresolved` array —
+/// never invented.
+fn decision_schema() -> Value {
+    let mut props = record_header_properties();
+    extend_props(
+        &mut props,
+        [
+            ("summary", json!({ "type": "string" })),
+            ("decision_text", str_or_null()),
+            ("rationale_summary", str_or_null()),
+            ("provenance_handle", str_or_null()),
+            ("agent_id", str_or_null()),
+            ("session_id", str_or_null()),
+            ("observed_at", str_or_null()),
+            ("confidence", str_or_null()),
+            (
+                "evidence_handles",
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "required": ["relation", "target_record_id", "target_kind"],
+                        "properties": {
+                            "relation": { "type": "string" },
+                            "target_record_id": { "type": "string" },
+                            "target_kind": { "type": "string" }
+                        }
+                    }
+                }),
+            ),
+        ],
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust", "decision_text", "rationale_summary"],
+        "properties": props
+    })
+}
+
 fn output_handle_citation_schema() -> Value {
     json!({
         "type": ["object", "null"],
@@ -542,7 +591,7 @@ fn symbol_context_schema() -> Value {
         "additionalProperties": true,
         "required": [
             "ok", "symbol_name", "source_facts", "topology_edges",
-            "observations", "project_state", "artifacts",
+            "observations", "decisions", "project_state", "artifacts",
             "verification_evidence", "drift_history", "unresolved",
             "store_coverage", "freshness"
         ],
@@ -552,6 +601,7 @@ fn symbol_context_schema() -> Value {
             "source_facts": { "type": "array", "items": source_fact_schema() },
             "topology_edges": { "type": "array", "items": topology_edge_schema() },
             "observations": { "type": "array", "items": observation_schema() },
+            "decisions": { "type": "array", "items": decision_schema() },
             "project_state": { "type": "array", "items": linked_item_schema() },
             "artifacts": { "type": "array", "items": linked_item_schema() },
             "verification_evidence": { "type": "array", "items": linked_item_schema() },
@@ -574,7 +624,7 @@ fn task_evidence_schema() -> Value {
         "additionalProperties": true,
         "required": [
             "ok", "task_id", "tasks", "acceptance_criteria", "source_facts",
-            "observations", "artifacts", "verification_evidence", "reviews",
+            "observations", "decisions", "artifacts", "verification_evidence", "reviews",
             "external_links", "unresolved", "store_coverage", "freshness"
         ],
         "properties": {
@@ -587,6 +637,7 @@ fn task_evidence_schema() -> Value {
             },
             "source_facts": { "type": "array", "items": source_fact_schema() },
             "observations": { "type": "array", "items": observation_schema() },
+            "decisions": { "type": "array", "items": decision_schema() },
             "artifacts": { "type": "array", "items": linked_item_schema() },
             "verification_evidence": { "type": "array", "items": linked_item_schema() },
             "reviews": { "type": "array", "items": linked_item_schema() },

@@ -113,7 +113,17 @@ pub struct SubsystemContext<'a> {
     /// Codegraph topology edges between nodes in `source_facts`.
     pub topology_edges: Vec<&'a GraphRecord>,
     /// Agent-authored `Observation` nodes linked to source facts.
+    ///
+    /// Section contract (issue #191): this section holds `Observation` and
+    /// `Failure` records only. `Decision` records never appear here — they
+    /// surface in [`SubsystemContext::decisions`].
     pub observations: Vec<&'a GraphRecord>,
+    /// Agent-authored `Decision` nodes linked to source facts, carrying
+    /// `decision_text` and `rationale_summary` (issue #191).
+    ///
+    /// Trust contract: decisions are agent-authored and evidence-backed, but
+    /// they are deliberate judgments — never deterministic source truth.
+    pub decisions: Vec<&'a GraphRecord>,
     /// `Task` and `AcceptanceCriterion` nodes linked to source facts.
     pub project_state: Vec<&'a GraphRecord>,
     /// `Artifact` and `PatchArtifact` nodes linked to source facts.
@@ -138,6 +148,7 @@ impl SubsystemContext<'_> {
     pub const fn is_no_match(&self) -> bool {
         self.source_facts.is_empty()
             && self.observations.is_empty()
+            && self.decisions.is_empty()
             && self.project_state.is_empty()
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
@@ -290,6 +301,7 @@ pub fn subsystem_context<'a>(
     // Steps 2+: bounded BFS + backfill — same logic as symbol_context.
     let mut source_facts: BTreeSet<&str> = seed_ids.clone();
     let mut observations: BTreeSet<&str> = BTreeSet::new();
+    let mut decisions: BTreeSet<&str> = BTreeSet::new();
     let mut project_state: BTreeSet<&str> = BTreeSet::new();
     let mut artifacts: BTreeSet<&str> = BTreeSet::new();
     let mut verification_evidence: BTreeSet<&str> = BTreeSet::new();
@@ -300,6 +312,7 @@ pub fn subsystem_context<'a>(
     let classify_and_insert = |record_id: &'a str,
                                source_facts: &mut BTreeSet<&'a str>,
                                observations: &mut BTreeSet<&'a str>,
+                               decisions: &mut BTreeSet<&'a str>,
                                project_state: &mut BTreeSet<&'a str>,
                                artifacts: &mut BTreeSet<&'a str>,
                                verification_evidence: &mut BTreeSet<&'a str>|
@@ -320,6 +333,10 @@ pub fn subsystem_context<'a>(
             }
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::Decision) => {
+                decisions.insert(record_id);
                 true
             }
             Some(ContextSection::ProjectState) => {
@@ -376,6 +393,7 @@ pub fn subsystem_context<'a>(
                             id,
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -417,6 +435,7 @@ pub fn subsystem_context<'a>(
                             node_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -435,6 +454,7 @@ pub fn subsystem_context<'a>(
                                         target_id.as_str(),
                                         &mut source_facts,
                                         &mut observations,
+                                        &mut decisions,
                                         &mut project_state,
                                         &mut artifacts,
                                         &mut verification_evidence,
@@ -506,6 +526,7 @@ pub fn subsystem_context<'a>(
         let to_scan: Vec<String> = source_facts
             .iter()
             .chain(observations.iter())
+            .chain(decisions.iter())
             .chain(project_state.iter())
             .chain(artifacts.iter())
             .chain(verification_evidence.iter())
@@ -539,6 +560,7 @@ pub fn subsystem_context<'a>(
                             target_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -567,6 +589,7 @@ pub fn subsystem_context<'a>(
     let mut extra_frontier: BTreeSet<&str> = source_facts
         .iter()
         .chain(observations.iter())
+        .chain(decisions.iter())
         .chain(project_state.iter())
         .chain(artifacts.iter())
         .chain(verification_evidence.iter())
@@ -608,6 +631,7 @@ pub fn subsystem_context<'a>(
                         id,
                         &mut source_facts,
                         &mut observations,
+                        &mut decisions,
                         &mut project_state,
                         &mut artifacts,
                         &mut verification_evidence,
@@ -734,6 +758,7 @@ pub fn subsystem_context<'a>(
             out
         },
         observations: resolve(&observations),
+        decisions: resolve(&decisions),
         project_state: resolve(&project_state),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),

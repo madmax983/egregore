@@ -131,6 +131,9 @@ fn make_agent_memory_node(
         repository_identity: None,
         source_snapshot: None,
         text,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         superseded_by: None,
         agent_id: Some("test-agent".to_string()),
         agent_kind: Some("test".to_string()),

@@ -7,6 +7,7 @@ use super::record_budget::RecordBudget;
 /// `context_observation`, `context_linked_item`). `.copied()` collapses the
 /// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
 pub(crate) fn build_context_sections<'a>(
+    records: &'a [GraphRecord],
     ctx: &'a query::SymbolContext<'a>,
     trust: &query::TrustIndex<'_>,
 ) -> ContextSections<'a> {
@@ -53,6 +54,14 @@ pub(crate) fn build_context_sections<'a>(
             .copied()
             .filter_map(|r| context_observation(r, trust))
             .collect(),
+        // Section contract (issue #191): decisions surface in their own
+        // section and never in `observations`.
+        decisions: ctx
+            .decisions
+            .iter()
+            .copied()
+            .filter_map(|r| context_decision(r, records, trust))
+            .collect(),
         project_state: ctx
             .project_state
             .iter()
@@ -85,19 +94,62 @@ pub(crate) fn build_context_sections<'a>(
     }
 }
 
-pub(crate) fn apply_supersession<'a>(
-    observations: Vec<query::ContextObservation<'a>>,
+/// A context row that can carry temporal-supersession flags (issue #191:
+/// decisions need the same supersession handling as observations).
+pub(crate) trait SupersessionRow<'a> {
+    fn record_id(&self) -> &'a str;
+    fn trust(&self) -> crate::query::TrustClass;
+    fn set_temporal_status(&mut self, status: String);
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>);
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>);
+}
+
+impl<'a> SupersessionRow<'a> for query::ContextObservation<'a> {
+    fn record_id(&self) -> &'a str {
+        self.record_id
+    }
+    fn trust(&self) -> crate::query::TrustClass {
+        self.trust
+    }
+    fn set_temporal_status(&mut self, status: String) {
+        self.temporal_status = Some(status);
+    }
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.superseded_by = ids;
+    }
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.contradicted_by = ids;
+    }
+}
+
+impl<'a> SupersessionRow<'a> for query::ContextDecision<'a> {
+    fn record_id(&self) -> &'a str {
+        self.record_id
+    }
+    fn trust(&self) -> crate::query::TrustClass {
+        self.trust
+    }
+    fn set_temporal_status(&mut self, status: String) {
+        self.temporal_status = Some(status);
+    }
+    fn set_superseded_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.superseded_by = ids;
+    }
+    fn set_contradicted_by(&mut self, ids: Option<Vec<crate::temporal_status::TemporalReference>>) {
+        self.contradicted_by = ids;
+    }
+}
+
+pub(crate) fn apply_supersession<'a, R: SupersessionRow<'a>>(
+    rows: Vec<R>,
     resolver: &crate::temporal_status::TemporalResolver<'a>,
     mode: crate::temporal_status::SupersessionMode,
-) -> (
-    Vec<query::ContextObservation<'a>>,
-    Vec<ExcludedDiagnostic<'a>>,
-) {
+) -> (Vec<R>, Vec<ExcludedDiagnostic<'a>>) {
     let mut filtered = Vec::new();
     let mut excluded = Vec::new();
 
-    for mut obs in observations {
-        let (status, superseded_by, contradicted_by) = resolver.resolve_status(obs.record_id);
+    for mut row in rows {
+        let (status, superseded_by, contradicted_by) = resolver.resolve_status(row.record_id());
 
         let is_superseded = status == "superseded" || status == "cycle";
         let is_contradicted = status == "contradicted";
@@ -111,8 +163,8 @@ pub(crate) fn apply_supersession<'a>(
             match mode {
                 crate::temporal_status::SupersessionMode::Exclude => {
                     excluded.push(ExcludedDiagnostic {
-                        record_id: obs.record_id,
-                        trust: obs.trust,
+                        record_id: row.record_id(),
+                        trust: row.trust(),
                         reason,
                         superseded_by: if superseded_by.is_empty() {
                             None
@@ -127,28 +179,28 @@ pub(crate) fn apply_supersession<'a>(
                     });
                 }
                 crate::temporal_status::SupersessionMode::IncludeButFlag => {
-                    obs.temporal_status = Some(status.to_string());
-                    obs.superseded_by = if superseded_by.is_empty() {
+                    row.set_temporal_status(status.to_string());
+                    row.set_superseded_by(if superseded_by.is_empty() {
                         None
                     } else {
                         Some(superseded_by)
-                    };
-                    obs.contradicted_by = if contradicted_by.is_empty() {
+                    });
+                    row.set_contradicted_by(if contradicted_by.is_empty() {
                         None
                     } else {
                         Some(contradicted_by)
-                    };
-                    filtered.push(obs);
+                    });
+                    filtered.push(row);
                 }
             }
         } else {
             match mode {
                 crate::temporal_status::SupersessionMode::IncludeButFlag => {
-                    obs.temporal_status = Some(status.to_string());
-                    filtered.push(obs);
+                    row.set_temporal_status(status.to_string());
+                    filtered.push(row);
                 }
                 crate::temporal_status::SupersessionMode::Exclude => {
-                    filtered.push(obs);
+                    filtered.push(row);
                 }
             }
         }
@@ -276,7 +328,7 @@ pub(crate) fn query_context_cmd(
     let (ctx, display_name) = resolve_symbol_or_candidate(records, symbol_name, candidate)?;
 
     let trust = query::TrustIndex::build(records);
-    let sections = build_context_sections(&ctx, &trust);
+    let sections = build_context_sections(records, &ctx, &trust);
 
     // Attach the freshness verdict only when every source fact belongs to the
     // repository the verdict was computed for (PR #186): `query context` has no
@@ -296,8 +348,14 @@ pub(crate) fn query_context_cmd(
     // Reuse the resolver the trust index already built over this exact slice
     // (one O(n) build per answer) so `trust` and `temporal_status` can never be
     // computed from different corpora.
-    let (observations, excluded) =
+    let (observations, mut excluded) =
         apply_supersession(sections.observations, trust.resolver(), supersession);
+
+    // Decisions get their own supersession pass (issue #191): same
+    // temporal-status semantics, surfaced in the decisions section.
+    let (decisions, decision_excluded) =
+        apply_supersession(sections.decisions, trust.resolver(), supersession);
+    excluded.extend(decision_excluded);
 
     let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<ContextDrift<'_>> = ctx
@@ -320,6 +378,7 @@ pub(crate) fn query_context_cmd(
         source_facts: budget.section(sections.source_facts),
         topology_edges: budget.section(sections.topology_edges),
         observations: budget.section(observations),
+        decisions: budget.section(decisions),
         project_state: budget.section(sections.project_state),
         artifacts: budget.section(sections.artifacts),
         verification_evidence: budget.section(sections.verification_evidence),

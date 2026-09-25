@@ -925,6 +925,9 @@ fn make_node(
         role: None,
         id,
         kind,
+        // Issue #191: decision-only fields; None for non-Decision records.
+        decision_text: None,
+        rationale_summary: None,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: extra.repo_relative_path,
         span: None,

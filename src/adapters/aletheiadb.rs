@@ -2742,6 +2742,9 @@ impl EmbeddedAletheiaSink {
             history_replay_tip,
             embedding_model,
             text,
+            // Issue #191: decision-only fields, bound for exhaustiveness.
+            decision_text,
+            rationale_summary,
             superseded_by,
             agent_id,
             agent_kind,
@@ -3009,6 +3012,10 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert("embedding_model_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
+        // Decision-only fields (issue #191). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        builder = insert_optional(builder, "decision_text", decision_text.as_deref());
+        builder = insert_optional(builder, "rationale_summary", rationale_summary.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
         builder = insert_optional(builder, "agent_id", agent_id.as_deref());
         builder = insert_optional(builder, "agent_kind", agent_kind.as_deref());
@@ -3746,6 +3753,17 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("evidence_links_json invalid: {e}")))?,
             text: optional_str_property(record_id, "text", node.get_property("text"))?,
+            // Decision-only fields (issue #191); symmetric with `write_node`.
+            decision_text: optional_str_property(
+                record_id,
+                "decision_text",
+                node.get_property("decision_text"),
+            )?,
+            rationale_summary: optional_str_property(
+                record_id,
+                "rationale_summary",
+                node.get_property("rationale_summary"),
+            )?,
             superseded_by: optional_str_property(
                 record_id,
                 "superseded_by",

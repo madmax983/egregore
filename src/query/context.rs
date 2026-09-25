@@ -96,7 +96,20 @@ pub struct SymbolContext<'a> {
     ///
     /// Every record carries `agent_id`, `observed_at`, and `confidence`.
     /// These are subjective and MUST NOT be treated as source truth.
+    ///
+    /// Section contract (issue #191): this section holds `Observation` and
+    /// `Failure` records only. `Decision` records never appear here — they
+    /// surface in [`SymbolContext::decisions`].
     pub observations: Vec<&'a GraphRecord>,
+    /// Agent-authored `Decision` nodes linked to the symbol, carrying
+    /// `decision_text` and `rationale_summary` (issue #191).
+    ///
+    /// Trust contract: decisions are agent-authored and evidence-backed, but
+    /// they are deliberate judgments — never deterministic source truth.
+    /// Treat the rationale as a claim to verify before reusing, not as a
+    /// fact to cite. A decision never appears in
+    /// [`SymbolContext::observations`].
+    pub decisions: Vec<&'a GraphRecord>,
     /// `Task` and `AcceptanceCriterion` nodes linked to the symbol.
     pub project_state: Vec<&'a GraphRecord>,
     /// `Artifact` and `PatchArtifact` nodes linked to the symbol.
@@ -132,6 +145,7 @@ impl SymbolContext<'_> {
     pub const fn is_no_match(&self) -> bool {
         self.source_facts.is_empty()
             && self.observations.is_empty()
+            && self.decisions.is_empty()
             && self.project_state.is_empty()
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
@@ -162,10 +176,17 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         NodeKind::Symbol | NodeKind::File | NodeKind::Module | NodeKind::Import => {
             Some(ContextSection::SourceFact)
         }
-        // agent-authored observations and failure records
-        NodeKind::Observation | NodeKind::Decision | NodeKind::Failure => {
-            Some(ContextSection::Observation)
-        }
+        // agent-authored observations and failure records.
+        //
+        // Section contract (issue #191): `Observation` and `Failure` share
+        // the observations section; `Decision` has its own. Failures stay
+        // here deliberately — they are post-hoc notes about what went wrong,
+        // not deliberate judgments — and this comment is the documented
+        // routing the issue requires instead of silent flattening.
+        NodeKind::Observation | NodeKind::Failure => Some(ContextSection::Observation),
+        // agent-authored decisions with rationale (issue #191): a dedicated
+        // section, never mixed into observations.
+        NodeKind::Decision => Some(ContextSection::Decision),
         // project / task domain
         NodeKind::Task
         | NodeKind::AcceptanceCriterion
@@ -203,6 +224,10 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
 pub(super) enum ContextSection {
     SourceFact,
     Observation,
+    /// Agent-authored decisions with rationale (issue #191). Trust-separated
+    /// from observations: a decision is a deliberate, evidence-backed
+    /// judgment — never an ad-hoc note and never source truth.
+    Decision,
     ProjectState,
     Artifact,
     VerificationEvidence,
@@ -707,6 +732,7 @@ fn context_from_seeds<'a>(
 
     // Step 3a + 3b: classify linked records.
     let mut observations: BTreeSet<&str> = BTreeSet::new();
+    let mut decisions: BTreeSet<&str> = BTreeSet::new();
     let mut project_state: BTreeSet<&str> = BTreeSet::new();
     let mut artifacts: BTreeSet<&str> = BTreeSet::new();
     let mut verification_evidence: BTreeSet<&str> = BTreeSet::new();
@@ -728,6 +754,7 @@ fn context_from_seeds<'a>(
     let classify_and_insert = |record_id: &'a str,
                                source_facts: &mut BTreeSet<&'a str>,
                                observations: &mut BTreeSet<&'a str>,
+                               decisions: &mut BTreeSet<&'a str>,
                                project_state: &mut BTreeSet<&'a str>,
                                artifacts: &mut BTreeSet<&'a str>,
                                verification_evidence: &mut BTreeSet<&'a str>|
@@ -751,6 +778,10 @@ fn context_from_seeds<'a>(
             }
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::Decision) => {
+                decisions.insert(record_id);
                 true
             }
             Some(ContextSection::ProjectState) => {
@@ -825,6 +856,7 @@ fn context_from_seeds<'a>(
                             id,
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -880,6 +912,7 @@ fn context_from_seeds<'a>(
                             node_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -903,6 +936,7 @@ fn context_from_seeds<'a>(
                                         target_id.as_str(),
                                         &mut source_facts,
                                         &mut observations,
+                                        &mut decisions,
                                         &mut project_state,
                                         &mut artifacts,
                                         &mut verification_evidence,
@@ -1039,6 +1073,7 @@ fn context_from_seeds<'a>(
                             target_id.as_str(),
                             &mut source_facts,
                             &mut observations,
+                            &mut decisions,
                             &mut project_state,
                             &mut artifacts,
                             &mut verification_evidence,
@@ -1071,6 +1106,7 @@ fn context_from_seeds<'a>(
     let mut extra_frontier: BTreeSet<&str> = source_facts
         .iter()
         .chain(observations.iter())
+        .chain(decisions.iter())
         .chain(project_state.iter())
         .chain(artifacts.iter())
         .chain(verification_evidence.iter())
@@ -1113,6 +1149,7 @@ fn context_from_seeds<'a>(
                         id,
                         &mut source_facts,
                         &mut observations,
+                        &mut decisions,
                         &mut project_state,
                         &mut artifacts,
                         &mut verification_evidence,
@@ -1130,6 +1167,7 @@ fn context_from_seeds<'a>(
     // (a Symbol node classified via edge could end up in the wrong section).
     for sid in symbol_ids {
         observations.remove(sid);
+        decisions.remove(sid);
         project_state.remove(sid);
         artifacts.remove(sid);
         verification_evidence.remove(sid);
@@ -1304,6 +1342,7 @@ fn context_from_seeds<'a>(
             out
         },
         observations: resolve(&observations),
+        decisions: resolve(&decisions),
         project_state: resolve(&project_state),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
@@ -2103,5 +2142,279 @@ mod relay_liveness_tests {
                 .any(|r| r.id() == "codegraph:v5:run:relay"),
             "a tombstoned ToolCall with no re-ingest must not relay the context BFS"
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_section_tests {
+    //! Issue #191: `Decision` records must surface in a dedicated `decisions`
+    //! section — never flattened into `observations`.
+    //!
+    //! The section exists: `SymbolContext::decisions` carries `Decision`
+    //! records, `SymbolContext::observations` never does.
+    use super::*;
+    use crate::ir::{AGENT_MEMORY_SCHEMA_VERSION, EvidenceLink};
+    use crate::query::{TrustIndex, context_decision};
+
+    const DEC_ID: &str = "agent_memory:v1:dec-191";
+    const OBS_ID: &str = "agent_memory:v1:obs-191";
+    const FAIL_ID: &str = "agent_memory:v1:fail-191";
+
+    fn sym(name: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v5:sym-{name}"),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn evidence_link(target: &str, relation: &str) -> EvidenceLink {
+        EvidenceLink {
+            target_record_id: Some(target.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: relation.to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }
+    }
+
+    fn agent_node(id: &str, kind: NodeKind, symbol_id: &str, relation: &str) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            format!("{kind:?} summary"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            observed_at,
+            evidence_links,
+            ..
+        } = &mut node
+        {
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-1".to_owned());
+            *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+            *evidence_links = Some(vec![evidence_link(symbol_id, relation)]);
+        }
+        node
+    }
+
+    fn fixture() -> Vec<GraphRecord> {
+        let target = sym("foo");
+        let target_id = target.id().to_owned();
+        vec![
+            target,
+            agent_node(DEC_ID, NodeKind::Decision, &target_id, "OBSERVES"),
+            agent_node(OBS_ID, NodeKind::Observation, &target_id, "OBSERVES"),
+            agent_node(FAIL_ID, NodeKind::Failure, &target_id, "FAILED_ON"),
+        ]
+    }
+
+    #[test]
+    fn classify_node_separates_decision_from_observation() {
+        // RED: today Decision flattens into the Observation section.
+        assert_ne!(
+            classify_node(NodeKind::Decision),
+            classify_node(NodeKind::Observation),
+            "Decision must not share the Observation section (issue #191)"
+        );
+    }
+
+    #[test]
+    fn classify_node_keeps_failure_in_observations() {
+        // Section contract (issue #191): Failure stays in observations —
+        // documented, not silently flattened. Guards the fix against moving
+        // failures along with decisions.
+        assert_eq!(
+            classify_node(NodeKind::Failure),
+            Some(ContextSection::Observation)
+        );
+        assert_eq!(
+            classify_node(NodeKind::Observation),
+            Some(ContextSection::Observation)
+        );
+    }
+
+    #[test]
+    fn decision_record_never_surfaces_inside_observations() {
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            !obs_ids.contains(&DEC_ID),
+            "Decision {DEC_ID} must not appear in observations: {obs_ids:?}"
+        );
+    }
+
+    #[test]
+    fn decision_record_surfaces_in_dedicated_decisions_section() {
+        // The dedicated-section half of the contract: the Decision record is
+        // not merely kept out of `observations` — it must appear in
+        // `decisions` (issue #191 AC1/AC3).
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let dec_ids: Vec<&str> = ctx.decisions.iter().map(|r| r.id()).collect();
+        assert!(
+            dec_ids.contains(&DEC_ID),
+            "Decision {DEC_ID} must surface in the decisions section: {dec_ids:?}"
+        );
+        assert!(
+            !ctx.is_no_match(),
+            "a symbol with linked decisions is not a no-match"
+        );
+    }
+
+    #[test]
+    fn failure_records_stay_in_observations_per_section_contract() {
+        // Companion to the classifier contract: the fix must not move
+        // failures out of observations.
+        let records = fixture();
+        let ctx = symbol_context(&records, "foo");
+        let obs_ids: Vec<&str> = ctx.observations.iter().map(|r| r.id()).collect();
+        assert!(
+            obs_ids.contains(&FAIL_ID),
+            "Failure records stay in observations per the section contract: {obs_ids:?}"
+        );
+        assert!(
+            obs_ids.contains(&OBS_ID),
+            "Observation records stay in observations: {obs_ids:?}"
+        );
+        assert!(!ctx.is_no_match());
+    }
+
+    #[test]
+    fn decision_row_retains_text_rationale_and_resolved_evidence() {
+        // Issue #191 AC2/AC6: the dedicated section must carry the decision
+        // text, the non-empty rationale, provenance, confidence, and the
+        // resolved `EXPLAINS_CHANGE` evidence handle.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_decision_text("decide to refactor foo")
+        .with_rationale_summary("the symbol is duplicated in three places");
+        if let GraphRecord::Node {
+            agent_id,
+            session_id,
+            confidence,
+            evidence_links,
+            ..
+        } = &mut decision
+        {
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-1".to_owned());
+            *confidence = Some("0.9".to_owned());
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some("codegraph:v5:sym-foo".to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "EXPLAINS_CHANGE".to_owned(),
+                confidence: "0.9".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        let records = vec![sym("foo"), decision];
+        let trust = TrustIndex::build(&records);
+        let record = records.iter().find(|r| r.id() == DEC_ID).unwrap();
+        let row = context_decision(record, &records, &trust)
+            .expect("Decision record must build a decision row");
+
+        assert_eq!(row.decision_text, Some("decide to refactor foo"));
+        assert!(
+            row.rationale_summary.is_some_and(|r| !r.is_empty()),
+            "rationale_summary must be non-empty (issue #191 success metric)"
+        );
+        assert_eq!(row.provenance_handle.as_deref(), Some("agent-1:sess-1"));
+        assert_eq!(row.confidence, Some("0.9"));
+        assert_eq!(row.record_id, DEC_ID);
+        assert_eq!(row.evidence_handles.len(), 1);
+        assert_eq!(row.evidence_handles[0].relation, "EXPLAINS_CHANGE");
+        assert_eq!(
+            row.evidence_handles[0].target_record_id,
+            "codegraph:v5:sym-foo"
+        );
+        assert_eq!(row.evidence_handles[0].target_kind, "Symbol");
+    }
+
+    #[test]
+    fn decision_row_provenance_falls_back_to_agent_id() {
+        // Provenance handle is `agent_id:session_id`, falling back to
+        // `agent_id` when no session is recorded.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_rationale_summary("some reason");
+        if let GraphRecord::Node { agent_id, .. } = &mut decision {
+            *agent_id = Some("agent-9".to_owned());
+        }
+        let records = vec![decision];
+        let trust = TrustIndex::build(&records);
+        let row = context_decision(&records[0], &records, &trust).unwrap();
+        assert_eq!(row.provenance_handle.as_deref(), Some("agent-9"));
+    }
+
+    #[test]
+    fn decision_row_serializes_with_expected_fields() {
+        // The row shape the CLI/MCP/daemon lanes share: every field the
+        // issue requires must be present on the wire.
+        let mut decision = GraphRecord::node(
+            DEC_ID.to_owned(),
+            NodeKind::Decision,
+            None,
+            None,
+            None,
+            "Decision summary".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION)
+        .with_decision_text("decide X")
+        .with_rationale_summary("because Y");
+        if let GraphRecord::Node { agent_id, .. } = &mut decision {
+            *agent_id = Some("agent-1".to_owned());
+        }
+        let records = vec![decision];
+        let trust = TrustIndex::build(&records);
+        let row = context_decision(&records[0], &records, &trust).unwrap();
+        let value = serde_json::to_value(&row).unwrap();
+        // Always-serialized keys (the MCP contract requires them).
+        for field in [
+            "record_id",
+            "kind",
+            "trust",
+            "summary",
+            "decision_text",
+            "rationale_summary",
+        ] {
+            assert!(
+                value.get(field).is_some(),
+                "decision row must serialize `{field}`"
+            );
+        }
+        // Present here because the fixture sets them; skipped when absent.
+        assert_eq!(value["provenance_handle"], "agent-1");
+        assert_eq!(value["rationale_summary"], "because Y");
     }
 }

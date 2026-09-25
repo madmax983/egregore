@@ -30,6 +30,9 @@ pub(crate) struct LocateResponse<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Agent-authored decisions with rationale (issue #191) — never mixed
+    /// into `observations`.
+    decisions: Vec<ContextDecision<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
@@ -230,9 +233,14 @@ pub(crate) fn locate_response_value(
             })?;
             let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
                 disclose_head_anchored_corpus(records, at.is_some() || as_of.is_some());
-            let sections = build_context_sections(&context, &trust);
-            let (observations, excluded) =
+            let sections = build_context_sections(records, &context, &trust);
+            let (observations, mut excluded) =
                 apply_supersession(sections.observations, trust.resolver(), supersession);
+            // Section contract (issue #191): decisions surface in their own
+            // section with the same supersession handling as observations.
+            let (decisions, decision_excluded) =
+                apply_supersession(sections.decisions, trust.resolver(), supersession);
+            excluded.extend(decision_excluded);
 
             let response = LocateResponse {
                 ok: true,
@@ -250,6 +258,7 @@ pub(crate) fn locate_response_value(
                 source_facts: sections.source_facts,
                 topology_edges: sections.topology_edges,
                 observations,
+                decisions,
                 project_state: sections.project_state,
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,
