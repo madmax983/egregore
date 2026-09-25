@@ -2010,6 +2010,18 @@ pub(crate) enum QuerySubcommand {
         /// Exclude unverified agent observations (no cited verification evidence).
         #[arg(long)]
         verified_only: bool,
+        /// Restrict recall to observations authored by this agent identity
+        /// (issue #195). Composes with `--repo`, `--verified-only`,
+        /// `--not-agent`, and `--supersession`; the default (no flag) leaves
+        /// recall unscoped. Deterministic code-graph facts carry no `agent_id`
+        /// and are never returned by an author-scoped recall.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Exclude observations authored by this agent identity (issue #195).
+        /// Composes with `--agent`: a recalled observation must satisfy both
+        /// selectors (when both name the same agent the exclusion wins).
+        #[arg(long)]
+        not_agent: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2418,6 +2430,19 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Restrict the `observations` section to memories authored by this
+        /// agent identity (issue #195). Composes with `--not-agent`; the
+        /// default (no flag) leaves recall unscoped. Deterministic code-graph
+        /// facts (the `source_facts` section) carry no `agent_id` and are
+        /// never presented as author-scoped memory — the selector applies to
+        /// agent-authored observations only.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Exclude observations authored by this agent identity (issue #195).
+        /// Composes with `--agent`: an observation must satisfy both selectors
+        /// (when both name the same agent the exclusion wins).
+        #[arg(long)]
+        not_agent: Option<String>,
     },
     /// Surface graph-derived change-impact LEADS for a symbol or file handle (issue #76).
     ///
@@ -6774,6 +6799,32 @@ pub(crate) struct SubsystemLogSignature<'a> {
     resolved_frames: Vec<SubsystemLogFrame<'a>>,
 }
 
+/// Documents an active author selector on a subsystem answer (issue #195).
+///
+/// Present only when `--agent` / `--not-agent` was given. Records which
+/// selector spelled the filter, which answer field carries the authoring agent
+/// identity, and how many observations the filter matched — so an empty
+/// `observations` array under an active scope is an explicit empty result,
+/// not a silent fallback to unscoped recall.
+#[derive(Serialize)]
+pub(crate) struct AuthorScopeReport<'a> {
+    /// The `--agent` value: only observations authored by this `agent_id`
+    /// were returned. Omitted when the flag was not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    /// The `--not-agent` value: observations authored by this `agent_id`
+    /// were excluded. Omitted when the flag was not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_agent: Option<&'a str>,
+    /// The observation field carrying the authoring agent identity.
+    author_field: &'static str,
+    /// Observations in the answer after the author filter and supersession
+    /// resolution.
+    observations_matched: usize,
+    /// Observations under the prefix before the author filter.
+    observations_total: usize,
+}
+
 /// Full subsystem context query response envelope (issue #83).
 #[derive(Serialize)]
 pub(crate) struct SubsystemResponse<'a> {
@@ -6783,6 +6834,10 @@ pub(crate) struct SubsystemResponse<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
+    /// Author selector applied to `observations` (issue #195). `None`
+    /// (omitted) when recall was unscoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_scope: Option<AuthorScopeReport<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
@@ -7986,6 +8041,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             limit,
             verified_only,
+            agent,
+            not_agent,
             format,
             supersession,
         } => query_semantic_memory(
@@ -7994,6 +8051,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             repo.as_deref(),
             verified_only,
+            agent.as_deref(),
+            not_agent.as_deref(),
             format,
             supersession,
         ),
@@ -8255,6 +8314,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             all_history,
             format,
             supersession,
+            agent,
+            not_agent,
         } => {
             // Validate the prefix before loading records so malformed input fails
             // fast with a machine-readable diagnostic, not a store I/O error.
@@ -8278,6 +8339,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 format,
                 supersession,
+                agent.as_deref(),
+                not_agent.as_deref(),
             )
         }
         QuerySubcommand::ChangeImpact {

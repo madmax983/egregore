@@ -679,6 +679,53 @@ pub(crate) fn is_recallable_memory(
     true
 }
 
+/// Prints the explicit empty result for an author-scoped recall that matched
+/// nothing (issue #195).
+///
+/// An author selector matching no observations is a successful query with zero
+/// results — not an error and not a silent fallback to unscoped recall. The
+/// envelope echoes the selector (`agent` / `not_agent`), names the answer
+/// field carrying the authoring agent identity (`author_field`), and reports
+/// the matched count.
+#[cfg(feature = "embeddings")]
+fn print_empty_author_scope(
+    query: &str,
+    author_scope: &crate::query::AuthorScope,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "ok": true,
+                "query": query,
+                "results": [],
+                "author_scope": {
+                    "agent": author_scope.include,
+                    "not_agent": author_scope.exclude,
+                    "author_field": "agent_id",
+                    "observations_matched": 0,
+                },
+                "message": "no observations matched the author selector",
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+        }
+        OutputFormat::Text => {
+            let mut selectors = Vec::new();
+            if let Some(include) = author_scope.include.as_deref() {
+                selectors.push(format!("agent={include}"));
+            }
+            if let Some(exclude) = author_scope.exclude.as_deref() {
+                selectors.push(format!("not_agent={exclude}"));
+            }
+            println!(
+                "no memory results matched the author selector ({})",
+                selectors.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Recalls prior agent memory by meaning, trust-separated from code (issue #91).
 ///
 /// Embeds the natural-language query with the local model, runs the same vector
@@ -707,13 +754,15 @@ impl PrintText for ExcludedRecallDiagnostic<'_> {
 }
 
 #[cfg(feature = "embeddings")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_semantic_memory(
     query: &str,
     data_dir: &Path,
     limit: usize,
     repo: Option<&str>,
     verified_only: bool,
+    agent: Option<&str>,
+    not_agent: Option<&str>,
     format: OutputFormat,
     supersession: crate::temporal_status::SupersessionMode,
 ) -> Result<()> {
@@ -745,6 +794,13 @@ pub(crate) fn query_semantic_memory(
     }
 
     let query_vector = embed_query_checked(query, &sink, &records)?;
+
+    // Author selector for recalled observations (issue #195). Inactive by
+    // default: recall without `--agent` / `--not-agent` is unchanged.
+    let author_scope = crate::query::AuthorScope {
+        include: agent.map(str::to_owned),
+        exclude: not_agent.map(str::to_owned),
+    };
 
     // The shared vector index holds both code and memory; fetch a generous pool
     // and filter to memory so the `limit` bounds recalled memory, not the blend.
@@ -782,6 +838,14 @@ pub(crate) fn query_semantic_memory(
         else {
             continue;
         };
+
+        // Author scoping (issue #195): an active selector keeps only records
+        // carrying a resolvable authoring `agent_id`. Deterministic code-graph
+        // facts carry no `agent_id` and are structurally excluded from
+        // author-scoped recall (see `crate::query::AuthorScope::matches`).
+        if !author_scope.matches(agent_id.as_deref()) {
+            continue;
+        }
 
         // Scope through the code this memory cites: memory nodes are not in the
         // containment topology, so a `--repo` filter must resolve the repository
@@ -930,6 +994,13 @@ pub(crate) fn query_semantic_memory(
     rows.truncate(limit);
 
     if rows.is_empty() {
+        if author_scope.is_active() {
+            // Explicit empty result (issue #195): the author selector matched
+            // no observations. This is a successful query with zero results —
+            // not an error and not a silent fallback to unscoped recall.
+            print_empty_author_scope(query, &author_scope, format)?;
+            return Ok(());
+        }
         eprintln!(
             "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
         );

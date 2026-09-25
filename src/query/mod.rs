@@ -11,6 +11,7 @@
 
 // Module list is alphabetized; each query lane lives in its own file.
 mod as_of;
+mod author_scope;
 mod belief_timeline;
 mod change_impact;
 mod changes;
@@ -89,6 +90,7 @@ mod track_record;
 mod session_retrospective;
 
 pub use as_of::*;
+pub use author_scope::*;
 pub use belief_timeline::*;
 pub use change_impact::*;
 pub use changes::*;

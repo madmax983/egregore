@@ -49,7 +49,8 @@ eg query semantic-memory "what breaks when the input file is empty?" \
 
 ```text
 eg query semantic-memory <QUERY> --data-dir <DIR> [--repo <SELECTOR>] \
-    [--limit <N>] [--verified-only] [--supersession <exclude|include-but-flag>] [--format json|text]
+    [--limit <N>] [--verified-only] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>] \
+    [--supersession <exclude|include-but-flag>] [--format json|text]
 ```
 
 Reads directly from an embedded AletheiaDB store (`--data-dir`). The query string
@@ -63,6 +64,8 @@ contacted.
 | `--repo <SELECTOR>` | Restrict results to one repository (issue #67). |
 | `--limit <N>` | Maximum memory hits to return (default 10). |
 | `--verified-only` | Exclude unverified observations (see below). |
+| `--agent <AGENT_ID>` | Restrict recall to observations authored by this agent identity (see "Author scoping"). |
+| `--not-agent <AGENT_ID>` | Exclude observations authored by this agent identity (see "Author scoping"). |
 | `--supersession <mode>` | `exclude` (default) or `include-but-flag` (see [recall-supersession.md](recall-supersession.md)). |
 | `--format` | `json` (default) or `text`. |
 
@@ -115,6 +118,55 @@ silently promoted to a fact.
 ### `--supersession`
 
 Controls how superseded or contradicted observations are filtered or annotated. By default (`exclude`), they are excluded from the `observations` list and added to `excluded` diagnostics. With `include-but-flag`, they are returned alongside their temporal status and forward references. See [recall-supersession.md](recall-supersession.md) for full details.
+
+### Author scoping (issue #195)
+
+In multi-agent deployments many agents write observations into one shared
+store. The author selector scopes recall by the authoring agent identity:
+
+```sh
+# Only what agent_1 concluded about the parser:
+eg query semantic-memory "what breaks when the input file is empty?" \
+  --data-dir .egregore --agent agent_1
+
+# Everything except agent_1's observations:
+eg query semantic-memory "what breaks when the input file is empty?" \
+  --data-dir .egregore --not-agent agent_1
+```
+
+- The selector is spelled `--agent <AGENT_ID>` (include) and
+  `--not-agent <AGENT_ID>` (exclude). Both may be given: a recalled
+  observation must satisfy both, so when both name the same agent the
+  exclusion wins.
+- Every recalled observation already carries its author as first-class
+  answer fields: **`agent_id`** and **`session_id`** on each row (never
+  buried inside raw provenance).
+- Matching is exact, case-sensitive equality on the `agent_id` handle.
+- Composes with `--repo`, `--verified-only`, and `--supersession`; with no
+  selector recall is unscoped (default behavior unchanged).
+- Deterministic code-graph facts carry no `agent_id` and are never returned
+  by an author-scoped recall.
+- When the selector matches no observations the answer is an explicit empty
+  result — exit `0`, not an error and not a silent fallback to unscoped
+  recall:
+
+```json
+{
+  "ok": true,
+  "query": "what breaks when the input file is empty?",
+  "results": [],
+  "author_scope": {
+    "agent": "agent_9",
+    "not_agent": null,
+    "author_field": "agent_id",
+    "observations_matched": 0
+  },
+  "message": "no observations matched the author selector"
+}
+```
+
+`author_scope.author_field` names the row field carrying the author
+(`agent_id`); `agent` / `not_agent` echo the selectors that were applied.
 
 ### Example
 

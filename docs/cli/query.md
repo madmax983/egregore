@@ -860,8 +860,8 @@ observations, project state, artifacts, verification evidence, semantic drift,
 runtime error signatures, and unresolved evidence links.
 
 ```text
-eg query subsystem <PREFIX> --graph <PATH> [--format json|text]
-eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text]
+eg query subsystem <PREFIX> --graph <PATH> [--format json|text] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>]
+eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>]
 ```
 
 ### Arguments
@@ -872,6 +872,8 @@ eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text]
 | `--graph <PATH>` | one of `--graph` / `--data-dir` | Graph JSONL produced by `eg scan`, `eg scan-history`, `eg scan-logs`, and/or `eg resolve-frames`, concatenated. |
 | `--data-dir <DIR>` | one of `--graph` / `--data-dir` | Embedded store directory (transaction-time-current view). |
 | `--format` | no | `json` (default) or `text`. |
+| `--agent <AGENT_ID>` | no | Restrict the `observations` section to memories authored by this agent identity (see "Author scoping"). |
+| `--not-agent <AGENT_ID>` | no | Exclude observations authored by this agent identity (see "Author scoping"). |
 
 ### Prefix matching
 
@@ -894,6 +896,41 @@ The JSON envelope carries `ok`, `prefix`, and the trust-separated sections
 `verification_evidence`, `semantic_drift`, `log_signatures`, `unresolved`, and
 `excluded`. `log_signatures` and `unresolved` are **always present** (`[]` when
 empty); `topology_edges` and `excluded` are omitted when empty.
+
+### Author scoping (issue #195)
+
+`--agent <AGENT_ID>` restricts the `observations` section to memories authored
+by that agent; `--not-agent <AGENT_ID>` excludes that agent's memories. Both
+may be given (an observation must satisfy both; when both name the same agent
+the exclusion wins). With no selector the answer is unscoped (default behavior
+unchanged).
+
+- Each observation row already carries its author as first-class fields
+  **`agent_id`** and **`session_id`** — never buried inside raw provenance.
+- The selector applies to the agent-authored `observations` section only.
+  Deterministic code-graph facts (the `source_facts` section) carry no
+  `agent_id` and are never presented as author-scoped memory.
+- Matching is exact, case-sensitive equality on the `agent_id` handle.
+- When the selector is active the envelope carries an `author_scope` section
+  documenting the applied filter, so an empty `observations` array is an
+  explicit empty result — not an error and not a silent fallback to unscoped
+  recall:
+
+```json
+{
+  "author_scope": {
+    "agent": "agent_9",
+    "author_field": "agent_id",
+    "observations_matched": 0,
+    "observations_total": 3
+  }
+}
+```
+
+`author_field` names the observation field carrying the author; `agent` /
+`not_agent` echo the selectors spelled on the command line
+(`--agent` / `--not-agent`); `observations_matched` / `observations_total`
+count the section after / before the filter.
 
 ### `log_signatures` (issue #325)
 
