@@ -55,6 +55,12 @@ pub struct FileAtPointSymbol<'a> {
     /// (role unknown, never fabricated).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190), resolved as-of the
+    /// selected point: the normalized predicates lexically gating the backing
+    /// record, outermost gate first. Omitted for records that predate
+    /// issue #190 or are ungated (unknown-or-absent, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<Vec<String>>,
 }
 
 /// One stable, machine-readable diagnostic on a *successful* file-at-point
@@ -424,6 +430,9 @@ pub fn file_symbols_at_point<'a>(
             commit: resolved_sha,
             valid_time: Some(t.valid_time.as_str()),
             role: r.role().copied(),
+            // Conditional-compilation gates (issue #190), resolved as-of the
+            // point like every other record field on the row.
+            cfg: r.cfg().cloned(),
         });
     }
     symbols.sort_by(|a, b| {

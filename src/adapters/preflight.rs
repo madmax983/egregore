@@ -275,6 +275,10 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 draft: _,
                 deprecated: _,
                 lint_suppression: _,
+                // Conditional-compilation gates (issue #190): recorded as a
+                // single `cfg_json` blob at write time, like
+                // `lint_suppression`; not individually interned.
+                cfg: _,
                 entry_point: _,
                 role: _,
             } => {

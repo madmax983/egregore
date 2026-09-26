@@ -81,7 +81,27 @@ pub(crate) fn print_daemon_symbol_record(
             // fabricated value.
             let role_suffix =
                 daemon_record_role(rec).map_or(String::new(), |r| format!(" [{}]", r.as_str()));
-            println!("{name} ({kind}) @ {path}:{line}{commit}{role_suffix}");
+            // Conditional-compilation gates (issue #190); absent on records
+            // from a store that predates it or on ungated items, and then
+            // printed as nothing — never a fabricated gate. The ` && ` join
+            // mirrors the conjunction semantics; the JSON array is
+            // authoritative.
+            let cfg_suffix =
+                rec.get("cfg")
+                    .and_then(|value| value.as_array())
+                    .map_or(String::new(), |gates| {
+                        let joined = gates
+                            .iter()
+                            .filter_map(|gate| gate.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" && ");
+                        if joined.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [cfg: {joined}]")
+                        }
+                    });
+            println!("{name} ({kind}) @ {path}:{line}{commit}{role_suffix}{cfg_suffix}");
         }
     }
     Ok(())
@@ -321,6 +341,11 @@ pub(crate) fn symbol_row<'a>(
         corpus_mode_source: None,
         corpus_disclaimer: None,
         role: record.role(),
+        // Conditional-compilation gates (issue #190): the row IS the
+        // symbol's record, so its gate chain rides along like every other
+        // `eg query symbol` field. Absent for ungated symbols and for
+        // records that predate issue #190 — never fabricated.
+        cfg: record.cfg(),
     })
 }
 
@@ -534,6 +559,14 @@ impl PrintText for SymbolResult<'_> {
         // and rendering "production" would fabricate a negative fact.
         if let Some(role) = self.role {
             let _ = write!(text, "\n  role: {}", role.as_str());
+        }
+        // Conditional-compilation gates (issue #190). An ABSENT field prints
+        // NOTHING: the record predates issue #190 or the item is ungated, and
+        // rendering a gate would fabricate a compilation fact. The chain
+        // reads outermost gate first; the ` && ` join mirrors the conjunction
+        // semantics — the JSON array is authoritative.
+        if let Some(gates) = self.cfg {
+            let _ = write!(text, "\n  cfg: {}", gates.join(" && "));
         }
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and

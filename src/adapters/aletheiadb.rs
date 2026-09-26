@@ -2727,6 +2727,7 @@ impl EmbeddedAletheiaSink {
             route,
             deprecated,
             lint_suppression,
+            cfg,
             entry_point,
             role,
             crate_attribution,
@@ -2878,6 +2879,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(facts)
         {
             builder = builder.insert("lint_suppression_json", json.as_str());
+        }
+        // Conditional-compilation gates (issue #190). Paired with the read
+        // at `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(gates) = cfg
+            && let Ok(json) = serde_json::to_string(gates)
+        {
+            builder = builder.insert("cfg_json", json.as_str());
         }
         // Entry-point facts (issue #240). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3704,6 +3712,14 @@ impl EmbeddedAletheiaSink {
             .map_err(|e| {
                 read_back_error(record_id, format!("lint_suppression_json invalid: {e}"))
             })?,
+            // Conditional-compilation gates (issue #190). The read MUST
+            // mirror the write, for the same structural-equality reason as
+            // above.
+            cfg: optional_str_property(record_id, "cfg_json", node.get_property("cfg_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("cfg_json invalid: {e}")))?,
             // Entry-point facts (issue #240). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make

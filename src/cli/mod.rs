@@ -6359,6 +6359,18 @@ pub(crate) struct SymbolResult<'a> {
     /// prints nothing for an absent role rather than fabricating one.
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically gating the
+    /// row's record, outermost gate first (file `#![cfg]` inner attributes,
+    /// then enclosing gated items/modules, then the item's own attributes).
+    /// Each entry is the predicate exactly as written — never evaluated.
+    ///
+    /// OMITTED entirely for a record produced before issue #190, and for an
+    /// ungated record — gate UNKNOWN-or-absent, which is a different fact
+    /// from a present chain. The text render likewise prints nothing for an
+    /// absent chain rather than fabricating a gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a Vec<String>>,
 }
 
 /// Resolves the effective corpus mode for a current-state code lane and,

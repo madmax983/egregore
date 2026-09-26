@@ -281,6 +281,18 @@ pub struct OutOfLineModFact {
     /// resolved against the wrong directory.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub under_inline_path_override: bool,
+    /// The declaration's full conditional-compilation gate chain
+    /// (issue #190): the declaring file's `#![cfg(...)]` inner attributes,
+    /// then enclosing gated items/modules outermost-first, then the `mod x;`
+    /// item's own `#[cfg(...)]` / `#[cfg_attr(...)]` predicates. The
+    /// repo-wide [`apply_out_of_line_cfg_gates`] pass prepends this chain to
+    /// every record of the target file, so the module file's symbols carry
+    /// the same gate the declaration does. Empty when the declaration is
+    /// ungated — an ungated declaration contributes no inherited gates
+    /// (mirroring the dual-use production-precedence rule: a file also
+    /// loaded ungated compiles without the gate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cfg_gates: Vec<String>,
 }
 
 /// An IMPLEMENTS-eligible trait/type definition exported for the repo-wide
@@ -462,6 +474,15 @@ pub struct FileFacts {
     /// self-dispatch call-resolution join (issue #414).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub impl_trait_relations: Vec<ImplTraitRelationFact>,
+    /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates from `#![…]`
+    /// inner attributes at the file top level (issue #190). Not a cross-file
+    /// resolution fact — it rides `FileFacts` as the single channel from the
+    /// per-file extractor back to the scan funnel, which stamps it on the
+    /// `File` node. Skipped when empty so the incremental cache format is
+    /// unchanged for ungated files; deliberately NOT part of `is_empty` (a
+    /// file can carry gates without exporting resolution facts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_cfg_gates: Vec<String>,
 }
 
 impl FileFacts {
@@ -1017,6 +1038,133 @@ pub fn apply_out_of_line_test_roles(
         {
             *role = Some(SymbolRole::Test);
         }
+    }
+}
+
+/// Propagates conditional-compilation gates across out-of-line module
+/// declarations (issue #190).
+///
+/// A `#[cfg(feature = "x")] mod foo;` declaration gates the whole target
+/// file, which is extracted with no view
+/// of the gating attribute. The repo-wide pass prepends each declaration's
+/// gate chain to every `File` / `Symbol` / `Module` record of the resolved
+/// target file, outermost gate first.
+///
+/// Composition rule (deterministic, documented in `docs/cli/query.md`):
+/// - A target file inherits the *effective* chain of each declaration loading
+///   it: the declaring file's own inherited gates, then the declaration's
+///   extracted chain (declaring file's `#![cfg]` inner attributes, enclosing
+///   gated items outermost-first, the `mod x;` item's own predicates).
+/// - Transitivity falls out of the fixpoint: when `a.rs` declares
+///   `#[cfg(x)] mod b;` and `b.rs` declares `#[cfg(y)] mod c;`, `c`'s records
+///   carry `[x, y]` — `b`'s inherited `[x]` prefixes `b`'s declaration chain
+///   `[y]`.
+/// - Dual-use declarations: if ANY declaration loading the target is
+///   effectively ungated (empty chain), the target inherits nothing — the
+///   file compiles without the gate, mirroring the test-role pass's
+///   production-precedence rule. Otherwise the target inherits the union of
+///   all effective chains, deduplicated, declaring files in sorted order and
+///   declarations in fact order.
+/// - A record's own gates are never dropped or reordered: inherited gates are
+///   prepended, then exact-duplicate predicates collapse (first occurrence
+///   wins), so re-running the pass over already-stamped records is a no-op.
+///
+/// Recomputed over the whole assembled graph every scan — never cached — so a
+/// gating change in a parent file re-gates an unchanged module file's cached
+/// records correctly. The stamping is idempotent, so incremental reassembly
+/// cannot double-apply it.
+pub fn apply_out_of_line_cfg_gates(
+    records: &mut [GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) {
+    let known_paths = known_file_paths(records, facts_by_file);
+    // Resolve every out-of-line declaration once into (target, declaring
+    // file, extracted chain) triples.
+    let mut declarations: Vec<(String, String, Vec<String>)> = Vec::new();
+    for (file, facts) in facts_by_file {
+        for fact in &facts.out_of_line_mods {
+            if let Some(target) = resolve_out_of_line_target(file, fact, &known_paths) {
+                declarations.push((target, file.clone(), fact.cfg_gates.clone()));
+            }
+        }
+    }
+    if declarations.is_empty() {
+        return;
+    }
+
+    // Fixpoint over declaring files' inherited gates: a declaring file's own
+    // inherited gates prefix every chain it contributes. Monotone growth over
+    // a finite predicate universe — terminates. `BTreeMap` iteration keeps
+    // the union order deterministic.
+    let mut inherited: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        // Per-target effective chains under the current `inherited` map.
+        let mut target_chains: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+        for (target, declaring_file, chain) in &declarations {
+            let mut effective = inherited.get(declaring_file).cloned().unwrap_or_default();
+            effective.extend(chain.iter().cloned());
+            target_chains
+                .entry(target.clone())
+                .or_default()
+                .push(effective);
+        }
+        for (target, chains) in &target_chains {
+            // Ungated wins: any effectively-ungated declaration means the
+            // target compiles without a gate.
+            if chains.iter().any(Vec::is_empty) {
+                if inherited.remove(target).is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            let mut union: Vec<String> = Vec::new();
+            for chain in chains {
+                for gate in chain {
+                    if !union.contains(gate) {
+                        union.push(gate.clone());
+                    }
+                }
+            }
+            if inherited.get(target) != Some(&union) {
+                inherited.insert(target.clone(), union);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if inherited.is_empty() {
+        return;
+    }
+
+    for record in records.iter_mut() {
+        let GraphRecord::Node {
+            kind: NodeKind::File | NodeKind::Symbol | NodeKind::Module,
+            repo_relative_path: Some(path),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let Some(prefix) = inherited.get(path.as_str()) else {
+            continue;
+        };
+        if prefix.is_empty() {
+            continue;
+        }
+        let existing = record.cfg().cloned().unwrap_or_default();
+        let mut merged = prefix.clone();
+        for gate in existing {
+            if !merged.contains(&gate) {
+                merged.push(gate);
+            }
+        }
+        // `with_cfg` consumes the record; clone, stamp, and write back.
+        // Every record reaching this point has a non-empty merged chain.
+        let stamped = record.clone().with_cfg(merged);
+        *record = stamped;
     }
 }
 
@@ -5165,6 +5313,7 @@ mod tests {
                     test_gated: false,
                     path_override: None,
                     under_inline_path_override: false,
+                    cfg_gates: Vec::new(),
                 })
                 .collect(),
             ..FileFacts::default()
@@ -6526,6 +6675,7 @@ mod tests {
             test_gated,
             path_override: None,
             under_inline_path_override: false,
+            cfg_gates: Vec::new(),
         }
     }
 
@@ -6707,6 +6857,277 @@ mod tests {
             file_role(&records, "src/helpers/inner.rs"),
             Some(crate::ir::SymbolRole::Test),
             "transitive submodule of a test-only module must be test"
+        );
+    }
+
+    // ── Out-of-line cfg-gate propagation (issue #190) ─────────────────────
+
+    /// One out-of-line `mod <name>;` fact with an explicit cfg gate chain.
+    fn cfg_gated_mod_fact(name: &str, gates: &[&str]) -> OutOfLineModFact {
+        OutOfLineModFact {
+            name: name.to_owned(),
+            inline_module_path: Vec::new(),
+            test_gated: false,
+            path_override: None,
+            under_inline_path_override: false,
+            cfg_gates: gates.iter().map(|gate| (*gate).to_owned()).collect(),
+        }
+    }
+
+    fn record_cfg(records: &[GraphRecord], id: &str) -> Option<Vec<String>> {
+        records
+            .iter()
+            .find(|record| record.id() == id)
+            .unwrap_or_else(|| panic!("record `{id}` should exist"))
+            .cfg()
+            .cloned()
+    }
+
+    fn file_cfg(records: &[GraphRecord], path: &str) -> Option<Vec<String>> {
+        record_cfg(records, &format!("file:{path}"))
+    }
+
+    #[test]
+    fn out_of_line_cfg_gated_module_file_inherits_gates() {
+        // `#[cfg(feature = "x")] mod helpers;` in src/lib.rs → the whole
+        // target file's records carry the declaration's gate chain.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/helpers.rs"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "gated out-of-line module file inherits the declaration gate"
+        );
+        assert_eq!(
+            record_cfg(&records, "symbol:src/helpers.rs#helper"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "the module file's symbols inherit the declaration gate"
+        );
+        assert_eq!(
+            file_cfg(&records, "src/lib.rs"),
+            None,
+            "the declaring file is never re-gated by its own declaration"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_gates_are_transitive() {
+        // `#[cfg(x)] mod b;` in lib.rs and `#[cfg(y)] mod c;` in b.rs →
+        // b/c.rs carries [x, y]: the declaring file's inherited gates prefix
+        // the declaration's own chain. Paths follow real Rust module
+        // resolution: `mod b;` in the crate root is src/b.rs, and `mod c;`
+        // in src/b.rs is src/b/c.rs.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("b", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/b.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("c", &[r#"feature = "y""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/b/c.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/b.rs"),
+            file_record("src/b/c.rs"),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/b.rs"),
+            Some(vec![r#"feature = "x""#.to_owned()]),
+            "direct target inherits the declaration gate"
+        );
+        assert_eq!(
+            file_cfg(&records, "src/b/c.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "y""#.to_owned()
+            ]),
+            "transitive target accumulates gates outermost-first"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_ungated_declaration_wins() {
+        // Dual-use module file: loaded ungated by src/lib.rs and gated by
+        // src/other.rs. It compiles without the gate, so it inherits nothing
+        // — mirroring the test-role pass's production precedence.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/other.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/other.rs"),
+            file_record("src/shared.rs"),
+            symbol_record(
+                "shared_fn",
+                "src/shared.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/shared.rs"),
+            None,
+            "a file also loaded ungated inherits no gates"
+        );
+        assert_eq!(
+            record_cfg(&records, "symbol:src/shared.rs#shared_fn"),
+            None,
+            "ungated precedence extends to the dual-use file's symbols"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_unions_gated_declarations() {
+        // Two gated declarations load one file: the target inherits the
+        // union, declaring files in sorted order. Both declarations come
+        // from crate roots (lib.rs and main.rs) so that `mod shared;`
+        // resolves to the same src/shared.rs under real Rust module
+        // resolution.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/main.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("shared", &[r#"feature = "y""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/shared.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/main.rs"),
+            file_record("src/shared.rs"),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/shared.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "y""#.to_owned()
+            ]),
+            "all-gated dual use inherits the union in declaring-file order"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_prepends_before_existing_gates() {
+        // A target file with its own `#![cfg]` inner attributes keeps them;
+        // inherited gates prefix the chain, outermost first.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs").with_cfg(vec![r#"feature = "file""#.to_owned()]),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            file_cfg(&records, "src/helpers.rs"),
+            Some(vec![
+                r#"feature = "x""#.to_owned(),
+                r#"feature = "file""#.to_owned()
+            ]),
+            "inherited gates prepend before the file's own gates"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_pass_is_idempotent() {
+        // Re-running the pass over already-stamped records is a no-op, so
+        // incremental reassembly cannot double-apply gates.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    out_of_line_mods: vec![cfg_gated_mod_fact("helpers", &[r#"feature = "x""#])],
+                    ..FileFacts::default()
+                },
+            ),
+            ("src/helpers.rs".to_owned(), FileFacts::default()),
+        ]
+        .into_iter()
+        .collect();
+        let mut records = vec![
+            file_record("src/lib.rs"),
+            file_record("src/helpers.rs"),
+            symbol_record(
+                "helper",
+                "src/helpers.rs",
+                crate::ir::SymbolRole::Production,
+            ),
+        ];
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        let once = records.clone();
+        apply_out_of_line_cfg_gates(&mut records, &facts);
+        assert_eq!(
+            records, once,
+            "a second pass run must not change already-stamped records"
         );
     }
 }

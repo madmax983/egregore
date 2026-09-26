@@ -921,6 +921,7 @@ fn make_node(
     GraphRecord::Node {
         deprecated: None,
         lint_suppression: None,
+        cfg: None,
         entry_point: None,
         role: None,
         id,

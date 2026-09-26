@@ -758,6 +758,46 @@ unscoped one. On `--daemon` the filter applies client-side. Full contract,
 including the closed signal set and the out-of-line propagation rule, in
 [`test-production-roles.md`](test-production-roles.md).
 
+## Conditional-compilation gates (`cfg`, issue #190)
+
+Every Rust `Symbol`, `Module`, and `File` record carries a deterministic `cfg`
+gate chain — the normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates
+lexically gating the item — derived from source signals only. Each entry is the
+predicate **exactly as written** (interior whitespace collapsed), e.g.
+`"feature = \"embedded-aletheiadb\""`; predicates are recorded, never
+evaluated, satisfied, or expanded.
+
+Composition rule — outermost gate first:
+1. the file's `#![cfg(...)]` / `#![cfg_attr(...)]` inner attributes,
+2. every enclosing gated item or module, outermost first (an inline module's
+   own `#![cfg(...)]` body attributes gate the module, so they travel with
+   its outer attributes),
+3. the item's own `#[cfg(...)]` / `#[cfg_attr(...)]` attributes, in source order.
+
+The item's effective compilation gate is the conjunction of the `#[cfg(...)]`
+entries. A `#[cfg_attr(predicate, …)]` entry records the predicate gating that
+attribute's application — not the item's compilation — so
+conditional-compilation facts are never silently dropped.
+
+Out-of-line modules: a `#[cfg(...)] mod x;` declaration's full chain is
+prepended to every `File` / `Symbol` / `Module` record of the target file by a
+repo-wide pass (transitive — gates accumulate through chains of gated
+declarations). If any declaration loading the file is ungated, the file
+inherits no gates: it compiles without them. When several gated declarations
+load one file, the target inherits the union of their chains.
+
+The chain is **additive metadata, never an identity input**: it does not
+contribute to stable record IDs. An absent `cfg` key means the record predates
+issue #190 or the item is ungated — unknown-or-absent, never a fabricated
+gate. In `--format text` an absent field prints nothing; a present chain
+renders as `cfg: <gate> && <gate>` (the JSON array is authoritative).
+
+`eg query symbol` and `eg query file` expose `cfg` on every row in JSON and
+text, including the `--at` / `--as-of` temporal lanes and daemon records.
+Only the AST is read: comments, string literals, and doc text never mint
+gates. Out of scope: evaluating feature sets or target semantics, Cargo
+feature graphs, temporal cfg diffs, and cfg linting.
+
 ## Repository scope (`--repo`, issue #67)
 
 A shared local store can hold more than one repository, and two repositories

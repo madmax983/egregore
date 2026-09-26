@@ -161,6 +161,10 @@ pub(crate) fn query_file(
             // The row IS the symbol's record, so its role rides along like
             // every other `eg query symbol` field (issue #238).
             role: r.role(),
+            // Likewise the conditional-compilation gate chain (issue #190):
+            // `docs/cli/query.md` promises these rows carry every `eg query
+            // symbol` field but visibility/signature/doc.
+            cfg: r.cfg(),
         });
     }
 
@@ -303,8 +307,18 @@ pub(crate) fn query_file_at_point(
                         let role_suffix = row
                             .role
                             .map_or(String::new(), |r| format!(" [{}]", r.as_str()));
+                        // Conditional-compilation gates (issue #190); absent
+                        // on records that predate it or are ungated, and then
+                        // printed as nothing — never a fabricated gate.
+                        let cfg_suffix = row.cfg.as_ref().map_or(String::new(), |gates| {
+                            if gates.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [cfg: {}]", gates.join(" && "))
+                            }
+                        });
                         println!(
-                            "{} (Symbol) @ {}:{line} [{}]{role_suffix}",
+                            "{} (Symbol) @ {}:{line} [{}]{role_suffix}{cfg_suffix}",
                             row.name, row.repo_relative_path, row.commit
                         );
                     }

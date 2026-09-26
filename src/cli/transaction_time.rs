@@ -41,6 +41,12 @@ pub(crate) struct TxSymbolRow<'a> {
     /// records that predate issue #238 (role unknown, never fabricated).
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a crate::ir::SymbolRole>,
+    /// Conditional-compilation gate chain (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically gating the
+    /// row's record, outermost gate first. Omitted for records that predate
+    /// issue #190 or are ungated (unknown-or-absent, never fabricated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a Vec<String>>,
 }
 
 /// Response envelope for `eg query symbol --tx-as-of`.
@@ -124,6 +130,11 @@ pub(crate) fn tx_symbol_row<'a>(
         extraction_completeness: completeness,
         diagnostics: None,
         role: record.role(),
+        // Conditional-compilation gates (issue #190): the row IS the
+        // symbol's record, so its gate chain rides along like every other
+        // `eg query symbol` field. Absent for ungated symbols and for
+        // records that predate issue #190 — never fabricated.
+        cfg: record.cfg(),
     })
 }
 

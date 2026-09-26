@@ -227,6 +227,9 @@ fn make_agent_memory_node(
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
         lint_suppression: None,
+        // Conditional-compilation gates (issue #190): test fixtures build
+        // plain nodes; ungated, so no `cfg` chain.
+        cfg: None,
     }
 }
 

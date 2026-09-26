@@ -17,8 +17,8 @@ use crate::{
     },
     languages::{
         common::{
-            SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
-            path_segments, reference_text, span,
+            SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges,
+            next_symbol_ordinal, node_name, path_segments, reference_text, span,
         },
         cross_file::{
             BlockLocalDefinitionFact, CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact,
@@ -97,11 +97,22 @@ pub fn extract_file_source(
             path: file.path.clone(),
         })?;
 
-    let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
+    let mut extractor = RustExtractor::new(
+        file,
+        file_id,
+        repository_id,
+        graph,
+        source,
+        file_level_cfg_gates(tree.root_node(), source),
+    );
     extractor.walk(tree.root_node());
     extractor.resolve_pending_impl_edges();
     extractor.finalize_use_imports();
     extractor.emit_reference_edges();
+    // File-level `#![cfg(...)]` gates (issue #190): the scan funnel stamps
+    // them on the `File` node it emitted before extraction, so the file's own
+    // record carries the same gate every symbol in it inherits.
+    extractor.facts.file_cfg_gates = extractor.file_cfg_gates.clone();
     Ok(extractor.facts)
 }
 
@@ -233,6 +244,11 @@ struct RustExtractor<'graph, 'source> {
     /// Depth of enclosing test scopes (`#[cfg(test)]` modules and `#[test]`
     /// functions). Non-zero means panic-risk call sites classify as `test`.
     test_scope_depth: usize,
+    /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates from `#![…]`
+    /// inner attributes at the file top level (issue #190). They gate the
+    /// whole file, so they lead every symbol's gate chain and are exported
+    /// on [`FileFacts`](cross_file::FileFacts) for the `File` node.
+    file_cfg_gates: Vec<String>,
     /// `true` when the whole file lives under a top-level `tests/` or
     /// `benches/` directory (Cargo's integration-test and bench roots).
     file_in_test_root: bool,
@@ -283,6 +299,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         repository_id: &'source str,
         graph: &'graph mut Graph,
         source: &'source str,
+        file_cfg_gates: Vec<String>,
     ) -> Self {
         Self {
             file,
@@ -312,6 +329,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             inline_module_stack: Vec::new(),
             inline_path_override_depth: 0,
             test_scope_depth: 0,
+            file_cfg_gates,
             file_in_test_root: path_segments(&file.repo_relative_path)
                 .first()
                 .is_some_and(|segment| segment == "tests" || segment == "benches"),
@@ -367,29 +385,40 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // reachability queries (issue #213) can resolve the module chain
         // without re-parsing source. Additive per
         // `docs/schema/schema-versioning.md §2`; never an identity input.
+        let mut module_record = GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::Module,
+            self.file.repo_relative_path.clone(),
+            span(node),
+            qualified_name.clone(),
+            "rust",
+            format!("Rust module {qualified_name}"),
+        )
+        .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
+        // Test-vs-production role (issue #238): a `#[cfg(test)] mod`
+        // declaration is itself the lexical gate, so the Module record
+        // carries the same role its member symbols get. Stamped before
+        // the scope counter is entered for the module's children.
+        .with_role(self.symbol_role(node));
+        // Conditional-compilation gates (issue #190): the module's own
+        // `#[cfg(...)]` / `#[cfg_attr(...)]` predicates plus every enclosing
+        // gated item/module, outermost first. Member symbols inherit this
+        // chain through the parent-chain walk. Stamped only when non-empty —
+        // ungated modules carry no `cfg` field. Additive, never an identity
+        // input.
+        let module_cfg_gates = self.cfg_gate_chain(node);
+        if !module_cfg_gates.is_empty() {
+            module_record = module_record.with_cfg(module_cfg_gates);
+        }
         self.graph.push(
-            GraphRecord::syntax_node(
-                id.clone(),
-                NodeKind::Module,
-                self.file.repo_relative_path.clone(),
-                span(node),
-                qualified_name.clone(),
-                "rust",
-                format!("Rust module {qualified_name}"),
-            )
-            .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
-            // Test-vs-production role (issue #238): a `#[cfg(test)] mod`
-            // declaration is itself the lexical gate, so the Module record
-            // carries the same role its member symbols get. Stamped before
-            // the scope counter is entered for the module's children.
-            .with_role(self.symbol_role(node))
-            // The module summary is name-only, so a body change with an
-            // unchanged name would hash identically. Stamp a compact BLAKE3
-            // handle over the normalized body so evidence-freshness drift stays
-            // content-detectable (issue #206). Inline `mod foo { .. }` covers
-            // the whole body; out-of-line `mod foo;` covers just the
-            // declaration (the target file's own records carry its body).
-            .with_content_signature(content_signature(self.node_text(node))),
+            module_record
+                // The module summary is name-only, so a body change with an
+                // unchanged name would hash identically. Stamp a compact BLAKE3
+                // handle over the normalized body so evidence-freshness drift stays
+                // content-detectable (issue #206). Inline `mod foo { .. }` covers
+                // the whole body; out-of-line `mod foo;` covers just the
+                // declaration (the target file's own records carry its body).
+                .with_content_signature(content_signature(self.node_text(node))),
         );
         self.add_edge(
             EdgeLabel::Contains,
@@ -411,6 +440,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 test_gated: is_test_module || self.in_test_context(),
                 path_override: self.mod_path_override(node),
                 under_inline_path_override: self.inline_path_override_depth > 0,
+                // The declaration's full gate chain (issue #190): the target
+                // file's records inherit this via the repo-wide
+                // `apply_out_of_line_cfg_gates` pass. Computed before the
+                // module-name stack is pushed — the chain is a pure function
+                // of the AST parent chain plus the file's inner attributes,
+                // so stack state is irrelevant.
+                cfg_gates: self.cfg_gate_chain(node),
             });
         }
 
@@ -1637,6 +1673,19 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         }
     }
 
+    /// Builds the item's conditional-compilation gate chain (issue #190):
+    /// the file's `#![cfg(...)]` inner attributes first, then every enclosing
+    /// gated item/module outermost-first, then the item's own `#[cfg(...)]` /
+    /// `#[cfg_attr(...)]` predicates. Empty when the item is ungated — the
+    /// caller stamps nothing, so ungated records carry no `cfg` field. Pure
+    /// function of the AST: deterministic and walk-order independent.
+    fn cfg_gate_chain(&self, node: Node<'_>) -> Vec<String> {
+        let mut gates = self.file_cfg_gates.clone();
+        gates.extend(enclosing_cfg_gates(node, self.source));
+        gates.extend(own_cfg_gates(node, self.source));
+        gates
+    }
+
     /// `true` when the item carries a test-family attribute in the attribute
     /// items immediately preceding it: `#[test]`, `#[bench]`, or a path
     /// attribute ending in `::test` / `::bench` (e.g. `#[tokio::test]`),
@@ -2118,6 +2167,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // record — the classification is total, so there is no unknown case
         // at extraction time. Additive, never an identity input.
         record = record.with_role(self.symbol_role(node));
+        // Conditional-compilation gates (issue #190): the item's own
+        // predicates plus every enclosing gated item/module, outermost first.
+        // Stamped only when the chain is non-empty — ungated symbols carry no
+        // `cfg` field, never a fabricated gate. Additive, never an identity
+        // input.
+        let cfg_gates = self.cfg_gate_chain(node);
+        if !cfg_gates.is_empty() {
+            record = record.with_cfg(cfg_gates);
+        }
         self.graph.push(record);
         self.add_edge(
             EdgeLabel::Defines,
@@ -3845,6 +3903,234 @@ fn deprecation_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<
         }
     }
     Some(DeprecationMark { since, note })
+}
+
+/// Splits `text` on `delimiter` at the top nesting level only, ignoring
+/// delimiters inside `(`/`[`/`{` pairs, string/character literals (with
+/// backslash escapes), and line/block comments. Yields the segments in order;
+/// deterministic. Used to isolate the predicate of a
+/// `#[cfg_attr(predicate, …)]` gate from its attribute payload without
+/// mis-splitting on commas inside nested predicates or string literals
+/// (issue #190).
+fn split_top_level(text: &str, delimiter: char) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut segment_start = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '"' | '\'' => {
+                // Skip the literal body; a backslash escapes the next char.
+                let quote = ch;
+                let mut escaped = false;
+                for (_, literal_ch) in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if literal_ch == '\\' {
+                        escaped = true;
+                    } else if literal_ch == quote {
+                        break;
+                    }
+                }
+            }
+            '/' => {
+                // Skip `//…` and `/*…*/` comments so a delimiter inside one
+                // never splits.
+                match chars.peek() {
+                    Some((_, '/')) => {
+                        for (_, comment_ch) in chars.by_ref() {
+                            if comment_ch == '\n' {
+                                break;
+                            }
+                        }
+                    }
+                    Some((_, '*')) => {
+                        chars.next();
+                        let mut previous = '\0';
+                        for (_, comment_ch) in chars.by_ref() {
+                            if previous == '*' && comment_ch == '/' {
+                                break;
+                            }
+                            previous = comment_ch;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                if ch == delimiter && depth == 0 {
+                    segments.push(&text[segment_start..index]);
+                    segment_start = index + ch.len_utf8();
+                }
+            }
+        }
+    }
+    segments.push(&text[segment_start..]);
+    segments
+}
+
+/// Normalizes a `#[cfg(...)]` / `#[cfg_attr(...)]` predicate (issue #190):
+/// comment trivia is stripped first, then runs of whitespace collapse to a
+/// single space. AC8 demands the recorded gate never include comments — a
+/// predicate like `feature = /* why */ "x"` records as `feature = "x"`.
+/// String and character literals are respected by the stripper: a `//`
+/// inside `"a//b"` is predicate text, not a comment.
+fn normalize_cfg_predicate(predicate: &str) -> String {
+    collapse_whitespace(&strip_comments_keep_newlines(predicate))
+}
+
+/// Parses an `attribute` node (the inner node of a `#[…]` / `#![…]`
+/// attribute item) into its normalized cfg predicate when the attribute's own
+/// name leaf is exactly `cfg` or `cfg_attr` (issue #190). Tree-sitter node
+/// walking only, never regex.
+///
+/// The predicate is the verbatim source text of the attribute's first
+/// top-level argument — `#[cfg(feature = "embedded-aletheiadb")]` yields
+/// `feature = "embedded-aletheiadb"`, and
+/// `#[cfg_attr(feature = "x", allow(dead_code))]` yields `feature = "x"` —
+/// with comment trivia stripped and interior whitespace collapsed
+/// deterministically. It is recorded, never evaluated, satisfied, or
+/// expanded. Returns `None` for every other attribute and for malformed
+/// gates with no predicate text (`#[cfg]`, `#[cfg()]`).
+fn cfg_predicate_from_attribute_node(attribute: Node<'_>, source: &str) -> Option<String> {
+    let name_node = attribute.named_child(0)?;
+    let raw_name = node_source(name_node, source).trim();
+    let leaf = raw_name
+        .rsplit("::")
+        .next()
+        .map_or_else(|| raw_name.trim(), str::trim);
+    if !matches!(leaf, "cfg" | "cfg_attr") {
+        return None;
+    }
+    let arguments = attribute.child_by_field_name("arguments")?;
+    let arguments_text = node_source(arguments, source);
+    let inner = arguments_text
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))?;
+    split_top_level(inner, ',')
+        .into_iter()
+        .next()
+        .map(normalize_cfg_predicate)
+        .filter(|text| !text.is_empty())
+}
+
+/// Parses one `attribute_item` (`#[…]`) into its normalized cfg predicate
+/// when it is a `#[cfg(...)]` / `#[cfg_attr(...)]` gate (issue #190).
+/// Inner `#![…]` items never match here — they apply to the enclosing item,
+/// not the following one; file-level inner attributes are collected by
+/// [`file_level_cfg_gates`].
+fn cfg_predicate_from_attribute(attribute_item: Node<'_>, source: &str) -> Option<String> {
+    if attribute_item.kind() != "attribute_item" {
+        return None;
+    }
+    let attribute = first_descendant_of_kind(attribute_item, "attribute")?;
+    cfg_predicate_from_attribute_node(attribute, source)
+}
+
+/// Collects the normalized cfg predicates from the `attribute_item` siblings
+/// immediately preceding `node`, in source order (issue #190). Comments are
+/// skipped; any other sibling terminates the scan — the same lexical rule the
+/// doc/visibility/deprecation extractors use, so one attribute block never
+/// leaks onto a neighboring item. Inner `#![…]` attributes are NOT collected
+/// here: they apply to the enclosing item, not the following one — except for
+/// an inline module's own body, whose inner attributes gate the module itself
+/// ([`module_inner_cfg_gates`]) and are appended after the outer attributes.
+fn own_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut gates = Vec::new();
+    let mut current = node.prev_sibling();
+    while let Some(sibling) = current {
+        match sibling.kind() {
+            "attribute_item" => {
+                if let Some(predicate) = cfg_predicate_from_attribute(sibling, source) {
+                    gates.push(predicate);
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        current = sibling.prev_sibling();
+    }
+    gates.reverse();
+    gates.extend(module_inner_cfg_gates(node, source));
+    gates
+}
+
+/// Collects the cfg predicates of every lexically enclosing item, outermost
+/// first (issue #190). Walks the Tree-sitter parent chain: each ancestor's own
+/// `#[cfg(...)]` / `#[cfg_attr(...)]` attributes contribute their predicates,
+/// so a symbol under `#[cfg(feature = "a")] mod m` inherits
+/// `feature = "a"` before its own gates. Ancestor order is reversed, but each
+/// ancestor's own attributes stay in source order — reversing the flat vector
+/// would scramble per-ancestor attribute order. Pure function of the AST —
+/// deterministic and independent of walk order.
+fn enclosing_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut per_ancestor: Vec<Vec<String>> = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        per_ancestor.push(own_cfg_gates(parent, source));
+        current = parent.parent();
+    }
+    per_ancestor.into_iter().rev().flatten().collect()
+}
+
+/// Collects the normalized cfg predicates from `#![cfg(...)]` /
+/// `#![cfg_attr(...)]` inner attributes in an inline module's body (issue
+/// #190). They apply to the enclosing module — `mod m { #![cfg(feature =
+/// "x")] … }` gates `m` itself — so they belong to the module's own gate
+/// chain and are inherited by its members through the parent-chain walk.
+/// Returns empty for every other node kind: inner attributes in function
+/// bodies apply to the block expression, a different semantic, and stay out
+/// of scope.
+fn module_inner_cfg_gates(node: Node<'_>, source: &str) -> Vec<String> {
+    if node.kind() != "mod_item" {
+        return Vec::new();
+    }
+    let mut gates = Vec::new();
+    let Some(body) = node.child_by_field_name("body") else {
+        return gates;
+    };
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "inner_attribute_item" {
+            continue;
+        }
+        let Some(attribute) = first_descendant_of_kind(child, "attribute") else {
+            continue;
+        };
+        if let Some(predicate) = cfg_predicate_from_attribute_node(attribute, source) {
+            gates.push(predicate);
+        }
+    }
+    gates
+}
+
+/// Collects the normalized cfg predicates from `#![cfg(...)]` /
+/// `#![cfg_attr(...)]` inner attributes that are direct children of the file
+/// root (issue #190). They gate the whole file: the extractor leads every
+/// symbol's gate chain with them and exports them on `FileFacts` for the
+/// `File` node. `#![…]` attributes nested in an inline module's body gate
+/// that module, not the file — they are collected by
+/// [`module_inner_cfg_gates`]. Inner attributes anywhere else (a function
+/// body) apply to the block expression, a different semantic, and stay out
+/// of scope.
+fn file_level_cfg_gates(root: Node<'_>, source: &str) -> Vec<String> {
+    debug_assert_eq!(root.kind(), "source_file");
+    let mut gates = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "inner_attribute_item" {
+            continue;
+        }
+        let Some(attribute) = first_descendant_of_kind(child, "attribute") else {
+            continue;
+        };
+        if let Some(predicate) = cfg_predicate_from_attribute_node(attribute, source) {
+            gates.push(predicate);
+        }
+    }
+    gates
 }
 
 /// Parses one `attribute_item` (`#[...]`) or `inner_attribute_item`
@@ -6751,6 +7037,308 @@ pub mod inner {
                 false
             )],
             "only an immediately adjacent comment is a justification signal"
+        );
+    }
+
+    // ── Conditional-compilation gates (issue #190, RED) ────────────────────
+    //
+    // These tests assert the ABSENT feature: `GraphRecord::Node` carries no
+    // `cfg` field on the base tree, so every assertion expecting a gate chain
+    // FAILS until the implementation lands. They inspect serialized JSON, so
+    // they compile against the base schema. (`cfg_attr` is deliberately absent
+    // from the fixtures: its attribute decoding is issue #191's scope; issue
+    // #190 records the controlling predicate once it decodes.)
+
+    /// Fixture: a directly-gated fn, a fn inheriting its enclosing module's
+    /// gate, and an ungated fn.
+    const CFG_GATE_FIXTURE: &str = r#"#[cfg(feature = "embedded-aletheiadb")]
+fn directly_gated() {}
+
+#[cfg(feature = "mod-gate")]
+mod gated_module {
+    fn inherited_fn() {}
+}
+
+fn ungated_fn() {}
+"#;
+
+    /// Fixture: a file-inner gate, inherited by every symbol in the file.
+    const CFG_FILE_INNER_FIXTURE: &str = r#"#![cfg(feature = "file-gate")]
+
+fn file_scoped_fn() {}
+"#;
+
+    /// Extracts `source` as `path` and returns every record as serialized
+    /// JSON, so the assertions compile against the base schema while probing
+    /// for the `cfg` key the implementation adds.
+    fn cfg_json_records(source: &str, path: &str) -> Vec<serde_json::Value> {
+        let file = SourceFile {
+            path: PathBuf::from(path),
+            repo_relative_path: path.to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).expect("record serializes"))
+            .collect()
+    }
+
+    /// Returns the `cfg` string chain for the record named `name`, or `None`
+    /// when the record — or the `cfg` key — is absent. Matches the record's
+    /// simple name or its qualified name (`mod_path::name`), since nested
+    /// symbols are stamped with their qualified name.
+    fn cfg_chain_for(records: &[serde_json::Value], name: &str) -> Option<Vec<String>> {
+        let qualified_suffix = format!("::{name}");
+        records
+            .iter()
+            .find(|value| {
+                value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|record_name| {
+                        record_name == name || record_name.ends_with(qualified_suffix.as_str())
+                    })
+            })
+            .and_then(|value| value.get("cfg"))
+            .and_then(serde_json::Value::as_array)
+            .map(|gates| {
+                gates
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+    }
+
+    /// Serializes one extraction of `source` to JSONL bytes.
+    fn cfg_jsonl_bytes(source: &str, path: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for record in cfg_json_records(source, path) {
+            out.extend_from_slice(
+                serde_json::to_string(&record)
+                    .expect("record serializes")
+                    .as_bytes(),
+            );
+            out.push(b'\n');
+        }
+        out
+    }
+
+    #[test]
+    fn cfg_direct_gate_is_recorded_on_symbol() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "directly_gated"),
+            Some(vec![r#"feature = "embedded-aletheiadb""#.to_owned()]),
+            "a #[cfg(...)] gate is recorded verbatim on the symbol"
+        );
+    }
+
+    #[test]
+    fn cfg_module_gate_is_inherited_by_members() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "inherited_fn"),
+            Some(vec![r#"feature = "mod-gate""#.to_owned()]),
+            "a symbol inherits its enclosing module's gate"
+        );
+    }
+
+    #[test]
+    fn cfg_ungated_symbol_carries_no_cfg_key() {
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        let record = records
+            .iter()
+            .find(|value| {
+                value.get("name").and_then(serde_json::Value::as_str) == Some("ungated_fn")
+            })
+            .expect("ungated_fn is extracted");
+        assert!(
+            record.get("cfg").is_none(),
+            "an ungated symbol carries no cfg key at all: {record}"
+        );
+    }
+
+    #[test]
+    fn cfg_file_inner_gate_is_inherited_by_symbols() {
+        let records = cfg_json_records(CFG_FILE_INNER_FIXTURE, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&records, "file_scoped_fn"),
+            Some(vec![r#"feature = "file-gate""#.to_owned()]),
+            "a #![cfg(...)] file-inner gate is inherited by the file's symbols"
+        );
+    }
+
+    #[test]
+    fn cfg_extraction_is_byte_stable_across_five_runs() {
+        let baseline = cfg_jsonl_bytes(CFG_GATE_FIXTURE, "src/lib.rs");
+        for _ in 1..5 {
+            assert_eq!(
+                cfg_jsonl_bytes(CFG_GATE_FIXTURE, "src/lib.rs"),
+                baseline,
+                "repeated extractions are byte-identical"
+            );
+        }
+        // The stability assertion is vacuous without the feature: the chain
+        // itself must be present.
+        let records = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        assert!(
+            cfg_chain_for(&records, "directly_gated").is_some(),
+            "the stable output actually carries cfg gates"
+        );
+    }
+
+    #[test]
+    fn cfg_gates_survive_crlf_and_path_separators() {
+        let lf = cfg_json_records(CFG_GATE_FIXTURE, "src/lib.rs");
+        let crlf_source = CFG_GATE_FIXTURE.replace('\n', "\r\n");
+        let crlf = cfg_json_records(&crlf_source, "src/lib.rs");
+        assert_eq!(
+            cfg_chain_for(&crlf, "directly_gated"),
+            cfg_chain_for(&lf, "directly_gated"),
+            "CRLF line endings yield the same gate chain as LF"
+        );
+        let backslash = cfg_json_records(CFG_GATE_FIXTURE, r"src\lib.rs");
+        assert_eq!(
+            cfg_chain_for(&backslash, "directly_gated"),
+            cfg_chain_for(&lf, "directly_gated"),
+            "backslash and slash paths yield the same gate chain"
+        );
+        assert!(
+            cfg_chain_for(&lf, "directly_gated").is_some(),
+            "the portable output actually carries cfg gates"
+        );
+    }
+
+    // ── Conditional-compilation gates (issue #190, GREEN) ───────────────────
+    //
+    // Behavior tests for the implementation: `cfg_attr` controlling
+    // predicates, comment/string decoys, multi-gate composition order, inline
+    // module inner attributes, and per-ancestor attribute order.
+
+    #[test]
+    fn cfg_attr_controlling_predicate_is_recorded() {
+        let records = cfg_json_records(
+            "#[cfg_attr(feature = \"attr-gate\", allow(dead_code))]\nfn attr_fn() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "attr_fn"),
+            Some(vec![r#"feature = "attr-gate""#.to_owned()]),
+            "cfg_attr records its controlling predicate, not the payload"
+        );
+    }
+
+    #[test]
+    fn cfg_comment_and_string_decoys_never_mint_gates() {
+        let source = "// #[cfg(feature = \"comment-gate\")]\n/// #[cfg(feature = \"doc-gate\")]\nconst MARKER: &str = \"#[cfg(feature = \\\"string-gate\\\")]\";\nfn decoy_fn() {}\n";
+        let records = cfg_json_records(source, "src/lib.rs");
+        let record = records
+            .iter()
+            .find(|value| value.get("name").and_then(serde_json::Value::as_str) == Some("decoy_fn"))
+            .expect("decoy_fn is extracted");
+        assert!(
+            record.get("cfg").is_none(),
+            "decoys in comments and strings never mint gates: {record}"
+        );
+        for value in &records {
+            if let Some(gates) = value.get("cfg").and_then(serde_json::Value::as_array) {
+                for gate in gates {
+                    let text = gate.as_str().unwrap_or_default();
+                    assert!(
+                        !text.contains("comment-gate")
+                            && !text.contains("doc-gate")
+                            && !text.contains("string-gate"),
+                        "no decoy gate leaks into any record: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cfg_doubly_gated_fn_composes_outermost_first() {
+        let records = cfg_json_records(
+            "#[cfg(feature = \"outer\")]\nmod outer_mod {\n    #[cfg(feature = \"inner\")]\n    fn double_fn() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "double_fn"),
+            Some(vec![
+                r#"feature = "outer""#.to_owned(),
+                r#"feature = "inner""#.to_owned()
+            ]),
+            "own gate composes after the inherited gate, outermost first"
+        );
+    }
+
+    #[test]
+    fn cfg_module_inner_attribute_gates_module_and_members() {
+        let records = cfg_json_records(
+            "mod inner_gated {\n    #![cfg(feature = \"inner-mod-gate\")]\n    fn member_fn() {}\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "member_fn"),
+            Some(vec![r#"feature = "inner-mod-gate""#.to_owned()]),
+            "a member inherits its module's #![cfg] inner attribute"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "inner_gated"),
+            Some(vec![r#"feature = "inner-mod-gate""#.to_owned()]),
+            "the module record carries its own #![cfg] inner attribute"
+        );
+    }
+
+    #[test]
+    fn cfg_ancestor_attribute_order_is_preserved() {
+        // Regression: the ancestor walk must reverse ancestor order only —
+        // reversing the flat vector scrambles each ancestor's own attribute
+        // order.
+        let records = cfg_json_records(
+            "#[cfg(feature = \"a\")]\n#[cfg(feature = \"b\")]\nmod outer {\n    #[cfg(feature = \"c\")]\n    #[cfg(feature = \"d\")]\n    mod inner {\n        fn deep_fn() {}\n    }\n}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "deep_fn"),
+            Some(vec![
+                r#"feature = "a""#.to_owned(),
+                r#"feature = "b""#.to_owned(),
+                r#"feature = "c""#.to_owned(),
+                r#"feature = "d""#.to_owned(),
+            ]),
+            "each ancestor's attributes stay in source order, outermost first"
+        );
+    }
+
+    #[test]
+    fn cfg_inline_comments_are_stripped_from_predicates() {
+        // AC8: the recorded gate is the predicate as written, minus comments —
+        // comment text never reaches the output. A `//` inside a string
+        // literal is predicate text, not a comment, and survives.
+        let records = cfg_json_records(
+            "#[cfg(feature = /* why gated */ \"comment-gate\")]\nfn block_commented_fn() {}\n\
+             #[cfg(\n    feature = // line comment inside the predicate\n    \"line-gate\",\n)]\nfn line_commented_fn() {}\n\
+             #[cfg(feature = \"slash//literal\")]\nfn slash_fn() {}\n",
+            "src/lib.rs",
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "block_commented_fn"),
+            Some(vec![r#"feature = "comment-gate""#.to_owned()]),
+            "an inline block comment inside the predicate is stripped"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "line_commented_fn"),
+            Some(vec![r#"feature = "line-gate""#.to_owned()]),
+            "an inline line comment inside the predicate is stripped"
+        );
+        assert_eq!(
+            cfg_chain_for(&records, "slash_fn"),
+            Some(vec![r#"feature = "slash//literal""#.to_owned()]),
+            "// inside a string literal is predicate text, not a comment"
         );
     }
 }

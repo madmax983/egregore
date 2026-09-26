@@ -437,6 +437,12 @@ fn scan_repository_at_with_override_inner(
     // by the same test-only-module resolution. Roles are re-stamped on every
     // scan, never cached.
     languages::cross_file::apply_out_of_line_test_roles(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(...)] mod x;` gate propagation (issue #190): the
+    // module file is extracted with no view of the gating attribute, so the
+    // repo-wide pass prepends each declaration's gate chain to every
+    // File/Symbol/Module record of the target file. Recomputed every scan,
+    // never cached; the stamping is idempotent.
+    languages::cross_file::apply_out_of_line_cfg_gates(graph.records_mut(), &facts_by_file);
 
     // Declared Cargo dependencies (issue #180): every manifest's directly-
     // declared dependencies become deterministic, citable graph facts joined
@@ -918,6 +924,21 @@ pub(crate) fn scan_source_text_records(
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
     let facts =
         parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
+    // Conditional-compilation gates on the `File` node (issue #190): the
+    // extractor exported the file's `#![cfg(...)]` / `#![cfg_attr(...)]`
+    // inner-attribute gates on `FileFacts`; stamp them on the File node
+    // emitted above so the file's own record carries the same gate every
+    // symbol in it inherits. The File node is the first record this funnel
+    // pushes, found by its stable id. Additive, never an identity input.
+    if !facts.file_cfg_gates.is_empty()
+        && let Some(file_record) = graph
+            .records_mut()
+            .iter_mut()
+            .find(|record| record.id() == file_id)
+    {
+        let stamped = file_record.clone().with_cfg(facts.file_cfg_gates.clone());
+        *file_record = stamped;
+    }
     Ok((graph.records().to_vec(), facts))
 }
 

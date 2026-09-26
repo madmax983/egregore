@@ -1327,6 +1327,25 @@ pub enum GraphRecord {
         /// input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lint_suppression: Option<LintSuppressionFacts>,
+        // ── Conditional-compilation gate facts (issue #190) ───────────────
+        /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates lexically
+        /// gating a `Symbol`, `Module`, or `File` node (issue #190). Each
+        /// entry is the predicate text exactly as written in source (interior
+        /// whitespace collapsed) — never evaluated, satisfied, or expanded.
+        /// Entries run outermost gate first: the file's `#![cfg(...)]` inner
+        /// attributes, then enclosing gated items/modules, then the item's
+        /// own attributes. The item's effective compilation gate is the
+        /// conjunction of the `#[cfg(...)]` entries; a `#[cfg_attr(pred, …)]`
+        /// entry records the predicate gating that attribute's application
+        /// (not the item's compilation) so conditional-compilation facts are
+        /// never silently dropped — see `docs/cli/query.md` for the full
+        /// composition rule. Absent when the item carries no gate — never a
+        /// fabricated `true`, never an empty vector. A
+        /// `TrustClass::SourceDerived` code-graph fact drawn from the AST —
+        /// no agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg: Option<Vec<String>>,
         // ── Entry-point facts (issue #240) ────────────────────────────────
         /// Non-call entry-point facts on a `Symbol` node (issue #240):
         /// presence means the item is a recognized non-call entry point — a
@@ -1941,6 +1960,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             lint_suppression: None,
+            cfg: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2078,6 +2098,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             lint_suppression: None,
+            cfg: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2214,6 +2235,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             lint_suppression: None,
+            cfg: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2355,6 +2377,7 @@ impl GraphRecord {
             route: None,
             deprecated: None,
             lint_suppression: None,
+            cfg: None,
             entry_point: None,
             role: None,
             crate_attribution: None,
@@ -2915,6 +2938,38 @@ impl GraphRecord {
             Self::Node {
                 lint_suppression, ..
             } => lint_suppression.as_ref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches the conditional-compilation gate chain to a `Symbol`,
+    /// `Module`, or `File` node record (issue #190): the normalized
+    /// `#[cfg(...)]` / `#[cfg_attr(...)]` predicates, outermost gate first
+    /// (file inner attributes, then enclosing gated items/modules, then the
+    /// item's own). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records. Callers pass a
+    /// non-empty chain — absent means ungated, never an empty vector.
+    #[must_use]
+    pub fn with_cfg(mut self, gates: Vec<String>) -> Self {
+        debug_assert!(
+            !gates.is_empty(),
+            "with_cfg must not stamp an empty gate chain: absent means ungated"
+        );
+        if let Self::Node { cfg, .. } = &mut self {
+            *cfg = Some(gates);
+        }
+        self
+    }
+
+    /// Returns the conditional-compilation gate chain when stamped
+    /// (issue #190), outermost gate first. `None` means the record predates
+    /// issue #190 or the item is ungated — unknown-or-absent, never a
+    /// fabricated gate.
+    #[must_use]
+    pub const fn cfg(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Node { cfg, .. } => cfg.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
