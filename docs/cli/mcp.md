@@ -2,7 +2,7 @@
 
 `eg mcp` is the **primary way a coding agent talks to Egregore**: a stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server exposing
-four **read-only**, citation-bearing tools backed by the running local
+five **read-only**, citation-bearing tools backed by the running local
 daemon. Register it once in your agent host; the agent then calls Egregore's
 evidence tools over MCP instead of shelling out to `eg query …` per question —
 which keeps tool discovery, the structured-output contract, and the citation
@@ -28,7 +28,7 @@ envelope intact.
    eg daemon status --data-dir /abs/path/to/.egregore   # confirm it is up
    ```
 
-   All four tools fail closed when no daemon answers for `--data-dir`
+   All five tools fail closed when no daemon answers for `--data-dir`
    (see [Error envelope](#error-envelope) — gate on it, don't retry blindly).
 
 3. **Register the server** in your agent host with one of the copy-paste
@@ -45,7 +45,8 @@ envelope intact.
    ```
 
    The first line must contain `"serverInfo":{"name":"egregore",…}` and the
-   third must list exactly `inspect_store`, `symbol_context`, `task_evidence`.
+   third must list exactly `inspect_store`, `symbol_context`, `task_evidence`,
+   `store_freshness`, `failure_history`.
    (This is the same handshake `tests/integration/mcp_stdio.rs` proves on
    every CI run.)
 
@@ -118,7 +119,7 @@ Every tool takes an optional `data_dir` argument (string, defaults to the
 `--data-dir` the server was started with) and returns a JSON text payload.
 The top-level shape is stable: **`"ok": true`** with data fields, or
 **`"ok": false`** with an `"error"` object — never a bare string, never an
-HTTP-style status. The four tool names are stable; the response is additive
+HTTP-style status. The five tool names are stable; the response is additive
 (fields may be added, existing fields are not renamed or removed without a
 contract change — tracked by issue #194).
 
@@ -193,6 +194,49 @@ Arguments: `{ "data_dir"?: string, "repo_path"?: string }`
 Stable `ok: true` fields: `freshness` — the same object the other tools stamp
 (see [Freshness stamping](#freshness-stamping)).
 
+### `failure_history`
+
+Prior failed attempts for a symbol, file, or task handle (issue #188) —
+the same answer as `eg query failures`, trust-separated for agents.
+Requires a running daemon.
+
+Arguments: `{ "handle": string (required, non-empty), "data_dir"?: string, "repo_path"?: string }`
+
+The `handle` resolves in `eg query failures` order: canonical code record
+ID, task/task-source handle, repo-relative file path, exact symbol name,
+source/provenance handle.
+
+Stable `ok: true` fields: `handle`, `target_type`
+(`symbol` | `file` | `task` | `source`), `target_ids`, then the
+trust-separated sections:
+
+| Field | Meaning |
+|---|---|
+| `runtime_failures` | runtime verification failures (trust `verification_evidence`) |
+| `agent_failures` | agent-authored failure claims (trust `agent_authored`) |
+| `superseding_successes` | later passing verifications (never hide the older failures) |
+| `patch_artifacts` | patch artifacts produced by the failures |
+| `diagnostics` | stable failure-history diagnostics (`code`, `source_record_id`, `target_handle`) |
+| `safety_note` | states the safety semantics: absence of recorded failure is not evidence of safety, and no failure cause is inferred |
+| `freshness` | store-freshness object (issue #220) — see [Freshness stamping](#freshness-stamping) |
+
+Every failure carries a stable `record_id`/evidence handle and a read-time
+`resolution_status` (`still_failing` | `since_resolved`); sections are
+canonically ordered oldest-first, so identical stores yield byte-identical
+output. Rows are redaction-safe: no raw transcript text, command
+stdout/stderr, or patch hunks appear anywhere — only hashes, handles,
+bounded summaries, and redaction markers.
+
+A resolved target with no recorded failures returns a successful,
+explicitly-empty answer (empty sections + `safety_note`) — distinct from an
+unresolvable handle.
+
+Stable error codes: `missing_argument` (empty `handle`), `unsupported_handle`
+(malformed canonical ID), `ambiguous_handle` (cross-repository collision, with
+`candidates`), `no_match` (handle resolved to nothing live),
+`stale_handle` (handle named only tombstoned records), plus the daemon codes
+below.
+
 ## Freshness stamping
 
 Every successful tool response carries a non-fatal, machine-readable
@@ -250,7 +294,6 @@ daemon HTTP API today. The tool surface is additive by design:
 - #181 — semantic-search tool
 - #182 — temporal-lookup tool
 - #183 — observation-write tool
-- #188 — failure-history tool
 - #220 — (further tool expansion)
 - #194 — freeze/version the MCP tool I/O contract
 

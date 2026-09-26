@@ -44,13 +44,14 @@ use serde_json::{Value, json};
 pub const MCP_CONTRACT_VERSION: u32 = 1;
 
 /// Tool names covered by the frozen contract, in `tool_router` registration
-/// order. Any new MCP tool (e.g. #181, #182, #183, #188) must extend this
+/// order. Any new MCP tool (e.g. #181, #182, #183) must extend this
 /// list and register its schema here before it ships.
-pub const MCP_CONTRACT_TOOLS: [&str; 4] = [
+pub const MCP_CONTRACT_TOOLS: [&str; 5] = [
     "inspect_store",
     "symbol_context",
     "task_evidence",
     "store_freshness",
+    "failure_history",
 ];
 
 /// Returns the published JSON Schema (Draft 2020-12) for a shipped tool's
@@ -72,6 +73,7 @@ pub fn response_schema(tool_name: &str) -> Option<Value> {
         "symbol_context" => Some(symbol_context_schema()),
         "task_evidence" => Some(task_evidence_schema()),
         "store_freshness" => Some(store_freshness_schema()),
+        "failure_history" => Some(failure_history_schema()),
         _ => None,
     }
 }
@@ -79,7 +81,7 @@ pub fn response_schema(tool_name: &str) -> Option<Value> {
 /// Returns the published JSON Schema (Draft 2020-12) for the stable error
 /// envelope (`ok: false`).
 ///
-/// Every MCP tool error — `no_match`, `ambiguous_handle`,
+/// Every MCP tool error — `no_match`, `stale_handle`, `ambiguous_handle`,
 /// `unsupported_handle`, `missing_argument`, `daemon_not_running`,
 /// `daemon_stale` — shares this envelope: `{"ok": false, "error": {"code":
 /// ..., ...}}`. The `code` is stable; code-specific detail fields ride
@@ -661,6 +663,161 @@ fn store_freshness_schema() -> Value {
         "required": ["ok", "freshness"],
         "properties": {
             "ok": { "const": true },
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+/// The audit-vocabulary trust class used by failure-history rows
+/// (`crate::cli::trust_class_for`), distinct from the symbol-context
+/// `TrustClass` vocabulary pinned above.
+fn audit_trust_class_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "agent_authored",
+            "verification_evidence",
+            "source_fact",
+            "project_state",
+            "artifact",
+            "runtime_observation",
+            "other"
+        ]
+    })
+}
+
+/// One redaction-safe audit row (`superseding_successes`, `patch_artifacts`):
+/// stable record ID, citable handle, trust class, bounded summary, and
+/// hash/handle citations — never raw payload bytes.
+fn audit_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust_class", "relation", "citable_handle", "summary"],
+        "properties": {
+            "record_id": { "type": "string" },
+            "kind": { "type": "string" },
+            "trust_class": audit_trust_class_schema(),
+            "relation": { "type": "string" },
+            "citable_handle": { "type": "string" },
+            "summary": { "type": "string" },
+            "summary_hash": str_or_null(),
+            "name": str_or_null(),
+            "title": str_or_null(),
+            "repo_relative_path": str_or_null(),
+            "span": { "type": ["object", "null"], "additionalProperties": true },
+            "status": str_or_null(),
+            "verification_kind": str_or_null(),
+            "exit_code": { "type": ["integer", "null"] },
+            "source_artifact_path": str_or_null(),
+            "source_artifact_hash": str_or_null(),
+            "stdout_hash": str_or_null(),
+            "stderr_hash": str_or_null(),
+            "patch_status": str_or_null(),
+            "patch_bytes_hash": str_or_null(),
+            "body_handle_hash": str_or_null(),
+            "diff_hunk_hash": str_or_null(),
+            "author": str_or_null(),
+            "agent_id": str_or_null(),
+            "session_id": str_or_null(),
+            "observed_at": str_or_null(),
+            "confidence": str_or_null(),
+            "protected": bool_schema()
+        }
+    })
+}
+
+/// One failure-attempt row (`runtime_failures`, `agent_failures`): the audit
+/// row plus the read-time `resolution_status` computed at tool-call time
+/// (`still_failing` | `since_resolved`) and its `resolved_by` pointer.
+fn failure_attempt_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "kind", "trust_class", "relation", "citable_handle", "summary", "resolution_status"],
+        "properties": {
+            "record_id": { "type": "string" },
+            "kind": { "type": "string" },
+            "trust_class": audit_trust_class_schema(),
+            "relation": { "type": "string" },
+            "citable_handle": { "type": "string" },
+            "summary": { "type": "string" },
+            "summary_hash": str_or_null(),
+            "name": str_or_null(),
+            "title": str_or_null(),
+            "repo_relative_path": str_or_null(),
+            "span": { "type": ["object", "null"], "additionalProperties": true },
+            "status": str_or_null(),
+            "verification_kind": str_or_null(),
+            "failure_kind": str_or_null(),
+            "executed_at": str_or_null(),
+            "exit_code": { "type": ["integer", "null"] },
+            "source_artifact_path": str_or_null(),
+            "source_artifact_hash": str_or_null(),
+            "stdout_hash": str_or_null(),
+            "stderr_hash": str_or_null(),
+            "patch_status": str_or_null(),
+            "patch_bytes_hash": str_or_null(),
+            "body_handle_hash": str_or_null(),
+            "diff_hunk_hash": str_or_null(),
+            "author": str_or_null(),
+            "agent_id": str_or_null(),
+            "session_id": str_or_null(),
+            "observed_at": str_or_null(),
+            "confidence": str_or_null(),
+            "protected": bool_schema(),
+            "resolution_status": { "type": "string", "enum": ["still_failing", "since_resolved"] },
+            "resolved_by": str_or_null(),
+            "matched_target": { "type": "string" }
+        }
+    })
+}
+
+/// One stable failure-history diagnostic: the record IDs that named an
+/// unresolved target, and the relation/domain that failed.
+fn failure_diagnostic_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["code", "source_record_id", "target_handle"],
+        "properties": {
+            "code": { "type": "string" },
+            "source_record_id": { "type": "string" },
+            "target_handle": { "type": "string" },
+            "relation": { "type": "string" },
+            "target_domain": { "type": "string" }
+        }
+    })
+}
+
+fn failure_history_schema() -> Value {
+    let schema = schema_head(
+        "failure_history",
+        "Prior failed attempts for a symbol, file, or task handle, trust-separated into runtime failures, agent failures, and superseding successes (issue #188).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "ok", "handle", "target_type", "target_ids",
+            "runtime_failures", "agent_failures", "superseding_successes",
+            "patch_artifacts", "diagnostics", "safety_note", "freshness"
+        ],
+        "properties": {
+            "ok": { "const": true },
+            "handle": { "type": "string" },
+            "target_type": {
+                "type": "string",
+                "enum": ["symbol", "file", "task", "source"]
+            },
+            "target_ids": { "type": "array", "items": { "type": "string" } },
+            "runtime_failures": { "type": "array", "items": failure_attempt_schema() },
+            "agent_failures": { "type": "array", "items": failure_attempt_schema() },
+            "superseding_successes": { "type": "array", "items": audit_item_schema() },
+            "patch_artifacts": { "type": "array", "items": audit_item_schema() },
+            "diagnostics": { "type": "array", "items": failure_diagnostic_schema() },
+            "safety_note": { "type": "string" },
             "freshness": freshness_schema()
         }
     });

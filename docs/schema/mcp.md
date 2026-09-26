@@ -220,6 +220,55 @@ argument. Requires a running local daemon when called over the wire.
 
 ---
 
+### 4.5 `failure_history`
+
+Prior failed attempts for a symbol, file, or task handle (issue #188) —
+the same answer as `eg query failures`, trust-separated for agents.
+Requires a running local daemon when called over the wire.
+
+**Inputs**
+
+| Parameter | Type | Required | Notes |
+|---|---|---|---|
+| `handle` | string | yes | Resolves in `eg query failures` order: canonical code record ID → task/task-source handle → repo-relative file path → exact symbol name → source/provenance handle |
+| `repo_path` | string | no | |
+| `data_dir` | string | no | |
+
+**Success response**
+
+| Field | Type | Tier | Notes |
+|---|---|---|---|
+| `ok` | `true` | stable | |
+| `handle` | string | stable | The handle as passed |
+| `target_type` | string | stable | `symbol` \| `file` \| `task` \| `source` |
+| `target_ids` | array of string | stable | Resolved target record IDs |
+| `runtime_failures` | array | stable | Failure-attempt rows (§5.10) — trust `verification_evidence` |
+| `agent_failures` | array | stable | Failure-attempt rows (§5.10) — trust `agent_authored` |
+| `superseding_successes` | array | stable | Audit rows (§5.11) — later passing verifications; never hide the older failures |
+| `patch_artifacts` | array | stable | Audit rows (§5.11) — patch artifacts produced by the failures |
+| `diagnostics` | array | stable | Failure-history diagnostics (§5.12) |
+| `safety_note` | string | stable | States the safety semantics: absence of recorded failure is not evidence of safety, and no failure cause is ever inferred |
+| `freshness` | object | stable | §6 |
+
+Every failure row carries a stable `record_id`/evidence handle and a
+read-time `resolution_status` (`still_failing` | `since_resolved`); sections
+are canonically ordered oldest-first, so identical stores yield byte-identical
+output. Rows are redaction-safe: no raw transcript text, command
+stdout/stderr, or patch hunks appear anywhere — only hashes, handles, bounded
+summaries, and redaction markers.
+
+A resolved target with no recorded failures returns a successful,
+explicitly-empty answer (empty sections + `safety_note`) — distinct from an
+unresolvable handle, which is a structured error.
+
+**Errors** — see §5.8: `missing_argument` (empty `handle`),
+`unsupported_handle` (malformed canonical ID), `ambiguous_handle`
+(cross-repository collision, with `candidates`), `no_match` (handle resolved
+to nothing live), `stale_handle` (handle named only tombstoned records), plus
+the daemon codes.
+
+---
+
 ## 5 — Shared shapes
 
 ### 5.1 Source-fact row
@@ -303,6 +352,7 @@ Every error shares one stable envelope:
 | `missing_argument` | Required argument empty | `field`, `message` | Caller bug |
 | `daemon_not_running` | No live daemon for the data dir | `message` | **Store missing or unreadable** — retry after `eg daemon` |
 | `daemon_stale` | Daemon metadata stale | `message` | **Store missing or unreadable** — restart the daemon |
+| `stale_handle` | Handle named only tombstoned records | `handle` | The entity was deleted — never silently treat as `no_match` |
 
 The agent rule: `no_match` ⇒ the entity does not exist; `daemon_not_running`
 / `daemon_stale` ⇒ the store cannot be read. The two are never conflated.
@@ -336,6 +386,46 @@ sections are disjoint by construction. `Failure` records stay in
 `observations` — the section contract is "`Observation` and `Failure`",
 documented explicitly so the routing is never ambiguous.
 
+### 5.10 Failure-attempt row (stable)
+
+One failure attempt from `failure_history` (§4.5). The audit row (§5.11)
+plus the read-time `resolution_status` computed at tool-call time —
+`still_failing` | `since_resolved` (stable, closed vocabulary) — and
+`resolved_by` (string|null, stable — the record ID of the later passing
+verification that superseded this failure), `matched_target` (string, stable —
+the target this failure was matched to), `failure_kind` (string|null,
+stable), `executed_at` (string|null, stable). `resolution_status` is computed
+from the store state at read time — never a stored property of the record.
+
+### 5.11 Audit row (stable)
+
+One redaction-safe audit item (`superseding_successes`, `patch_artifacts`).
+`record_id` (string, stable), `kind` (string, stable), `trust_class`
+(string, stable — the audit vocabulary: `agent_authored`,
+`verification_evidence`, `source_fact`, `project_state`, `artifact`,
+`runtime_observation`, `other`; shared with the CLI failure-history and
+memory-audit surfaces), `relation` (string, stable — how the item was
+reached), `citable_handle` (string, stable — the handle an agent cites),
+`summary` (string, stable — the bounded one-line summary). Optional
+stable fields: `summary_hash`, `name`, `title`, `repo_relative_path`,
+`span`, `status`, `verification_kind`, `exit_code`, `source_artifact_path`,
+`source_artifact_hash`, `stdout_hash`, `stderr_hash`, `patch_status`,
+`patch_bytes_hash`, `body_handle_hash`, `diff_hunk_hash`, `author`,
+`agent_id`, `session_id`, `observed_at`, `confidence` (all `*|null`),
+`protected` (boolean, stable — `true` only when the payload is protected).
+
+Trust contract: rows carry only record IDs, hashes, handles, spans, and
+redaction markers — never raw payload bytes. A `summary` is a bounded
+synthesis, never a transcript excerpt.
+
+### 5.12 Failure-history diagnostic (stable)
+
+One stable failure-history diagnostic from `failure_history` (§4.5):
+`code` (string, stable — the diagnostic code), `source_record_id` (string,
+stable), `target_handle` (string, stable), `relation` (string, stable),
+`target_domain` (string, stable). The record IDs that named an unresolved
+target, and the relation/domain that failed — never transcript text.
+
 ---
 
 ## 6 — The `freshness` object
@@ -361,7 +451,7 @@ Reuses the store-freshness contract from #186 — no new vocabulary:
 
 ## 7 — Release gate for new tools
 
-Adding an MCP tool (queued: #181, #182, #183, #188) is a **release-gated**
+Adding an MCP tool (queued: #181, #182, #183) is a **release-gated**
 change. Before a new tool ships, its author must, in the same commit:
 
 1. Enumerate the tool in `docs/schema/mcp.md` §4: input parameters and the

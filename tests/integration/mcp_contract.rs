@@ -17,11 +17,11 @@ use std::path::Path;
 
 use aletheia_egregore::{
     EvidenceLink, GraphRecord, NodeKind, SourceSpan,
-    ir::AGENT_MEMORY_SCHEMA_VERSION,
+    ir::{AGENT_MEMORY_SCHEMA_VERSION, SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION},
     mcp::{
         EgregoreMcpServer, SymbolContextArgs, missing_argument_error, stamp_freshness_on_payload,
-        tool_freshness_stamp, tool_inspect_store_from_records, tool_symbol_context_from_records,
-        tool_task_evidence_from_records,
+        tool_failure_history_from_records, tool_freshness_stamp, tool_inspect_store_from_records,
+        tool_symbol_context_from_records, tool_task_evidence_from_records,
     },
     mcp_contract::{MCP_CONTRACT_TOOLS, MCP_CONTRACT_VERSION, error_schema, response_schema},
 };
@@ -115,6 +115,86 @@ fn fixture_records() -> Vec<GraphRecord> {
     ]
 }
 
+/// Records for the `failure_history` conformance fixture: one symbol with a
+/// superseded agent failure and a later passing verification, plus one
+/// failure-free symbol.
+fn failure_history_records() -> Vec<GraphRecord> {
+    let mut records = vec![
+        make_symbol("fh-sym-1", "fh_parse", "src/fh.rs"),
+        make_symbol("fh-sym-2", "fh_quiet", "src/fh.rs"),
+    ];
+
+    let mut failure = GraphRecord::node(
+        "fh-fail-1".to_owned(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        "agent failure on fh_parse".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        session_id,
+        observed_at,
+        evidence_links,
+        ..
+    } = &mut failure
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("test-agent".to_owned());
+        *session_id = Some("sess-001".to_owned());
+        *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some("fh-sym-1".to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "FAILED_ON".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    records.push(failure);
+
+    let mut pass = GraphRecord::node(
+        "fh-pass-1".to_owned(),
+        NodeKind::TestRun,
+        None,
+        None,
+        None,
+        "passing test run for fh_parse".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        status,
+        verification_kind,
+        executed_at,
+        evidence_links,
+        ..
+    } = &mut pass
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+        *verification_kind = Some("test_run".to_owned());
+        *executed_at = Some("2026-02-01T00:00:00Z".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some("fh-sym-1".to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    records.push(pass);
+
+    records
+}
+
 // ── Schema validation helper ────────────────────────────────────────────────
 
 fn assert_valid(schema: &Value, instance: &Value, what: &str) {
@@ -187,7 +267,8 @@ fn every_shipped_tool_has_a_published_schema() {
             "inspect_store",
             "symbol_context",
             "task_evidence",
-            "store_freshness"
+            "store_freshness",
+            "failure_history"
         ],
         "contract covers exactly the shipped tools in registration order"
     );
@@ -270,6 +351,37 @@ fn store_freshness_success_conforms_to_published_schema() {
     assert_valid(&schema, &payload, "store_freshness success");
 }
 
+/// The `failure_history` success payload — one superseded agent failure and
+/// its superseding pass, with the freshness stamp applied exactly the way
+/// the tool method does — validates against the published schema.
+#[test]
+fn failure_history_success_conforms_to_published_schema() {
+    let records = failure_history_records();
+    let mut payload = tool_failure_history_from_records(&records, "fh_parse");
+    assert_eq!(payload["ok"], Value::from(true), "got {payload}");
+    assert_eq!(payload["agent_failures"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        payload["superseding_successes"].as_array().map(Vec::len),
+        Some(1)
+    );
+    stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
+    let schema = response_schema("failure_history").expect("schema must exist");
+    assert_valid(&schema, &payload, "failure_history success");
+}
+
+/// The resolved-but-empty `failure_history` answer (a target with no
+/// recorded failures) is a distinct success shape — explicit empty sections
+/// and a `safety_note` — and still validates.
+#[test]
+fn failure_history_empty_target_conforms_to_published_schema() {
+    let records = failure_history_records();
+    let mut payload = tool_failure_history_from_records(&records, "fh_quiet");
+    assert_eq!(payload["ok"], Value::from(true), "got {payload}");
+    stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
+    let schema = response_schema("failure_history").expect("schema must exist");
+    assert_valid(&schema, &payload, "failure_history empty-target success");
+}
+
 // ── AC: conformance — error and empty results ───────────────────────────────
 
 /// Agents must deterministically distinguish "symbol/task not found"
@@ -297,6 +409,36 @@ fn error_shapes_conform_to_published_error_schema() {
     assert_eq!(missing["error"]["code"], Value::from("missing_argument"));
     assert_eq!(missing["error"]["field"], Value::from("symbol_name"));
     assert_valid(&schema, &missing, "missing_argument");
+}
+
+/// Every `failure_history` error code shares the stable error envelope.
+#[test]
+fn failure_history_error_shapes_conform_to_published_error_schema() {
+    let records = failure_history_records();
+    let schema = error_schema();
+
+    let no_match = tool_failure_history_from_records(&records, "no_such_target");
+    assert_eq!(no_match["error"]["code"], Value::from("no_match"));
+    assert_valid(&schema, &no_match, "failure_history no_match");
+
+    let unsupported = tool_failure_history_from_records(&records, "codegraph:not-a-valid-id");
+    assert_eq!(
+        unsupported["error"]["code"],
+        Value::from("unsupported_handle")
+    );
+    assert_valid(&schema, &unsupported, "failure_history unsupported_handle");
+
+    let mut stale_records = records;
+    stale_records.push(GraphRecord::Tombstone {
+        id: "fh-tombstone".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: "fh-sym-1".to_owned(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    });
+    let stale = tool_failure_history_from_records(&stale_records, "fh-sym-1");
+    assert_eq!(stale["error"]["code"], Value::from("stale_handle"));
+    assert_valid(&schema, &stale, "failure_history stale_handle");
 }
 
 /// A store/daemon failure (`daemon_not_running` / `daemon_stale`) shares the

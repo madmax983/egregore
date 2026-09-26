@@ -1,13 +1,16 @@
 //! MCP server for Egregore read-only tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
-//! four read-only tools backed by the existing daemon query, symbol-context,
-//! and task-evidence contracts:
+//! five read-only tools backed by the existing daemon query, symbol-context,
+//! task-evidence, and failure-history contracts:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
 //! - **`task_evidence`** — evidence-backed task context, trust-separated by domain.
 //! - **`store_freshness`** — store-freshness verdict for the whole store (issue #220).
+//! - **`failure_history`** — prior failed attempts for a symbol, file, or task
+//!   handle, trust-separated into runtime failures, agent failures, and
+//!   superseding successes (issue #188).
 //!
 //! All tool responses carry machine-readable structured output with record IDs and
 //! citation handles. Successful responses additionally carry a `freshness`
@@ -116,6 +119,21 @@ pub struct StoreFreshnessArgs {
     pub repo_path: Option<String>,
     /// `AletheiaDB` data directory (default: `.egregore`).
     pub data_dir: Option<String>,
+}
+
+/// Parameters for the `failure_history` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FailureHistoryArgs {
+    /// Handle resolving to the failure-history target, in `eg query failures`
+    /// order: canonical code record ID, task/task-source handle, repo-relative
+    /// file path, exact symbol name, or source/provenance handle.
+    pub handle: String,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
@@ -275,6 +293,66 @@ impl EgregoreMcpServer {
             "ok": true,
             "freshness": tool_freshness_stamp(&records, &repo_path, Some(&data_dir)),
         });
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Returns prior failed attempts for a symbol, file, or task handle —
+    /// trust-separated into `runtime_failures` (trust `verification_evidence`),
+    /// `agent_failures` (trust `agent_authored`), and `superseding_successes`
+    /// (later passing verifications, which never hide the older failures).
+    /// Every failure carries a stable `record_id`/evidence handle and a
+    /// read-time `resolution_status` (`still_failing` | `since_resolved`);
+    /// sections are canonically ordered oldest-first. Handles resolve in the
+    /// same order as `eg query failures`: canonical code record ID,
+    /// task/task-source handle, repo-relative file path, exact symbol name,
+    /// source/provenance handle. Unresolvable handles surface structured
+    /// `no_match` / `stale_handle` / `ambiguous_handle` / `unsupported_handle`
+    /// errors — never a silent empty success. A resolved target with no
+    /// recorded failures returns a successful explicitly-empty answer with a
+    /// `safety_note`: absence of recorded failure is not evidence of safety,
+    /// and no failure cause is ever inferred. Successful responses carry a
+    /// `freshness` object (verdict, stored source-snapshot identity,
+    /// working-tree state) so agents can gate trust in the cited handles.
+    #[tool(description = "Returns prior failed attempts for a symbol, file, \
+            or task handle, trust-separated into runtime_failures (trust \
+            verification_evidence), agent_failures (trust agent_authored), \
+            and superseding_successes (later passing verifications, which \
+            never hide the older failures). Every failure carries a stable \
+            record_id/evidence handle and a read-time resolution_status \
+            (still_failing | since_resolved); sections are canonically \
+            ordered oldest-first. Handles resolve in the same order as `eg \
+            query failures`: canonical code record ID, task/task-source \
+            handle, repo-relative file path, exact symbol name, \
+            source/provenance handle. Unresolvable handles surface structured \
+            no_match / stale_handle / ambiguous_handle / unsupported_handle \
+            errors. A resolved target with no recorded failures returns a \
+            successful explicitly-empty answer with a safety_note: absence \
+            of recorded failure is not evidence of safety. Successful \
+            responses carry a `freshness` object (verdict, stored \
+            source-snapshot identity, working-tree state) so agents can gate \
+            trust in the cited handles.")]
+    #[must_use]
+    pub fn failure_history(&self, Parameters(args): Parameters<FailureHistoryArgs>) -> String {
+        if args.handle.is_empty() {
+            let err = missing_argument_error("handle");
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let mut payload = tool_failure_history_from_records(&records, &args.handle);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
         serde_json::to_string(&payload).unwrap_or_default()
     }
 }
@@ -797,6 +875,143 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         "unresolved": unresolved,
         // Issue #196: store-level domain presence; see the symbol twin.
         "store_coverage": crate::query::StoreCoverage::from_records(records),
+    })
+}
+
+/// Builds a prior-failed-attempt history for a record slice (issue #188).
+///
+/// Resolves `handle` through the same documented order as `eg query failures`
+/// (canonical code record ID → task/task-source handle → repo-relative file
+/// path → exact symbol name → source/provenance handle) and returns the same
+/// trust-separated sections: `runtime_failures` (trust
+/// `verification_evidence`), `agent_failures` (trust `agent_authored`), and
+/// `superseding_successes` (later passing verifications, which never hide the
+/// older failures), plus the reached `patch_artifacts` and stable
+/// `diagnostics`.
+///
+/// Every failure row carries a stable `record_id`/evidence handle and a
+/// read-time `resolution_status` (`still_failing` | `since_resolved`).
+/// Sections are canonically ordered oldest-first, so identical stores yield
+/// byte-identical output.
+///
+/// Error codes (the same distinctions as the CLI exit codes, never a silent
+/// empty success):
+/// - `unsupported_handle` — malformed handle, same inputs the CLI rejects at exit 1
+/// - `ambiguous_handle` — cross-repository collision, with a `candidates` list
+/// - `no_match` — handle resolved to nothing live, same inputs the CLI rejects at exit 2
+/// - `stale_handle` — handle named only tombstoned records
+///
+/// A resolved target with no recorded failures is NOT an error: it returns
+/// `ok: true` with empty sections and a `safety_note`, because absence of
+/// recorded failure is not evidence of safety and no failure cause is ever
+/// inferred from the answer.
+///
+/// Rows reuse the CLI's redaction-safe serializers — no raw transcript text,
+/// command stdout/stderr, or patch hunks appear anywhere; only hashes,
+/// handles, bounded summaries, and redaction markers.
+#[must_use]
+pub fn tool_failure_history_from_records(records: &[GraphRecord], handle: &str) -> Value {
+    let repo_index = query::RepositoryIndex::build(records);
+    let target = match query::resolve_failure_handle(records, handle, &repo_index, None) {
+        Ok(target) => target,
+        Err(query::FailureHandleError::Ambiguous { handle, candidates }) => {
+            return json!({
+                "ok": false,
+                "error": {
+                    "code": "ambiguous_handle",
+                    "handle": handle,
+                    "candidates": candidates,
+                }
+            });
+        }
+        Err(query::FailureHandleError::Unsupported { handle, message }) => {
+            return json!({
+                "ok": false,
+                "error": {
+                    "code": "unsupported_handle",
+                    "handle": handle,
+                    "message": message,
+                }
+            });
+        }
+    };
+
+    // A handle that resolved to nothing live in the store is a structured
+    // no-match (or a stale handle when it named a tombstoned record). This is
+    // distinct from a resolved target that simply has no recorded failures,
+    // which is a genuine ok:true empty answer below (AC4).
+    if target.is_empty() {
+        let code = if target.stale {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        return json!({
+            "ok": false,
+            "error": { "code": code, "handle": handle },
+        });
+    }
+
+    let ctx = query::failure_history_context(records, &target);
+
+    // The CLI's redaction-safe serializers (issue #188, AC6): every row
+    // carries only record IDs, hashes, handles, spans, and redaction
+    // markers — never raw payloads.
+    let runtime_failures: Vec<Value> = ctx
+        .runtime_failures
+        .iter()
+        .map(|attempt| {
+            serde_json::to_value(crate::cli::failure_attempt_json(attempt)).unwrap_or(Value::Null)
+        })
+        .collect();
+    let agent_failures: Vec<Value> = ctx
+        .agent_failures
+        .iter()
+        .map(|attempt| {
+            serde_json::to_value(crate::cli::failure_attempt_json(attempt)).unwrap_or(Value::Null)
+        })
+        .collect();
+    let superseding_successes: Vec<Value> = ctx
+        .superseding_successes
+        .iter()
+        .map(|item| serde_json::to_value(crate::cli::audit_item(item)).unwrap_or(Value::Null))
+        .collect();
+    let patch_artifacts: Vec<Value> = ctx
+        .patch_artifacts
+        .iter()
+        .map(|item| serde_json::to_value(crate::cli::audit_item(item)).unwrap_or(Value::Null))
+        .collect();
+    let diagnostics: Vec<Value> = ctx
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("code".to_owned(), json!(diag.code));
+            obj.insert("source_record_id".to_owned(), json!(diag.source_record_id));
+            obj.insert("target_handle".to_owned(), json!(diag.target_handle));
+            if !diag.relation.is_empty() {
+                obj.insert("relation".to_owned(), json!(diag.relation));
+            }
+            if !diag.target_domain.is_empty() {
+                obj.insert("target_domain".to_owned(), json!(diag.target_domain));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "handle": handle,
+        "target_type": ctx.target_kind,
+        "target_ids": ctx.target_ids,
+        "runtime_failures": runtime_failures,
+        "agent_failures": agent_failures,
+        "superseding_successes": superseding_successes,
+        "patch_artifacts": patch_artifacts,
+        "diagnostics": diagnostics,
+        // AC4: absence of recorded failure is not evidence of safety, and no
+        // failure cause is ever inferred — the answer states the limit.
+        "safety_note": "No failure cause is inferred from this answer. A target with no recorded failures may still be unsafe: absence of recorded failure is not evidence of safety.",
     })
 }
 

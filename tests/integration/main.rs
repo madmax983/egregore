@@ -71,6 +71,7 @@ mod log_deltas;
 mod manifest_deps;
 mod mcp;
 mod mcp_contract;
+mod mcp_failure_history;
 mod mcp_freshness;
 mod mcp_stdio;
 mod memory_audit;
