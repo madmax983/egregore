@@ -161,6 +161,7 @@ mod semantic_relevance_gate;
 mod session_retrospective;
 mod store_contention;
 mod store_export;
+mod supersede_write;
 mod symbol_metadata;
 mod task_query;
 mod temporal;

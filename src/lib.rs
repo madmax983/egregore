@@ -132,6 +132,8 @@ pub mod scip;
 pub mod semantic_confidence;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
+/// Write-time supersession / contradiction authoring for `eg write observation` (issue #184).
+pub mod supersede_write;
 /// Transitive memory supersession and contradiction resolution (issue #92).
 pub mod temporal_status;
 /// Capture `cargo test` / libtest JSON runs as citable `TestRun` records (issue #165).

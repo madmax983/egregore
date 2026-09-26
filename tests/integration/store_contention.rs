@@ -108,6 +108,7 @@ fn observation_batch(writer: usize) -> (String, Vec<GraphRecord>) {
             target_span: None,
             target_git_commit: None,
         }],
+        supersession: None,
     };
     let outcome = build_observation_records(&req).expect("observation batch should build");
     (outcome.record_id, outcome.records)

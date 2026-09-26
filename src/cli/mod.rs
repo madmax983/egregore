@@ -5008,6 +5008,31 @@ pub(crate) enum WriteKind {
         /// Domain of the evidence targets (`codegraph`, `verification`, etc.).
         #[arg(long, default_value = "codegraph")]
         evidence_domain: String,
+        /// Supersede a prior observation-class record (issue #184): authors a
+        /// `SUPERSEDES` edge from the new observation to this record ID. The
+        /// target must be a live observation-class record (`Observation`,
+        /// `Decision`, `Failure`) in the store pointed at by `--graph` or
+        /// `--data-dir`; deterministic code-graph facts are rejected. Mutually
+        /// exclusive with `--contradicts`.
+        #[arg(long, conflicts_with = "contradicts")]
+        supersedes: Option<String>,
+        /// Contradict a prior observation-class record (issue #184): authors
+        /// a `CONTRADICTS` edge from the new observation to this record ID.
+        /// A contradiction is a mutual dispute, not a winner declaration —
+        /// both records stay live and citable. Same target rules as
+        /// `--supersedes`. Mutually exclusive with `--supersedes`.
+        #[arg(long, conflicts_with = "supersedes")]
+        contradicts: Option<String>,
+        /// Graph JSONL file used to validate the `--supersedes` /
+        /// `--contradicts` target at write time. Mutually exclusive with
+        /// `--data-dir`. The file is read, never modified.
+        #[arg(long, conflicts_with = "data_dir")]
+        graph: Option<PathBuf>,
+        /// Embedded store directory used to validate the `--supersedes` /
+        /// `--contradicts` target at write time. Mutually exclusive with
+        /// `--graph`. The store is opened read-only for validation.
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
         /// Output JSONL path for the produced records.
         #[arg(long, required = true)]
         out: PathBuf,

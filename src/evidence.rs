@@ -145,6 +145,11 @@ pub struct ObservationRequest {
     pub confidence: f64,
     /// Evidence citations. At least one is required.
     pub evidence_links: Vec<EvidenceLink>,
+    /// Optional write-time supersession/contradiction target (issue #184).
+    /// The label is restricted to `EdgeLabel::Supersedes` and
+    /// `EdgeLabel::Contradicts`; the target handle is validated against a
+    /// local store by the CLI (`eg write observation --supersedes <id>`).
+    pub supersession: Option<crate::supersede_write::SupersessionTarget>,
 }
 
 /// Typed request for writing a `CommandRun` (command evidence) record.
@@ -958,7 +963,10 @@ fn build_authored_by_edge(record_id: &str, session_id: &str) -> GraphRecord {
 /// On success, returns an [`EvidenceWriteOutcome`] containing:
 /// - A stable `agent_memory:v1:` record ID (the citable evidence handle)
 /// - All graph records: `Agent`, `AgentSession`, `Observation` nodes plus
-///   `SESSION_OF` and `AUTHORED_BY` edges
+///   `SESSION_OF` and `AUTHORED_BY` edges — and, when `supersession` is set
+///   (issue #184), one `SUPERSEDES` or `CONTRADICTS` edge from the new
+///   observation to the prior one (the write is purely additive; the target
+///   record is never rewritten)
 ///
 /// # Errors
 ///
@@ -1008,6 +1016,20 @@ pub fn build_observation_records(
         }
     }
 
+    // Write-time supersession/contradiction target (issue #184): the label is
+    // restricted to SUPERSEDES/CONTRADICTS and the handle must be non-empty.
+    // Store-side target validation (existence, observation-class, no
+    // code-graph facts) and idempotency-conflict detection live in
+    // `crate::supersede_write` at the CLI layer.
+    if let Some(sup) = &req.supersession {
+        if !matches!(sup.label, EdgeLabel::Supersedes | EdgeLabel::Contradicts) {
+            return Err(ProvenanceError::invalid("supersession"));
+        }
+        if sup.target_record_id.is_empty() {
+            return Err(ProvenanceError::missing("supersession"));
+        }
+    }
+
     let agent_kind = effective_agent_kind(&req.provenance);
 
     let agent_id_node =
@@ -1053,6 +1075,16 @@ pub fn build_observation_records(
         &links_hash,
         req.provenance.source_handle.as_deref().unwrap_or(""),
     ]);
+
+    // Write-time supersession/contradiction (issue #184): the target can never
+    // be the new observation itself — that is the only cycle a fresh write
+    // can introduce, since the new ID does not exist in any store yet. The
+    // CLI maps this to the stable `supersession_cycle` diagnostic.
+    if let Some(sup) = &req.supersession
+        && sup.target_record_id == obs_id
+    {
+        return Err(ProvenanceError::invalid("supersession"));
+    }
 
     // Build the observation node
     let obs_node = GraphRecord::Node {
@@ -1191,13 +1223,26 @@ pub fn build_observation_records(
     let session_of_edge = build_session_of_edge(&session_node_id, &agent_id_node);
     let authored_by_edge = build_authored_by_edge(&obs_id, &session_node_id);
 
-    let records = vec![
+    let mut records = vec![
         agent_node,
         session_node,
         session_of_edge,
         obs_node,
         authored_by_edge,
     ];
+
+    // Write-time supersession/contradiction (issue #184): author the edge from
+    // the new observation to the prior one. The write is purely additive — the
+    // target record is never rewritten, so its provenance fields (`agent_id`,
+    // `observed_at`, `source_handle`) are untouched and no deterministic
+    // code-graph record changes.
+    if let Some(sup) = &req.supersession {
+        records.push(crate::supersede_write::build_supersession_edge(
+            &obs_id,
+            sup,
+            &req.confidence.to_string(),
+        ));
+    }
 
     // Stamp the producer envelope (issue #226): the observation writer is a
     // first-class producer and its records must carry the envelope.
