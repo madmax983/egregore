@@ -135,6 +135,12 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             include_foreign,
             format,
         ),
+        // Appended (issue #185); kept at the end to minimize cross-lane merge conflicts.
+        AuditSubcommand::MemoryEvidenceHealth {
+            graph,
+            data_dir,
+            format,
+        } => audit_memory_evidence_health_cmd(graph.as_deref(), data_dir.as_deref(), format),
     }
 }
 
@@ -1817,4 +1823,166 @@ pub(crate) fn collect_semantic_input(
     } else {
         SemanticInput::default()
     }
+}
+
+/// Handles `eg audit memory-evidence-health` (issue #185).
+///
+/// Store-wide agent-memory evidence health sweep. Exit 0 clean (`ok: true`),
+/// 1 findings (dangling links or integrity violations; the full NDJSON report
+/// is still printed to stdout so triage tooling can consume it), 2
+/// usage/load error (both/neither input flag, unreadable/empty store or
+/// graph).
+pub(crate) fn audit_memory_evidence_health_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    // Read-only: an embedded store is read through a throwaway copy so opening
+    // the engine never re-persists index files into the original. The guard
+    // keeps the copy alive for the duration of the read below.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+    // History-inclusive load so tombstones and superseded versions stay
+    // VISIBLE — required to tell "absent" from "tombstoned" and to apply the
+    // latest-write-wins liveness rule. `--graph` JSONL already carries that
+    // history; `--data-dir` reads the history-inclusive view of the copy. The
+    // loader enforces exactly-one-of `--graph`/`--data-dir` (both/neither exit 2).
+    let records = match load_query_records_history(graph, effective_data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            drop(store_copy);
+            std::process::exit(2);
+        }
+    };
+
+    // A genuinely empty input (an empty/whitespace-only graph or an initialized
+    // store holding zero records) is a LOAD error naming the path: a false
+    // "clean" verdict on an empty store would be dangerous for a trust gate.
+    // Mirrors the `evidence-links` / `review-coverage` empty-input contract.
+    if records.is_empty() {
+        let source_path = graph
+            .or(data_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        drop(store_copy);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "code": "empty_memory_evidence_input",
+                "path": source_path,
+                "message": "evidence input holds zero records; provide a non-empty graph or store",
+            })
+        );
+        std::process::exit(2);
+    }
+
+    let lines = crate::memory_evidence_health::run_memory_evidence_health_audit(&records);
+
+    match format {
+        OutputFormat::Json => {
+            for line in &lines {
+                println!(
+                    "{}",
+                    serde_json::to_string(line)
+                        .context("failed to serialize memory evidence health line")?
+                );
+            }
+        }
+        OutputFormat::Text => {
+            print!("{}", render_memory_evidence_health_text(&lines));
+        }
+    }
+
+    let ok = lines.iter().any(|line| {
+        matches!(
+            line,
+            crate::memory_evidence_health::MemoryEvidenceHealthLine::Summary(summary) if summary.ok
+        )
+    });
+    drop(store_copy);
+    std::process::exit(i32::from(!ok));
+}
+
+/// Renders a memory-evidence-health report as a deterministic human-readable
+/// form (issue #185 AC5): per-source link rows grouped by source record, then
+/// integrity violations, then the bucket-count summary.
+fn render_memory_evidence_health_text(
+    lines: &[crate::memory_evidence_health::MemoryEvidenceHealthLine],
+) -> String {
+    use crate::memory_evidence_health::MemoryEvidenceHealthLine;
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut current_source = String::new();
+    for line in lines {
+        match line {
+            MemoryEvidenceHealthLine::Link(row) => {
+                if row.source_record_id != current_source {
+                    current_source.clone_from(&row.source_record_id);
+                    let _ = writeln!(out, "{} ({})", row.source_record_id, row.source_kind);
+                }
+                let detail = match row.bucket {
+                    crate::memory_evidence_health::LinkBucket::Drifted => format!(
+                        " drift_record={}",
+                        row.drift_record_id.as_deref().unwrap_or("?")
+                    ),
+                    crate::memory_evidence_health::LinkBucket::Dangling => {
+                        format!(" tombstoned={}", row.tombstoned.unwrap_or(false))
+                    }
+                    crate::memory_evidence_health::LinkBucket::ResolvesLive => String::new(),
+                };
+                let bucket = match row.bucket {
+                    crate::memory_evidence_health::LinkBucket::ResolvesLive => "resolves_live",
+                    crate::memory_evidence_health::LinkBucket::Drifted => "drifted",
+                    crate::memory_evidence_health::LinkBucket::Dangling => "dangling",
+                };
+                let _ = writeln!(
+                    out,
+                    "  [{bucket}] {} -> {}{detail}",
+                    row.relation, row.target_record_id
+                );
+            }
+            MemoryEvidenceHealthLine::IntegrityViolation(row) => {
+                let violation = match row.violation {
+                    crate::memory_evidence_health::IntegrityViolationKind::ArrayWithoutEdge => {
+                        "array_without_edge"
+                    }
+                    crate::memory_evidence_health::IntegrityViolationKind::EdgeWithoutArray => {
+                        "edge_without_array"
+                    }
+                };
+                let _ = writeln!(
+                    out,
+                    "integrity violation [{violation}] {} {} -> {} (array: {}, edges: {})",
+                    row.source_record_id,
+                    row.relation,
+                    row.target_record_id,
+                    row.array_count,
+                    row.edge_count
+                );
+            }
+            MemoryEvidenceHealthLine::Summary(summary) => {
+                out.push_str("summary:\n");
+                let _ = writeln!(out, "  ok: {}", summary.ok);
+                let _ = writeln!(out, "  sources_checked: {}", summary.sources_checked);
+                let _ = writeln!(out, "  links_checked: {}", summary.links_checked);
+                let _ = writeln!(out, "  resolves_live: {}", summary.resolves_live);
+                let _ = writeln!(out, "  drifted: {}", summary.drifted);
+                let _ = writeln!(out, "  dangling: {}", summary.dangling);
+                let _ = writeln!(
+                    out,
+                    "  integrity_violations: {}",
+                    summary.integrity_violations
+                );
+            }
+        }
+    }
+    out
 }

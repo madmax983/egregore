@@ -88,6 +88,11 @@ pub mod mcp;
 /// payloads (issue #194).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp_contract;
+/// Store-wide agent-memory evidence health sweep (issue #185).
+///
+/// Per-link `resolves_live`/`drifted`/`dangling` classification plus
+/// denormalized-array vs stored-edge integrity violations.
+pub mod memory_evidence_health;
 /// Agent-memory health report to flag reviewability risk (issue #94).
 pub mod memory_health;
 /// Agent-memory recall evaluation harness (issue #91).

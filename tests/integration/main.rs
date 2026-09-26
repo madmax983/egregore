@@ -75,6 +75,7 @@ mod mcp_failure_history;
 mod mcp_freshness;
 mod mcp_stdio;
 mod memory_audit;
+mod memory_evidence_health;
 mod memory_health;
 mod memory_recall;
 mod memory_recall_corpus;

@@ -5581,6 +5581,34 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    // Appended (issue #185); kept at the end to minimize cross-lane merge conflicts.
+    /// Sweep agent-memory evidence health: classify every evidence link of every
+    /// live observation-class node (`Observation`, `Decision`, `Failure`) into
+    /// exactly one bucket — `resolves_live`, `drifted`, or `dangling` — and flag
+    /// denormalized-array vs stored-edge integrity violations (issue #185).
+    ///
+    /// Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
+    /// store (`--data-dir`); strictly read-only, no daemon required. Default
+    /// output is newline-delimited JSON (one object per line: link rows, then
+    /// integrity-violation rows, then a summary line); `--format text` renders
+    /// the human view. Documented in `docs/cli/memory-evidence-health.md`.
+    ///
+    /// Exit codes:
+    ///   0 — clean (`ok: true`): no dangling links, no integrity violations.
+    ///       `drifted` links are freshness leads, not rot: they do not fail the gate.
+    ///   1 — findings (`ok: false`); the full report is still printed.
+    ///   2 — usage/load error (both or neither input flag, unreadable/empty store or graph).
+    MemoryEvidenceHealth {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Actions for `eg audit evidence-pack` (issue #338).
